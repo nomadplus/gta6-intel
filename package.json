@@ -15,7 +15,8 @@
     "check:status-presentation": "tsx src/checks/statusPresentation.check.ts",
     "check:ingestion-url-normalization": "tsx src/checks/ingestionUrlNormalization.check.ts",
     "check:ingestion-url-safety": "tsx src/checks/ingestionUrlSafety.check.ts",
-    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety",
+    "check:ingestion-safe-fetch": "tsx src/checks/ingestionSafeFetch.check.ts",
+    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch",
     "db:seed": "tsx src/db/seed/seed.ts"
   },
   "keywords": [],
