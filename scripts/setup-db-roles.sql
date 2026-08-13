@@ -1,0 +1,35 @@
+-- =============================================================================
+-- Role password provisioning -- NOT a schema migration.
+--
+-- Migrations 0002 and 0004 create app_role and admin_role idempotently,
+-- but deliberately NOLOGIN (no password) -- a schema migration is
+-- replayed verbatim across every environment and committed to source
+-- control, so it must never contain a real, usable credential.
+--
+-- This script is the separate, environment-driven step that grants LOGIN
+-- and sets a real password on those two roles. Run it once per
+-- environment, AFTER migrations 0000-0005 have been applied, using psql
+-- variables passed on the command line (never edit this file to hardcode
+-- a password):
+--
+--   psql "$MIGRATOR_DATABASE_URL" \
+--     -v app_role_password="$APP_ROLE_PASSWORD" \
+--     -v admin_role_password="$ADMIN_ROLE_PASSWORD" \
+--     -f scripts/setup-db-roles.sql
+--
+-- Where APP_ROLE_PASSWORD / ADMIN_ROLE_PASSWORD are generated secrets
+-- (e.g. `openssl rand -base64 24`) that you then also put into that
+-- environment's DATABASE_URL / ADMIN_DATABASE_URL -- never into this
+-- repo. See README.md ("Local development") for the full local setup
+-- sequence, including how to create the migrator_role/superuser needed
+-- to run this in the first place.
+--
+-- On Supabase specifically, this step already happened once, outside of
+-- any repo-controlled migration, when app_role/admin_role were first
+-- created on the staging project (see docs/architecture.md "Migration
+-- history reconciliation"). You do not need to re-run this against
+-- staging unless rotating those passwords.
+-- =============================================================================
+
+ALTER ROLE app_role WITH LOGIN PASSWORD :'app_role_password';
+ALTER ROLE admin_role WITH LOGIN PASSWORD :'admin_role_password';

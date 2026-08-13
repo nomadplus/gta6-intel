@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { SITE_URL } from "@/lib/siteConfig";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://example.com"),
+  metadataBase: new URL(SITE_URL),
   title: {
     default: "The Ledger — GTA VI Claim Archive",
     template: "%s — The Ledger",

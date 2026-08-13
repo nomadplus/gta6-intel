@@ -1,11 +1,10 @@
 import type { MetadataRoute } from "next";
 import { getClaims, claimHref } from "@/db/queries/claims";
 import { getTopics } from "@/db/queries/topics";
+import { SITE_URL as BASE_URL } from "@/lib/siteConfig";
 
 // Render fresh on every request so new claims/topics appear without a redeploy.
 export const dynamic = "force-dynamic";
-
-const BASE_URL = "https://example.com";
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   const [claims, topics] = await Promise.all([getClaims(), getTopics()]);

@@ -111,8 +111,33 @@ FROM claim_development_outcome_history;
 -- the trigger above is defense-in-depth, this grant is the primary
 -- control). Normal operational tables get full CRUD since they don't carry
 -- the same historical-integrity requirement.
+--
+-- Reconciliation note (added during post-Phase-3 architecture review --
+-- see docs/architecture.md "Migration history reconciliation"): on the
+-- staging database, app_role/admin_role were originally created by a
+-- one-off manual bootstrap step that predated this migration history and
+-- was never captured as a repo-controlled migration. That left a fresh
+-- install broken -- this GRANT would fail with "role app_role does not
+-- exist". The block below makes role creation idempotent and
+-- repo-controlled. It is a no-op on staging (role already exists there)
+-- and creates the role NOLOGIN (no password) on a fresh install --
+-- granting LOGIN + a real password is a separate, environment-driven step
+-- (see scripts/setup-db-roles.sql), never a value committed here.
 -- ---------------------------------------------------------------------------
 
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_role') THEN
+    CREATE ROLE app_role NOLOGIN;
+  END IF;
+  -- CONNECT is granted on whatever database this migration is actually
+  -- running against (current_database()), not a hardcoded name -- Supabase
+  -- projects are named "postgres", local setups often use "gta6_intel".
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO app_role', current_database());
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO app_role;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO app_role;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON

@@ -107,15 +107,26 @@ REVOKE INSERT ON
   claim_investigation_status_history, claim_development_outcome_history
 FROM app_role;
 
+-- Reconciliation note (added during architecture review -- see
+-- docs/architecture.md "Migration history reconciliation"): this
+-- previously created admin_role WITH LOGIN PASSWORD 'admin_dev_password'
+-- -- a real, usable, committed credential -- and granted CONNECT ON
+-- DATABASE gta6_intel, a name that doesn't exist on Supabase (whose
+-- database is named "postgres"), which would fail a fresh install
+-- outright. Fixed the same way as app_role in 0002: create the role
+-- NOLOGIN (no password committed to source control) and grant CONNECT
+-- against whatever database this migration actually runs on. Granting
+-- LOGIN + a real password is a separate, environment-driven step -- see
+-- scripts/setup-db-roles.sql.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'admin_role') THEN
-    CREATE ROLE admin_role WITH LOGIN PASSWORD 'admin_dev_password';
+    CREATE ROLE admin_role NOLOGIN;
   END IF;
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO admin_role', current_database());
 END
 $$;
 
-GRANT CONNECT ON DATABASE gta6_intel TO admin_role;
 GRANT USAGE ON SCHEMA public TO admin_role;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO admin_role;
 
