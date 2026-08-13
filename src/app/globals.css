@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Newsreader", ui-serif, Georgia, serif;
+  --font-body: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  --color-bg-void: #0b0e14;
+  --color-bg-panel: #12161f;
+  --color-bg-panel-raised: #171c27;
+  --color-ink-100: #e8e6de;
+  --color-ink-300: #b7b6ad;
+  --color-ink-400: #8b8f9c;
+  --color-ink-600: #5b6070;
+  --color-accent-brass: #c08a3e;
+  --color-accent-brass-dim: #7a5a2c;
+  --color-signal-confirmed: #4fa490;
+  --color-signal-disproven: #b8543f;
+  --color-hairline: #262b36;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--color-bg-void);
+  color: var(--color-ink-100);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background-color: var(--color-accent-brass);
+  color: var(--color-bg-void);
+}
+
+/* Respect reduced-motion preference site-wide */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Visible focus states everywhere, deliberately not suppressed */
+:focus-visible {
+  outline: 2px solid var(--color-accent-brass);
+  outline-offset: 2px;
+}
