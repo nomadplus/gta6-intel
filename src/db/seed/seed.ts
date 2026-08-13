@@ -11,11 +11,16 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import * as schema from "../schema.js";
 
-const pool = new Pool({
-  connectionString:
-    process.env.DATABASE_URL ||
-    "postgresql://migrator_role:migrator_dev_password@localhost:5432/gta6_intel",
-});
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  throw new Error(
+    "DATABASE_URL is not set. For local development, set it in .env.local to your " +
+      "migrator_role connection string -- see scripts/setup-db-roles.sql and README.md " +
+      "(\"Local development\") for how that role's password is provisioned."
+  );
+}
+
+const pool = new Pool({ connectionString });
 const db = drizzle(pool, { schema });
 
 async function main() {

@@ -87,11 +87,14 @@ async function main() {
 
   console.log("\n=== PART 2: seeded admin_users fixture content (standalone DB connection) ===\n");
 
-  const pool = new Pool({
-    connectionString:
-      process.env.CHECK_DATABASE_URL ||
-      "postgresql://migrator_role:migrator_dev_password@localhost:5432/gta6_intel",
-  });
+  const checkConnectionString = process.env.CHECK_DATABASE_URL;
+  if (!checkConnectionString) {
+    throw new Error(
+      "CHECK_DATABASE_URL is not set. See scripts/setup-db-roles.sql and README.md " +
+        "(\"Test / check commands\") for how to provision a local database for this check."
+    );
+  }
+  const pool = new Pool({ connectionString: checkConnectionString });
   const db = drizzle(pool);
 
   const rows = await db
