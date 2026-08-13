@@ -257,6 +257,95 @@ now reproduces the staging database's role/grant structure correctly.**
 
 ---
 
+## Data API lockdown
+
+**Context:** a post-cleanup security audit found that Supabase's
+auto-generated Data API (PostgREST) had no real access control on top of
+it. Every table in `public` had Row Level Security disabled *and* full
+CRUD grants (`SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`) to Supabase's
+built-in `anon` and `authenticated` roles — the roles the Data API uses,
+reachable with the publishable/anon key, which is necessarily public (it
+ships to the browser so Supabase Auth's client SDK can work). This meant
+every table — including `admin_users`, `admin_audit_log`,
+`admin_decisions`, and both append-only status-history ledgers — was
+potentially directly readable and writable through a path that completely
+bypasses the application, `app_role`/`admin_role`, admin authentication,
+and the append-only protections, none of which that path goes anywhere
+near.
+
+**Verified before changing anything:**
+- `edge_logs` showed zero historical `/rest/v1/*` requests — no evidence
+  the exposure had been exploited, but that says nothing about future
+  risk.
+- The only Supabase JS client usage anywhere in the codebase is
+  `supabase.auth.signInWithPassword()` on the admin login page. Nothing
+  in the app ever calls `.from()`, `.rpc()`, or any other PostgREST
+  method — confirming the app has zero functional dependency on the Data
+  API for business data, so locking it down could not break anything the
+  app actually does.
+- All 22 application tables were owned by `postgres`, not
+  `app_role`/`admin_role` — meaning enabling RLS would also block those
+  two roles unless explicitly exempted (see below).
+
+**Design chosen — Option B (deny-by-default), not Option A:** disabling
+the Data API's exposure of the `public` schema entirely (Option A) is a
+Supabase project-level setting (Dashboard → Settings → API → Data API
+Settings → "Exposed schemas"), not something representable in a SQL
+migration — the Supabase Management API that controls it is a separate
+HTTPS API from the Postgres connection migrations run over, and no tool
+available in this environment could read or change it. That remains
+worth checking directly (see "Action still required" below), but the fix
+below closes the vulnerability regardless of that toggle's state, so it
+wasn't a blocker.
+
+Rather than authoring per-table RLS policies to replicate what
+`app_role`/`admin_role` already do correctly via `GRANT` (which the
+project's own principles call out as unnecessary complexity — "prefer
+deny-by-default rather than dozens of permissive policies"), migration
+`0006_lock_down_data_api.sql` does three things:
+
+1. Revokes schema-level `USAGE` and all object privileges (tables,
+   sequences, functions) from `anon`/`authenticated` on `public`, plus
+   `ALTER DEFAULT PRIVILEGES` so future objects don't automatically
+   re-grant them anything either.
+2. Enables Row Level Security on all 22 tables with **zero policies** —
+   independent, second-layer protection: even if a future migration
+   accidentally re-grants a privilege, RLS still blocks every row for any
+   role that isn't the table owner and doesn't have `BYPASSRLS`.
+3. Grants `BYPASSRLS` to `app_role` and `admin_role` specifically, so RLS
+   is completely transparent to them — their existing grant-based scoping
+   (unchanged by this migration) remains the only thing that governs their
+   access, exactly as designed in migrations 0002/0004.
+
+`claim_status_timeline` (a view, not a table) needed no separate step —
+views don't have their own RLS switch; they run against the querying
+role's privileges on the underlying tables, which the above already
+covers.
+
+**Verified after:** using `SET ROLE anon` / `SET ROLE authenticated`
+directly against the live staging database (the most precise way to
+simulate exactly what a real Data API client session sees) — `SELECT` on
+`claims`, `SELECT` on `admin_users`, `INSERT` on
+`claim_investigation_status_history`, and `INSERT` on `claims` all
+correctly returned `permission denied`. `app_role`/`admin_role` grants
+were confirmed byte-for-byte unchanged by diffing
+`information_schema.role_table_grants` before and after. The full fix was
+also independently verified end-to-end (fresh install, seed, both check
+scripts, running app hitting every public/admin route, a real
+`admin_role` status transition, and confirming `UPDATE` on the history
+ledger still fails) against a local Postgres instance built from the
+complete 0000–0006 migration set before being applied to staging.
+`auth` schema privileges for `anon`/`authenticated` were confirmed
+untouched — Supabase Auth is unaffected.
+
+**Action still required (outside this repo):** in the Supabase dashboard,
+check Settings → API → Data API Settings, and confirm whether `public` is
+listed under "Exposed schemas." If it's not necessary for anything, remove
+it — this is optional additional hardening (the migration above already
+closes the vulnerability regardless), but removes the Data API's ability
+to see the schema at all rather than relying on it correctly enforcing
+zero access.
+
 ## SEO base URL
 
 Previously hardcoded to `https://example.com` in three separate places
