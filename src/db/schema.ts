@@ -101,6 +101,29 @@ export const aiJobStatusEnum = pgEnum("ai_job_status", [
   "failed",
 ]);
 
+// Where one ingestion/discovery attempt currently stands. Unlike
+// discoveryProviders below (an open-ended, growing taxonomy of HOW an item
+// was discovered), this is a small, fixed pipeline vocabulary -- the same
+// reasoning that keeps investigationStatus/developmentOutcome as enums
+// rather than lookup tables (see comment below). No statuses are added
+// speculatively; each one corresponds to a real terminal or in-progress
+// state the future ingestion pipeline will actually produce.
+export const ingestionStatusEnum = pgEnum("ingestion_status", [
+  "queued",
+  "fetching",
+  "stored",
+  "duplicate",
+  "needs_review",
+  "blocked_by_policy",
+  "robots_disallowed",
+  "authentication_required",
+  "paywalled",
+  "unsupported",
+  "fetch_failed",
+  "rate_limited",
+  "malformed",
+]);
+
 /*
  * source_type and source_item_type are intentionally NOT enums.
  *
@@ -249,6 +272,13 @@ export const sourceItems = pgTable(
     itemTypeId: integer("item_type_id").notNull().references(() => sourceItemTypes.id),
     url: text("url").notNull(),
     canonicalUrl: text("canonical_url"),
+    // Normalized form of `url`, written by future ingestion code.
+    // Deliberately indexed but NOT unique: publishers reuse URLs (a
+    // canonical URL's content can change after publication), so "same
+    // normalized URL" cannot mean "same item" at the schema level. Future
+    // ingestion logic distinguishes same-URL-same-hash (duplicate) from
+    // same-URL-different-hash (needs_review) using rawContentHash below.
+    normalizedUrl: text("normalized_url"),
     title: text("title"),
     author: varchar("author", { length: 300 }),
     publishedAt: timestamp("published_at", { withTimezone: true }),
@@ -261,6 +291,7 @@ export const sourceItems = pgTable(
   (t) => ({
     urlIdx: index("source_items_url_idx").on(t.url),
     hashIdx: index("source_items_hash_idx").on(t.rawContentHash),
+    normalizedUrlIdx: index("source_items_normalized_url_idx").on(t.normalizedUrl),
   })
 );
 
@@ -288,6 +319,79 @@ export const sourceRelationships = pgTable(
       t.sourceItemIdB,
       t.relationshipType
     ),
+  })
+);
+
+/* =========================================================================
+ * DISCOVERY / INGESTION (Phase 4 PR 1 — schema foundation only)
+ *
+ * This is the pipeline that will eventually populate `sourceItems`, kept
+ * distinct from the concepts it feeds:
+ *   - discovery: HOW an item was found (discoveryProviders / ingestionJobs
+ *     here) — a pipeline/operational concern.
+ *   - provenance: HOW a source item relates to other reporting
+ *     (sourceRelationships above) — an epistemic concern, orthogonal to
+ *     discovery. An item discovered manually can still be a citation of
+ *     something an RSS feed found first, and vice versa.
+ *   - truth: whether a claim built from that item is actually
+ *     well-evidenced (investigationStatus / developmentOutcome on
+ *     `claims`) — a human/AI-reviewed judgment, never inferred from how or
+ *     how many times something was discovered.
+ *
+ * No fetching, normalization, retry, scheduling, or AI logic exists yet —
+ * only the tables/columns later Phase 4 PRs will read and write.
+ * ========================================================================= */
+
+// Open-ended taxonomy of HOW an item was discovered — same lookup-table
+// pattern as sourceTypes/sourceItemTypes above, for the same reason
+// (expected to grow: manual, rss, and eventually things like an X/Twitter
+// integration, which is deliberately not added yet).
+export const discoveryProviders = pgTable("discovery_providers", {
+  id: serial("id").primaryKey(),
+  slug: varchar("slug", { length: 64 }).notNull().unique(),
+  label: varchar("label", { length: 200 }).notNull(),
+  description: text("description"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// One row per ingestion/discovery attempt.
+export const ingestionJobs = pgTable(
+  "ingestion_jobs",
+  {
+    id: serial("id").primaryKey(),
+    submittedUrl: text("submitted_url").notNull(),
+    normalizedUrl: text("normalized_url").notNull(),
+    discoveryProviderId: integer("discovery_provider_id")
+      .notNull()
+      .references(() => discoveryProviders.id),
+    initiatedBy: initiatedByEnum("initiated_by").notNull(),
+    adminUserId: integer("admin_user_id").references(() => adminUsers.id),
+    status: ingestionStatusEnum("status").notNull().default("queued"),
+    httpStatus: integer("http_status"),
+    contentType: varchar("content_type", { length: 200 }),
+    contentLength: integer("content_length"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    // Separate from createdAt (queue time) — the actual moment a fetch
+    // attempt began. Future per-domain rate limiting needs real
+    // fetch-attempt timing, not queue timing. Not used by any logic yet.
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    nextRetryAt: timestamp("next_retry_at", { withTimezone: true }),
+    failureReason: text("failure_reason"),
+    sourceItemId: integer("source_item_id").references(() => sourceItems.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => ({
+    // Shaped for the approved future in-flight-redundancy rule ("reuse a
+    // job with the same normalizedUrl if one is already queued/fetching
+    // and under an hour old") — not enforced here, no uniqueness
+    // constraint, just an index matching that future query. Partial on
+    // status so the index stays small as jobs settle into a terminal
+    // status. The 1-hour cutoff is application logic and intentionally
+    // not baked into the index definition.
+    inflightLookupIdx: index("ingestion_jobs_inflight_lookup_idx")
+      .on(t.normalizedUrl, t.createdAt)
+      .where(sql`${t.status} IN ('queued', 'fetching')`),
   })
 );
 

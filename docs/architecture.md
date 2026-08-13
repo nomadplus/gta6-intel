@@ -42,6 +42,91 @@ canonicalization here (unlike `claim_relationships` below) because
 provenance is inherently directional — a `citation` always has a
 from/to.
 
+### Discovery / ingestion (Phase 4 PR 1 — schema only)
+
+Three concepts that sound related but answer different questions, kept
+deliberately separate at the schema level:
+
+- **Discovery** — HOW a source item entered the system in the first
+  place (`discovery_providers`: `manual`, `rss`, and later others;
+  `ingestion_jobs`: one row per fetch/discovery attempt). This is a
+  pipeline/operational concern with no epistemic weight of its own —
+  finding something via RSS says nothing about whether it's true.
+- **Provenance** — HOW a source item relates to *other reporting*
+  (`source_relationships`, above). Orthogonal to discovery: an item found
+  manually can be a `citation` of something an RSS feed discovered
+  first, and vice versa. Provenance is what prevents citation chains from
+  being counted as independent corroboration; discovery has no role in
+  that judgment.
+- **Truth** — whether a claim built from that item is actually
+  well-evidenced (`claims.current_investigation_status` /
+  `current_development_outcome`, decided via the two-axis model above,
+  reviewed by an admin). Never inferred from how, or how many times,
+  something was discovered.
+
+`ingestion_jobs` tracks one ingestion/discovery *attempt*, not a source
+item — a single URL can have several attempts (retry after
+`fetch_failed`, a later re-check that finds it's since become
+`paywalled`, etc.), and a successful one eventually produces a row in
+`source_items` via the nullable `source_item_id` FK. `ingestion_status`
+is a small, fixed enum (`queued`, `fetching`, `stored`, `duplicate`,
+`needs_review`, `blocked_by_policy`, `robots_disallowed`,
+`authentication_required`, `paywalled`, `unsupported`, `fetch_failed`,
+`rate_limited`, `malformed`) — deliberately an ENUM rather than a lookup
+table like `discovery_providers`, for the same reason
+`investigation_status`/`development_outcome` are ENUMs: this is a
+tightly controlled pipeline vocabulary that defines real logic, not an
+open-ended taxonomy expected to grow casually.
+
+`ingestion_jobs.created_at` (queue time) and `started_at` (actual fetch
+attempt time) are deliberately separate columns — future per-domain rate
+limiting needs real fetch-attempt timing, not queue timing. Neither
+rate limiting nor any other pipeline logic is implemented yet; this PR
+is schema only.
+
+`source_items.normalized_url` is indexed but **deliberately not
+unique** — publishers reuse URLs (a canonical URL's content can change
+after publication), so "same normalized URL" can never mean "same item"
+at the schema level. The planned duplicate-detection rule is: same URL +
+same `raw_content_hash` (already existed, migration 0000) → `duplicate`;
+same URL + different hash → `needs_review`. That comparison is future
+application logic, not something this migration enforces — the schema
+only adds the column and index it will need.
+
+A related but unenforced rule, noted here because the schema was shaped
+for it: if another `ingestion_jobs` row with the same `normalized_url`
+is currently `queued` or `fetching` and was created within the previous
+hour, future ingestion code should reuse that job rather than starting a
+duplicate one. `ingestion_jobs_inflight_lookup_idx` — a partial index on
+`(normalized_url, created_at)` `WHERE status IN ('queued', 'fetching')`
+— exists to make that future query efficient; there is no uniqueness
+constraint backing it, and the 1-hour window is application logic, kept
+out of the index definition deliberately since it may change.
+
+**Grants:** both new tables get zero grants for `app_role` — the public
+website has no product need to see ingestion pipeline state
+(`discovery_providers` is administrative reference data; `ingestion_jobs`
+holds raw submitted URLs, fetch attempts, and failure reasons, none of
+it published content). `admin_role` gets full `SELECT`/`INSERT`/
+`UPDATE`/`DELETE` on both — neither is an append-only ledger like the
+status-history tables, since a job's status legitimately moves through
+its lifecycle in place. Per the standing rule below, migration 0007 also
+explicitly revokes `anon`/`authenticated` privileges and enables RLS on
+both new tables in the same migration that creates them, rather than
+relying only on migration 0006's schema-wide defaults.
+
+**Standing rule, in effect from migration 0007 onward:** every migration
+that creates an application table must explicitly secure that table in
+the same migration — explicit `REVOKE` from `anon`/`authenticated`,
+explicit `ENABLE ROW LEVEL SECURITY`, explicit grants to
+`app_role`/`admin_role`. Migration 0006's `ALTER DEFAULT PRIVILEGES`
+statements are scoped to the role that ran the migration that set them;
+Supabase's own default privileges for its `supabase_admin` role are a
+separate mechanism that can independently re-grant `anon`/`authenticated`
+access to objects created by a different creating role. Explicit
+per-migration statements are the only thing that isn't contingent on
+which role happens to execute a future migration.
+
 ### Claims
 
 `claims.information_type`: `fact`, `official`, `report`, `leak`,
