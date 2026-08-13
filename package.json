@@ -11,7 +11,9 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
+    "check:admin-auth": "tsx src/checks/adminAuth.check.ts",
     "check:status-presentation": "tsx src/checks/statusPresentation.check.ts",
+    "check": "npm run check:admin-auth && npm run check:status-presentation",
     "db:seed": "tsx src/db/seed/seed.ts"
   },
   "keywords": [],
