@@ -118,6 +118,29 @@ Immutability is enforced twice, deliberately redundantly:
 `admin_decisions`, which is scoped specifically to AI-recommendation
 review) gets the identical append-only treatment.
 
+### Transition evidence: tying evidence to a specific transition
+
+`investigation_transition_evidence` and
+`development_transition_evidence` — two many-to-many join tables, one per
+ledger, each linking a specific row in `claim_investigation_status_history`
+/ `claim_development_outcome_history` (`transition_id`) to a specific
+`evidence` row (`evidence_id`), with a unique constraint on the pair so
+the same evidence can't be linked twice to the same transition.
+
+The distinction these tables exist to make: `claim_evidence` (see
+"Evidence" above) records that a piece of evidence bears on a *claim* in
+general. These two tables record something narrower and more specific —
+that a piece of evidence was the actual justification for *one particular
+status change*. A claim can accumulate evidence for months without any of
+it individually triggering a transition; when a transition does happen,
+these tables are what let a later reviewer ask "what specifically
+justified moving this claim to Confirmed on this date," rather than only
+being able to see everything ever linked to the claim as a whole and
+having to guess which parts were relevant to which change. This is the
+same "represent uncertainty and specificity rather than flattening it"
+principle behind `source_relationships` and the two-axis status model —
+here applied to the evidentiary basis for history itself.
+
 ---
 
 ## Migration history reconciliation
