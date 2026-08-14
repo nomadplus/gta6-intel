@@ -157,3 +157,37 @@ export const createClaimRelationshipSchema = z
     message: "A claim cannot have a relationship to itself",
     path: ["claimIdB"],
   });
+
+/* =========================================================================
+ * INGESTION (Phase 4 PR 4 — manual ingestion pipeline core)
+ * ========================================================================= */
+
+/** Input to submitUrlForIngestion. Deliberately just the URL -- everything else (discoveryProvider=manual, initiatedBy=human, adminUserId) is derived server-side from the authenticated admin, never client-supplied. */
+export const submitIngestionUrlSchema = z.object({
+  url: z.string().trim().min(1, "A URL is required").url("Must be a valid absolute URL"),
+});
+
+/**
+ * Input to finalizeIngestionConfirmation. `jobId` identifies the
+ * `ready_for_confirmation` job being confirmed; the rest mirrors
+ * createSourceItemSchema's fields, since finalization ultimately inserts
+ * a `source_items` row -- but every field here is admin-supplied/
+ * -editable at confirmation time (Section 12: nothing is auto-created
+ * or auto-trusted merely because the pipeline extracted it). `itemTypeId`
+ * has no automatic default -- classifying "article" vs "press_release"
+ * vs "official_statement" etc. is a human judgment this PR does not
+ * attempt to infer.
+ */
+export const confirmIngestionSchema = z.object({
+  jobId: z.coerce.number().int().positive(),
+  sourceId: z.coerce.number().int().positive(),
+  itemTypeId: z.coerce.number().int().positive(),
+  title: z.string().trim().max(500).optional(),
+  author: z.string().trim().max(300).optional(),
+  publishedAt: z.coerce.date().optional(),
+  excerpt: z
+    .string()
+    .trim()
+    .max(600, "Keep excerpts short -- this is not a place to store full article text")
+    .optional(),
+});
