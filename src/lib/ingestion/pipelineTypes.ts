@@ -7,6 +7,17 @@
 import type { FailureIngestionStatus } from "./statusMapping";
 
 export interface ReviewMetadata {
+  /**
+   * The actual retrieved URL (`fetchResult.finalUrl`, post-redirects) --
+   * NOT necessarily the same as what the admin originally submitted.
+   * PR 5 gap fix: this was missing from PR 4's ReviewMetadata even
+   * though `finalizeIngestionConfirmation` requires it as `reviewData.url`
+   * to create the `source_items` row. Added here rather than reusing
+   * `canonicalUrl` (a distinct, page-declared value that may be absent
+   * or point somewhere else entirely) or reconstructing it later, since
+   * `finalUrl` only exists transiently inside pipeline.ts's fetch result.
+   */
+  url: string;
   title: string | null;
   /** Hard-capped, ~500-char-max excerpt -- never full article text (Section 6). */
   excerpt: string | null;

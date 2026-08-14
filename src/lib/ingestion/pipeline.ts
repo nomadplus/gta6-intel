@@ -109,6 +109,7 @@ export async function submitUrlForIngestion(input: unknown): Promise<IngestionPi
   const postNormalizedUrl = finalNormalized.ok ? finalNormalized.normalizedUrl : preNormalizedUrl;
 
   const reviewMetadata: ReviewMetadata = {
+    url: fetchResult.finalUrl,
     title: extracted.title,
     excerpt: extracted.excerpt,
     author: extracted.author,
