@@ -1,0 +1,80 @@
+/**
+ * Typed result API for the manual ingestion pipeline (Section 17).
+ * PR 5's admin UI is expected to switch on `kind` rather than parse
+ * strings -- every branch carries exactly the structured fields that
+ * branch needs, nothing more.
+ */
+import type { FailureIngestionStatus } from "./statusMapping";
+
+export interface ReviewMetadata {
+  title: string | null;
+  /** Hard-capped, ~500-char-max excerpt -- never full article text (Section 6). */
+  excerpt: string | null;
+  author: string | null;
+  publishedAt: Date | null;
+  canonicalUrl: string | null;
+  retrievedAt: Date;
+  rawContentHash: string;
+  httpStatus: number;
+  contentType: string;
+}
+
+interface BaseResult {
+  /** The ingestion_jobs row this result corresponds to. */
+  jobId: number;
+}
+
+/** Section 2: an in-flight job with the same normalizedUrl already exists; nothing new was created or fetched. */
+export interface ExistingInflightResult extends BaseResult {
+  kind: "existing_inflight";
+  existingJobId: number;
+  existingStatus: "queued" | "fetching";
+}
+
+/** Section 8: same URL, same content hash as an existing source_items row -- linked, not duplicated. */
+export interface DuplicateResult extends BaseResult {
+  kind: "duplicate";
+  sourceItemId: number;
+  matchedOn: "normalizedUrl" | "canonicalUrl";
+}
+
+export type NeedsReviewReason =
+  /** Section 8: same URL as an existing item, but a different content hash. */
+  | "hash_mismatch"
+  /** Section 10: fetched hostname didn't match exactly one known source. */
+  | "no_source_match"
+  | "ambiguous_source_match"
+  /** Section 5: HTTP 403 alone is genuinely ambiguous (bot-block, geo-block, or paywall). */
+  | "ambiguous_forbidden_response";
+
+export interface NeedsReviewResult extends BaseResult {
+  kind: "needs_review";
+  reason: NeedsReviewReason;
+  /** Present for hash_mismatch/no_source_match/ambiguous_source_match (all follow a successful fetch); null for ambiguous_forbidden_response, where the fetch itself did not succeed. */
+  metadata: ReviewMetadata | null;
+  candidateSourceItemId?: number;
+  candidateSourceIds?: number[];
+}
+
+/** Section 10/12: exactly one candidate source proposed, no duplicate, nothing persisted yet -- awaiting explicit admin confirmation. */
+export interface ReadyForConfirmationResult extends BaseResult {
+  kind: "ready_for_confirmation";
+  metadata: ReviewMetadata;
+  proposedSourceId: number;
+  /** Section 9: same content hash found at an unrelated URL -- surfaced for provenance review, never auto-collapsed. */
+  hashCoincidenceSourceItemIds: number[];
+}
+
+/** A definitive, terminal non-success classification (policy block, auth wall, paywall, unsupported content, transient/retryable failure, etc). */
+export interface FailedResult extends BaseResult {
+  kind: "failed";
+  status: FailureIngestionStatus;
+  failureReason: string;
+}
+
+export type IngestionPipelineResult =
+  | ExistingInflightResult
+  | DuplicateResult
+  | NeedsReviewResult
+  | ReadyForConfirmationResult
+  | FailedResult;
