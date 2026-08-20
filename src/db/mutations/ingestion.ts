@@ -5,6 +5,7 @@ import { ingestionJobs, discoveryProviders, sourceItems, sources } from "@/db/sc
 import { requireAdmin, type AuthorizedAdmin } from "@/lib/auth/requireAdmin";
 import { submitIngestionUrlSchema, confirmIngestionSchema } from "@/lib/validation/adminSchemas";
 import { normalizeUrl } from "@/lib/ingestion/urlNormalization";
+import { verifyReviewPayload } from "@/lib/ingestion/reviewPayloadSigning";
 import {
   findReusableInflightJob,
   beginFetchAttempt,
@@ -248,11 +249,19 @@ export class JobNotConfirmableError extends Error {
  * explicit call (which PR 5's admin UI will invoke from a confirm
  * button; PR 4 wires the function, not the button).
  *
- * `reviewData` carries the pipeline-derived, non-admin-editable facts
- * (the actual retrieved URL, its hash, its canonical URL) that must
- * survive from the original fetch to this confirmation call -- PR 5's
- * UI is expected to round-trip these from the `ready_for_confirmation`
- * result it displayed, not let the admin edit them.
+ * `reviewData` -- the pipeline-derived, non-admin-editable facts (the
+ * actual retrieved URL, its hash, its canonical URL) that must survive
+ * from the original fetch to this confirmation call -- is decoded from
+ * `input.reviewToken` below, NOT accepted as separate raw fields (PR 5
+ * security condition). `ingestion_jobs` still has no columns to persist
+ * it server-side between fetch and confirm (see PR 4 planning notes),
+ * so it still round-trips through the browser -- but as an opaque,
+ * HMAC-signed token (reviewPayloadSigning.ts) rather than editable
+ * hidden form fields, since `url` and `rawContentHash` specifically
+ * back the whole duplicate-detection integrity guarantee, not just
+ * cosmetic metadata. `verifyReviewPayload` also checks the token's
+ * embedded `jobId` against `data.jobId`, which is what actually
+ * prevents a token from being replayed against a different job.
  *
  * Re-verifies the job is actually still eligible (status = 'needs_review'
  * -- see pipeline.ts's note on why BOTH `ready_for_confirmation` and
@@ -261,39 +270,21 @@ export class JobNotConfirmableError extends Error {
  * "awaiting confirmation" value -- and `source_item_id IS NULL`) inside
  * the same transaction via `for("update")`, so two concurrent
  * confirmations of the same job cannot both succeed.
- *
- * TRUST BOUNDARY, explicitly decided rather than silently assumed:
- * `reviewData` is NOT persisted anywhere server-side between the
- * original fetch and this call (ingestion_jobs has no columns for it --
- * see PR 4 planning notes), so PR 5's confirm action must round-trip it
- * from the original `ready_for_confirmation`/`needs_review` response
- * (e.g. hidden form fields), and this function trusts what it's given
- * rather than re-deriving it from a stored copy. This is acceptable
- * because only authenticated 'editor'+ admins can reach this function
- * at all, and Section 12 already expects the admin to be able to
- * review/edit metadata before confirming -- but `url` and
- * `rawContentHash` specifically back the whole duplicate-detection
- * integrity guarantee, not just cosmetic metadata, so they get a cheap
- * shape check below rather than being written through unchecked.
  */
-export async function finalizeIngestionConfirmation(
-  input: unknown,
-  reviewData: {
-    url: string;
-    canonicalUrl: string | null;
-    excerpt: string | null;
-    rawContentHash: string;
-  }
-): Promise<{ sourceItemId: number }> {
+export async function finalizeIngestionConfirmation(input: unknown): Promise<{ sourceItemId: number }> {
   await requireAdmin("editor");
   const data = confirmIngestionSchema.parse(input);
+  const reviewData = verifyReviewPayload(data.reviewToken, data.jobId);
 
   const normalizedResult = normalizeUrl(reviewData.url);
   if (!normalizedResult.ok) {
-    throw new InvalidSubmissionUrlError("reviewData.url is not a valid absolute URL.");
+    // Should be unreachable -- the signed token's `url` was itself
+    // produced by a successful normalizeUrl call in pipeline.ts. Kept
+    // as a defensive check rather than a silent `!` assertion.
+    throw new InvalidSubmissionUrlError("reviewData.url (from the signed review token) is not a valid absolute URL.");
   }
   if (!/^[a-f0-9]{64}$/.test(reviewData.rawContentHash)) {
-    throw new Error("reviewData.rawContentHash is not a well-formed SHA-256 hex digest.");
+    throw new Error("reviewData.rawContentHash (from the signed review token) is not a well-formed SHA-256 hex digest.");
   }
   const storedNormalizedUrl = normalizedResult.normalizedUrl;
 

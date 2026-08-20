@@ -199,6 +199,7 @@ production.
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase Auth client (server + browser) | Supabase anon/public key |
 | `NEXT_PUBLIC_SITE_URL` | `src/lib/siteConfig.ts` (sitemap, robots, metadata) | canonical public base URL; set to `https://gta6-intel.vercel.app` for staging |
 | `LOCAL_FAKE_ADMIN_AUTH_USER_ID` | `src/lib/auth/session.ts` | **local development only** — see "Supabase Auth" above |
+| `INGESTION_REVIEW_SIGNING_SECRET` | `src/lib/ingestion/reviewPayloadSigning.ts` | HMAC secret binding manual-ingestion review data (retrieved URL, content hash) to the admin's confirm request, so hidden form fields can't substitute tampered values — see that file's header comment. Generate with e.g. `openssl rand -hex 32`; rotating it invalidates any in-flight (unconfirmed) review tokens, which is safe — the admin just resubmits the URL. |
 
 ---
 

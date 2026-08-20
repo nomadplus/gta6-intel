@@ -190,4 +190,13 @@ export const confirmIngestionSchema = z.object({
     .trim()
     .max(600, "Keep excerpts short -- this is not a place to store full article text")
     .optional(),
+  /**
+   * PR 5 security condition: the actual retrieved URL, canonical URL,
+   * excerpt fallback, and content hash are NOT accepted as raw form
+   * fields here -- they travel only inside this signed, HMAC-verified
+   * token (see reviewPayloadSigning.ts), so a tampered hidden field
+   * can't substitute different review data than what the pipeline
+   * actually fetched and hashed.
+   */
+  reviewToken: z.string().min(1, "Missing review token -- resubmit the URL to review it again"),
 });
