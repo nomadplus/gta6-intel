@@ -200,3 +200,31 @@ export const confirmIngestionSchema = z.object({
    */
   reviewToken: z.string().min(1, "Missing review token -- resubmit the URL to review it again"),
 });
+
+/* =========================================================================
+ * DISCOVERY FEEDS (Phase 4 PR 8 — feed configuration)
+ * ========================================================================= */
+
+/**
+ * Input to createDiscoveryFeed. `feedUrl` here is whatever the admin
+ * typed -- just checked for basic shape (a plausibly-absolute URL
+ * string). The mutation layer, not this schema, is responsible for
+ * running it through normalizeUrl() and rejecting anything that fails
+ * that stricter check (unsupported scheme, embedded credentials, etc.) --
+ * see src/db/mutations/discoveryFeeds.ts.
+ */
+export const createDiscoveryFeedSchema = z.object({
+  sourceId: z.coerce.number().int().positive(),
+  feedUrl: z.string().trim().min(1, "A feed URL is required").url("Must be a valid absolute URL"),
+  // Deliberately NOT z.coerce.boolean() -- Boolean("false") is true in
+  // JS, and an unchecked HTML checkbox sends no field at all (which would
+  // make .default(true) win even when the admin explicitly unchecked it).
+  // The form renders this as an explicit "true"/"false" <select>, not a
+  // checkbox, so both states are always present as a real submitted value.
+  enabled: z.enum(["true", "false"]).default("true").transform((v) => v === "true"),
+  pollingIntervalMinutes: z.coerce.number().int().positive().default(60),
+});
+
+export const updateDiscoveryFeedSchema = createDiscoveryFeedSchema.extend({
+  feedId: z.coerce.number().int().positive(),
+});

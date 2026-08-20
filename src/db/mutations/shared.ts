@@ -49,7 +49,9 @@ export type AdminAuditEntityType =
   // Added in migration 0008 (Phase 4 PR 6) -- kept in sync with
   // adminAuditEntityTypeEnum in src/db/schema.ts by hand, since this type
   // is a manual mirror rather than derived from the Drizzle enum.
-  | "ingestion_job";
+  | "ingestion_job"
+  // Added in migration 0010 (Phase 4 PR 8).
+  | "discovery_feed";
 
 /**
  * Writes one admin_audit_log row. Metadata must be structured context

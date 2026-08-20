@@ -220,6 +220,9 @@ export const adminAuditEntityTypeEnum = pgEnum("admin_audit_entity_type", [
   // src/db/mutations/ingestion.ts during PR 4 planning, where ingestion
   // job creation/completion had no audit_log entity type to log against.
   "ingestion_job",
+  // Added in migration 0010 (Phase 4 PR 8) -- discovery feed
+  // create/update/enable/disable actions.
+  "discovery_feed",
 ]);
 
 export const adminAuditLog = pgTable("admin_audit_log", {
@@ -413,6 +416,62 @@ export const ingestionJobs = pgTable(
     inflightLookupIdx: index("ingestion_jobs_inflight_lookup_idx")
       .on(t.normalizedUrl, t.createdAt)
       .where(sql`${t.status} IN ('queued', 'fetching')`),
+  })
+);
+
+/* =========================================================================
+ * DISCOVERY FEEDS (Phase 4 PR 8 — feed configuration only)
+ *
+ * An admin-managed list of RSS/Atom feeds the system should eventually
+ * poll. This table only stores configuration — no fetching, parsing,
+ * scheduling, or ingestion_jobs creation happens yet (that is PR 9's
+ * automated job processor and PR 10's RSS poller). last_polled_at /
+ * last_poll_status exist now so PR 10 doesn't need its own schema change
+ * for two columns that clearly belong on this table.
+ *
+ * feedUrl deliberately has only ONE URL column, unlike ingestion_jobs/
+ * source_items' submitted/normalized/canonical trio: those preserve
+ * exactly what was submitted or retrieved as historical evidence. A feed
+ * URL is operational config, not a historical record — there is nothing
+ * to preserve "as originally typed" if its normalized form changes. The
+ * application layer (src/db/mutations/discoveryFeeds.ts) writes the
+ * already-normalized form here via the existing normalizeUrl() from
+ * src/lib/ingestion/urlNormalization.ts, reused rather than reimplemented,
+ * so the database uniqueness constraint below actually prevents
+ * equivalent duplicate feed configurations rather than merely
+ * byte-identical ones.
+ *
+ * sourceId is required (NOT NULL, no inline source creation from this
+ * table's admin form) — a feed always belongs to an existing sources row,
+ * per product decision; source creation stays in the existing Sources
+ * admin workflow.
+ * ========================================================================= */
+
+export const discoveryFeeds = pgTable(
+  "discovery_feeds",
+  {
+    id: serial("id").primaryKey(),
+    sourceId: integer("source_id")
+      .notNull()
+      .references(() => sources.id),
+    feedUrl: text("feed_url").notNull(),
+    enabled: boolean("enabled").notNull().default(true),
+    pollingIntervalMinutes: integer("polling_interval_minutes").notNull().default(60),
+    // Both null until PR 10's poller exists to write them.
+    lastPolledAt: timestamp("last_polled_at", { withTimezone: true }),
+    // Free text (a short human-readable outcome) rather than an enum —
+    // this is a single rolling observability status, not a pipeline state
+    // machine with its own transition logic like ingestion_status.
+    lastPollStatus: text("last_poll_status"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    feedUrlUnique: uniqueIndex("discovery_feeds_feed_url_unique").on(t.feedUrl),
+    sourceIdIdx: index("discovery_feeds_source_id_idx").on(t.sourceId),
+    pollingIntervalPositive: check(
+      "discovery_feeds_polling_interval_positive",
+      sql`${t.pollingIntervalMinutes} > 0`
+    ),
   })
 );
 

@@ -18,6 +18,7 @@ import {
   aiJobs,
   ingestionJobs,
   discoveryProviders,
+  discoveryFeeds,
 } from "@/db/schema";
 
 export async function listClaimsForAdmin() {
@@ -138,6 +139,51 @@ export async function getIngestionJobForAdmin(id: number) {
     .leftJoin(adminUsers, eq(adminUsers.id, ingestionJobs.adminUserId))
     .leftJoin(sourceItems, eq(sourceItems.id, ingestionJobs.sourceItemId))
     .where(eq(ingestionJobs.id, id))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * Discovery feed configuration (Phase 4 PR 8) — read-only observability
+ * over `discovery_feeds`. Inner join to `sources`, since sourceId is
+ * NOT NULL (every feed must reference an existing source; no inline
+ * source creation from this table). Nothing here is fetched or polled --
+ * `lastPolledAt`/`lastPollStatus` remain null until PR 10's poller exists.
+ */
+export async function listDiscoveryFeedsForAdmin() {
+  return adminDb
+    .select({
+      id: discoveryFeeds.id,
+      feedUrl: discoveryFeeds.feedUrl,
+      enabled: discoveryFeeds.enabled,
+      pollingIntervalMinutes: discoveryFeeds.pollingIntervalMinutes,
+      lastPolledAt: discoveryFeeds.lastPolledAt,
+      lastPollStatus: discoveryFeeds.lastPollStatus,
+      sourceId: sources.id,
+      sourceName: sources.name,
+      createdAt: discoveryFeeds.createdAt,
+    })
+    .from(discoveryFeeds)
+    .innerJoin(sources, eq(sources.id, discoveryFeeds.sourceId))
+    .orderBy(desc(discoveryFeeds.createdAt));
+}
+
+export async function getDiscoveryFeedForAdmin(id: number) {
+  const rows = await adminDb
+    .select({
+      id: discoveryFeeds.id,
+      feedUrl: discoveryFeeds.feedUrl,
+      enabled: discoveryFeeds.enabled,
+      pollingIntervalMinutes: discoveryFeeds.pollingIntervalMinutes,
+      lastPolledAt: discoveryFeeds.lastPolledAt,
+      lastPollStatus: discoveryFeeds.lastPollStatus,
+      sourceId: sources.id,
+      sourceName: sources.name,
+      createdAt: discoveryFeeds.createdAt,
+    })
+    .from(discoveryFeeds)
+    .innerJoin(sources, eq(sources.id, discoveryFeeds.sourceId))
+    .where(eq(discoveryFeeds.id, id))
     .limit(1);
   return rows[0] ?? null;
 }

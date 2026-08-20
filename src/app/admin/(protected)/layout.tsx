@@ -28,6 +28,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
             <AdminNavLink href="/admin/topics">Topics</AdminNavLink>
             <AdminNavLink href="/admin/ingest">Ingest</AdminNavLink>
             <AdminNavLink href="/admin/ingest/history">Ingestion History</AdminNavLink>
+            <AdminNavLink href="/admin/discovery-feeds">Discovery Feeds</AdminNavLink>
             <AdminNavLink href="/admin/review">AI/Admin Review</AdminNavLink>
           </nav>
           <div className="mt-8 border-t border-hairline pt-4 font-mono text-[11px] text-ink-600">
