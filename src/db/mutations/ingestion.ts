@@ -6,6 +6,7 @@ import { requireAdmin, type AuthorizedAdmin } from "@/lib/auth/requireAdmin";
 import { submitIngestionUrlSchema, confirmIngestionSchema } from "@/lib/validation/adminSchemas";
 import { normalizeUrl } from "@/lib/ingestion/urlNormalization";
 import { verifyReviewPayload } from "@/lib/ingestion/reviewPayloadSigning";
+import { logAdminAction } from "./shared";
 import {
   findReusableInflightJob,
   beginFetchAttempt,
@@ -18,14 +19,19 @@ import type { CandidateSource } from "@/lib/ingestion/sourceIdentity";
 import type { IngestionFailureOutcome } from "@/lib/ingestion/statusMapping";
 
 /**
- * NOTE on admin_audit_log: ingestion job creation and lifecycle
- * transitions are deliberately NOT logged there in this PR.
- * `admin_audit_entity_type` has no `ingestion_job` value (a genuine
- * schema gap, flagged during PR 4 planning), and per explicit decision
- * this PR does not add one -- ingestion is left unaudited there for
- * now. `ingestion_jobs.admin_user_id`/`created_at`/`completed_at`
- * remain the (thinner, mutable-in-place) record of who/when. Revisit
- * if/when a future PR wants full audit-log coverage for ingestion.
+ * NOTE on admin_audit_log (updated in Phase 4 PR 6): the `ingestion_job`
+ * gap flagged during PR 4 planning is now closed (migration 0008). Audit
+ * logging here is deliberately scoped to the two points that are an
+ * actual admin-initiated action -- creating a new job (the submit click)
+ * and confirming one (the confirm click) -- not every intermediate
+ * pipeline-driven status write in between (markJobFetchStarted,
+ * completeJobFailure, completeJobReviewOutcome). Those intermediate
+ * writes are automatic consequences of the one submit click that already
+ * produced an audit entry, not separate admin decisions, so logging them
+ * too would just be noise on top of the entry that already covers that
+ * click. `ingestion_jobs.admin_user_id`/`created_at`/`completed_at`
+ * remain the thinner, mutable-in-place record of who/when for those
+ * intermediate states.
  */
 
 // ---------------------------------------------------------------------------
@@ -97,7 +103,7 @@ export type FindOrCreateJobResult =
 export async function findOrCreateIngestionJob(params: {
   submittedUrl: string;
   normalizedUrl: string;
-  adminId: number;
+  admin: AuthorizedAdmin;
 }): Promise<FindOrCreateJobResult> {
   const manualProviderId = await getManualDiscoveryProviderId();
 
@@ -121,6 +127,9 @@ export async function findOrCreateIngestionJob(params: {
     const reusable = findReusableInflightJob(candidates, new Date());
     if (reusable) {
       const [job] = await tx.select().from(ingestionJobs).where(eq(ingestionJobs.id, reusable.id)).limit(1);
+      // Deliberately NOT logged -- reusing an in-flight job is not a new
+      // admin action, it's this same click being deduplicated against one
+      // that already has (or will have) its own creation log entry.
       return { reused: true, job: job! };
     }
 
@@ -131,10 +140,17 @@ export async function findOrCreateIngestionJob(params: {
         normalizedUrl: params.normalizedUrl,
         discoveryProviderId: manualProviderId,
         initiatedBy: "human",
-        adminUserId: params.adminId,
+        adminUserId: params.admin.id,
         status: "queued",
       })
       .returning();
+
+    await logAdminAction(tx, params.admin, {
+      action: "create",
+      entityType: "ingestion_job",
+      entityId: job!.id,
+      summary: `Submitted URL for ingestion: ${params.submittedUrl}`,
+    });
 
     return { reused: false, job: job! };
   });
@@ -270,9 +286,15 @@ export class JobNotConfirmableError extends Error {
  * "awaiting confirmation" value -- and `source_item_id IS NULL`) inside
  * the same transaction via `for("update")`, so two concurrent
  * confirmations of the same job cannot both succeed.
+ *
+ * Logs TWO audit entries in the same transaction as the writes (Phase 4
+ * PR 6): a `source_item` `create` entry -- bringing this path in line
+ * with the manual "New Source Item" admin form, which already logged
+ * this and this path previously did not -- and an `ingestion_job`
+ * `update` entry recording that this specific job reached `stored`.
  */
 export async function finalizeIngestionConfirmation(input: unknown): Promise<{ sourceItemId: number }> {
-  await requireAdmin("editor");
+  const admin = await requireAdmin("editor");
   const data = confirmIngestionSchema.parse(input);
   const reviewData = verifyReviewPayload(data.reviewToken, data.jobId);
 
@@ -321,6 +343,20 @@ export async function finalizeIngestionConfirmation(input: unknown): Promise<{ s
       .update(ingestionJobs)
       .set({ status: "stored", sourceItemId: sourceItem!.id, completedAt: new Date() })
       .where(eq(ingestionJobs.id, data.jobId));
+
+    await logAdminAction(tx, admin, {
+      action: "create",
+      entityType: "source_item",
+      entityId: sourceItem!.id,
+      summary: `Created source item "${sourceItem!.title ?? sourceItem!.url}" via ingestion job #${data.jobId}`,
+    });
+
+    await logAdminAction(tx, admin, {
+      action: "update",
+      entityType: "ingestion_job",
+      entityId: data.jobId,
+      summary: `Confirmed ingestion job #${data.jobId}, stored as source item #${sourceItem!.id}`,
+    });
 
     return { sourceItemId: sourceItem!.id };
   });

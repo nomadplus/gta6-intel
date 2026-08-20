@@ -45,7 +45,7 @@ export async function submitUrlForIngestion(input: unknown): Promise<IngestionPi
   const jobResult = await findOrCreateIngestionJob({
     submittedUrl,
     normalizedUrl: preNormalizedUrl,
-    adminId: admin.id,
+    admin,
   });
 
   if (jobResult.reused) {
