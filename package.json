@@ -22,7 +22,8 @@
     "check:ingestion-duplicate-detection": "tsx src/checks/ingestionDuplicateDetection.check.ts",
     "check:ingestion-source-identity": "tsx src/checks/ingestionSourceIdentity.check.ts",
     "check:ingestion-job-lifecycle": "tsx src/checks/ingestionJobLifecycle.check.ts",
-    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch && npm run check:ingestion-content-hash && npm run check:ingestion-metadata-extraction && npm run check:ingestion-status-mapping && npm run check:ingestion-duplicate-detection && npm run check:ingestion-source-identity && npm run check:ingestion-job-lifecycle",
+    "check:ingestion-audit-logging": "tsx --conditions=react-server src/checks/ingestionAuditLogging.check.ts",
+    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch && npm run check:ingestion-content-hash && npm run check:ingestion-metadata-extraction && npm run check:ingestion-status-mapping && npm run check:ingestion-duplicate-detection && npm run check:ingestion-source-identity && npm run check:ingestion-job-lifecycle && npm run check:ingestion-audit-logging",
     "db:seed": "tsx src/db/seed/seed.ts"
   },
   "keywords": [],

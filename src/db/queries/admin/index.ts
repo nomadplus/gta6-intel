@@ -16,6 +16,8 @@ import {
   aiResults,
   adminDecisions,
   aiJobs,
+  ingestionJobs,
+  discoveryProviders,
 } from "@/db/schema";
 
 export async function listClaimsForAdmin() {
@@ -74,6 +76,57 @@ export async function listSourceItemsForAdmin() {
 
 export async function getSourceItemForAdmin(id: number) {
   const rows = await adminDb.select().from(sourceItems).where(eq(sourceItems.id, id)).limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * Ingestion job history/queue (Phase 4 PR 6) — read-only observability
+ * over `ingestion_jobs`. `discoveryProviders` is an inner join (the FK is
+ * NOT NULL); `adminUsers` and `sourceItems` are left joins since a job can
+ * predate an admin link or never resolve to a stored item (most
+ * `needs_review`/failure outcomes never do).
+ */
+const ingestionJobListSelection = {
+  id: ingestionJobs.id,
+  submittedUrl: ingestionJobs.submittedUrl,
+  normalizedUrl: ingestionJobs.normalizedUrl,
+  status: ingestionJobs.status,
+  discoveryProviderLabel: discoveryProviders.label,
+  initiatedBy: ingestionJobs.initiatedBy,
+  adminDisplayName: adminUsers.displayName,
+  httpStatus: ingestionJobs.httpStatus,
+  contentType: ingestionJobs.contentType,
+  contentLength: ingestionJobs.contentLength,
+  attemptCount: ingestionJobs.attemptCount,
+  startedAt: ingestionJobs.startedAt,
+  nextRetryAt: ingestionJobs.nextRetryAt,
+  failureReason: ingestionJobs.failureReason,
+  sourceItemId: ingestionJobs.sourceItemId,
+  sourceItemTitle: sourceItems.title,
+  sourceItemUrl: sourceItems.url,
+  createdAt: ingestionJobs.createdAt,
+  completedAt: ingestionJobs.completedAt,
+} as const;
+
+export async function listIngestionJobsForAdmin() {
+  return adminDb
+    .select(ingestionJobListSelection)
+    .from(ingestionJobs)
+    .innerJoin(discoveryProviders, eq(discoveryProviders.id, ingestionJobs.discoveryProviderId))
+    .leftJoin(adminUsers, eq(adminUsers.id, ingestionJobs.adminUserId))
+    .leftJoin(sourceItems, eq(sourceItems.id, ingestionJobs.sourceItemId))
+    .orderBy(desc(ingestionJobs.createdAt));
+}
+
+export async function getIngestionJobForAdmin(id: number) {
+  const rows = await adminDb
+    .select(ingestionJobListSelection)
+    .from(ingestionJobs)
+    .innerJoin(discoveryProviders, eq(discoveryProviders.id, ingestionJobs.discoveryProviderId))
+    .leftJoin(adminUsers, eq(adminUsers.id, ingestionJobs.adminUserId))
+    .leftJoin(sourceItems, eq(sourceItems.id, ingestionJobs.sourceItemId))
+    .where(eq(ingestionJobs.id, id))
+    .limit(1);
   return rows[0] ?? null;
 }
 

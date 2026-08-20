@@ -216,6 +216,10 @@ export const adminAuditEntityTypeEnum = pgEnum("admin_audit_entity_type", [
   "source_relationship",
   "investigation_status_history",
   "development_outcome_history",
+  // Added in migration 0008 (Phase 4 PR 6) -- closes the gap flagged in
+  // src/db/mutations/ingestion.ts during PR 4 planning, where ingestion
+  // job creation/completion had no audit_log entity type to log against.
+  "ingestion_job",
 ]);
 
 export const adminAuditLog = pgTable("admin_audit_log", {
