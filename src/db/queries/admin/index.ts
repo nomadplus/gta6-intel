@@ -106,6 +106,18 @@ const ingestionJobListSelection = {
   sourceItemUrl: sourceItems.url,
   createdAt: ingestionJobs.createdAt,
   completedAt: ingestionJobs.completedAt,
+  // Added in migration 0009 (Phase 4 PR 7) -- surfaced so the History detail
+  // page can show what was extracted and, for a still-open needs_review job,
+  // offer a re-signed confirm form via prepareHistoryReviewConfirmation
+  // (db/mutations/ingestion.ts) rather than requiring these to be re-derived
+  // from scratch here.
+  retrievedUrl: ingestionJobs.retrievedUrl,
+  canonicalUrl: ingestionJobs.canonicalUrl,
+  rawContentHash: ingestionJobs.rawContentHash,
+  extractedTitle: ingestionJobs.extractedTitle,
+  extractedAuthor: ingestionJobs.extractedAuthor,
+  extractedPublishedAt: ingestionJobs.extractedPublishedAt,
+  extractedExcerpt: ingestionJobs.extractedExcerpt,
 } as const;
 
 export async function listIngestionJobsForAdmin() {

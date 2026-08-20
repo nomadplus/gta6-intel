@@ -152,7 +152,11 @@ function ResultPanel({
         <div className={panelClass}>
           <p className="text-ink-100">Needs manual review — {formatNeedsReviewReason(result.reason)}</p>
           <p className="mt-1 text-ink-400">
-            No confirm action is offered here for review-only outcomes; handle these from the AI/Admin Review workflow.
+            No confirm action is offered here for review-only outcomes — resolve this later from{" "}
+            <a href={`/admin/ingest/history/${result.jobId}`} className="text-accent-brass hover:underline">
+              this job&apos;s History entry
+            </a>
+            , once it&apos;s been recorded.
           </p>
           {result.candidateSourceItemId && (
             <a
