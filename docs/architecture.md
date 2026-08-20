@@ -127,6 +127,42 @@ access to objects created by a different creating role. Explicit
 per-migration statements are the only thing that isn't contingent on
 which role happens to execute a future migration.
 
+### Discovery feeds (Phase 4 PR 8 — feed configuration only)
+
+`discovery_feeds` (migration 0011) lets an admin register RSS/Atom feeds
+to monitor. This PR is configuration storage only — no fetching,
+parsing, scheduling, or `ingestion_jobs` creation exists yet; that is
+PR 9's automated job processor and PR 10's RSS poller. `last_polled_at`/
+`last_poll_status` are columns reserved for PR 10 and are written by
+nothing until then.
+
+**Why `feed_url` is a single column, unlike ingestion's submitted/
+normalized/canonical trio:** `ingestion_jobs` and `source_items` each
+keep the originally-submitted or originally-retrieved URL alongside its
+normalized form, because that data is historical evidence — what was
+actually submitted or fetched must be preserved verbatim for audit and
+provenance, independent of how its normalized form is later computed.
+`discovery_feeds.feed_url` has no such requirement: it is operational
+configuration (which feed the system should poll right now), not a
+historical record of an event that happened. There is nothing to
+preserve "as originally typed" — if a feed's normalized form would
+change (a tracking parameter stripped, a trailing slash removed), the
+config should simply reflect the corrected value, not retain a stale
+submitted variant next to it for no purpose. Accordingly, the admin
+mutation layer (`src/db/mutations/discoveryFeeds.ts`) normalizes the
+submitted feed URL via the existing `normalizeUrl()`
+(`src/lib/ingestion/urlNormalization.ts`, reused rather than
+reimplemented) *before* writing it, and `feed_url` stores only that
+normalized result. This is also what makes the table's
+`discovery_feeds_feed_url_unique` constraint actually work as intended:
+uniqueness on a normalized column prevents equivalent duplicate feed
+configurations (e.g. the same feed with and without a `utm_source` query
+parameter), not merely byte-identical ones.
+
+`source_id` is `NOT NULL` with no inline source creation from the feed
+form — a feed always references an existing `sources` row, per product
+decision; source creation stays in the existing Sources admin workflow.
+
 ### Claims
 
 `claims.information_type`: `fact`, `official`, `report`, `leak`,
