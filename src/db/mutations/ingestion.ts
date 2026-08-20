@@ -5,7 +5,7 @@ import { ingestionJobs, discoveryProviders, sourceItems, sources } from "@/db/sc
 import { requireAdmin, type AuthorizedAdmin } from "@/lib/auth/requireAdmin";
 import { submitIngestionUrlSchema, confirmIngestionSchema } from "@/lib/validation/adminSchemas";
 import { normalizeUrl } from "@/lib/ingestion/urlNormalization";
-import { verifyReviewPayload } from "@/lib/ingestion/reviewPayloadSigning";
+import { verifyReviewPayload, signReviewPayload } from "@/lib/ingestion/reviewPayloadSigning";
 import { logAdminAction } from "./shared";
 import {
   findReusableInflightJob,
@@ -181,24 +181,81 @@ export async function completeJobFailure(
   await adminDb.update(ingestionJobs).set(patch).where(eq(ingestionJobs.id, jobId));
 }
 
-/** A successful fetch that resolved to `duplicate` or `needs_review` (Section 8) -- no source_items row is created for either. */
-export async function completeJobReviewOutcome(params: {
-  jobId: number;
-  status: "duplicate" | "needs_review";
-  httpStatus: number;
-  contentType: string;
-  contentLength: number;
-  sourceItemId?: number | null;
-}): Promise<void> {
+/**
+ * Persisted review metadata for a `needs_review` outcome (Phase 4 PR 7,
+ * migration 0009) -- the same fields the pipeline already extracts into its
+ * transient `ReviewMetadata`, kept here as a distinct, narrower type since
+ * `completeJobReviewOutcome` is the one place that writes them to the row,
+ * and `duplicate` outcomes never need them (Section 8: a duplicate is
+ * already linked to its existing source_items row, nothing further to
+ * recover). Deliberately omits httpStatus/contentType, since those already
+ * have their own dedicated columns/params here.
+ */
+export interface IngestionReviewMetadataPatch {
+  retrievedUrl: string;
+  canonicalUrl: string | null;
+  rawContentHash: string;
+  extractedTitle: string | null;
+  extractedAuthor: string | null;
+  extractedPublishedAt: Date | null;
+  extractedExcerpt: string | null;
+}
+
+/**
+ * A successful fetch that resolved to `duplicate` or `needs_review`
+ * (Section 8) -- no source_items row is created for either. `reviewMetadata`
+ * is required for `needs_review` (Phase 4 PR 7: this is what makes the job
+ * recoverable from /admin/ingest/history later -- see this file's header
+ * comment on ingestion_job audit logging, and reviewPayloadSigning.ts's
+ * header, for why this previously had nowhere to be written) and omitted
+ * for `duplicate`, which has nothing to recover.
+ */
+export async function completeJobReviewOutcome(
+  params:
+    | {
+        jobId: number;
+        status: "duplicate";
+        httpStatus: number;
+        contentType: string;
+        contentLength: number;
+        sourceItemId: number;
+      }
+    | {
+        jobId: number;
+        status: "needs_review";
+        httpStatus: number;
+        contentType: string;
+        contentLength: number;
+        sourceItemId?: null;
+        reviewMetadata: IngestionReviewMetadataPatch | null;
+      }
+): Promise<void> {
   const patch = completeWithOutcome({
     status: params.status,
     now: new Date(),
     httpStatus: params.httpStatus,
     contentType: params.contentType,
     contentLength: params.contentLength,
-    sourceItemId: params.sourceItemId,
+    sourceItemId: params.sourceItemId ?? null,
   });
-  await adminDb.update(ingestionJobs).set(patch).where(eq(ingestionJobs.id, params.jobId));
+
+  const reviewColumns =
+    params.status === "needs_review" && params.reviewMetadata
+      ? {
+          retrievedUrl: params.reviewMetadata.retrievedUrl,
+          canonicalUrl: params.reviewMetadata.canonicalUrl,
+          rawContentHash: params.reviewMetadata.rawContentHash,
+          extractedTitle: params.reviewMetadata.extractedTitle,
+          extractedAuthor: params.reviewMetadata.extractedAuthor,
+          extractedPublishedAt: params.reviewMetadata.extractedPublishedAt,
+          extractedExcerpt: params.reviewMetadata.extractedExcerpt,
+        }
+      : {};
+
+  await adminDb
+    .update(ingestionJobs)
+    .set({ ...patch, ...reviewColumns })
+    .where(eq(ingestionJobs.id, params.jobId));
 }
 
 // ---------------------------------------------------------------------------
@@ -269,15 +326,18 @@ export class JobNotConfirmableError extends Error {
  * actual retrieved URL, its hash, its canonical URL) that must survive
  * from the original fetch to this confirmation call -- is decoded from
  * `input.reviewToken` below, NOT accepted as separate raw fields (PR 5
- * security condition). `ingestion_jobs` still has no columns to persist
- * it server-side between fetch and confirm (see PR 4 planning notes),
- * so it still round-trips through the browser -- but as an opaque,
- * HMAC-signed token (reviewPayloadSigning.ts) rather than editable
- * hidden form fields, since `url` and `rawContentHash` specifically
- * back the whole duplicate-detection integrity guarantee, not just
- * cosmetic metadata. `verifyReviewPayload` also checks the token's
- * embedded `jobId` against `data.jobId`, which is what actually
- * prevents a token from being replayed against a different job.
+ * security condition). The token itself may have been signed either
+ * immediately after the original fetch (actions.ts) or re-signed later
+ * from this job's own persisted columns (Phase 4 PR 7's
+ * `prepareHistoryReviewConfirmation`, below) -- this function does not
+ * care which; `verifyReviewPayload` treats both identically, since a
+ * re-signed token carries exactly the same guarantee (see that function's
+ * comment for why). It is still never accepted as raw editable hidden
+ * form fields, since `url` and `rawContentHash` specifically back the
+ * whole duplicate-detection integrity guarantee, not just cosmetic
+ * metadata. `verifyReviewPayload` also checks the token's embedded
+ * `jobId` against `data.jobId`, which is what actually prevents a token
+ * from being replayed against a different job.
  *
  * Re-verifies the job is actually still eligible (status = 'needs_review'
  * -- see pipeline.ts's note on why BOTH `ready_for_confirmation` and
@@ -360,4 +420,119 @@ export async function finalizeIngestionConfirmation(input: unknown): Promise<{ s
 
     return { sourceItemId: sourceItem!.id };
   });
+}
+
+// ---------------------------------------------------------------------------
+// History-based recovery (Phase 4 PR 7, Section 18: recoverable, not lost)
+// ---------------------------------------------------------------------------
+
+export class JobNotReviewableError extends Error {
+  constructor(jobId: number, reason: string) {
+    super(`Ingestion job #${jobId} cannot be reviewed from history: ${reason}`);
+    this.name = "JobNotReviewableError";
+  }
+}
+
+export interface HistoryReviewPreparation {
+  jobId: number;
+  reviewToken: string;
+  metadata: {
+    url: string;
+    canonicalUrl: string | null;
+    excerpt: string | null;
+    rawContentHash: string;
+    title: string | null;
+    author: string | null;
+    publishedAt: Date | null;
+  };
+  /** Job's original `createdAt` (queue time) -- the UI layer computes any staleness notice from this, not this function (Section 12/18: informational only, never a re-fetch trigger or a confirmation block). */
+  createdAt: Date;
+}
+
+/**
+ * Re-derives a fresh, signed review token for a job that is still
+ * `needs_review` and unlinked, from the metadata this same server process
+ * persisted at fetch time (migration 0009) -- NOT by re-fetching the URL,
+ * and NOT by trusting anything client-supplied. This is what lets
+ * `/admin/ingest/history` render the same confirm form `IngestForm.tsx`
+ * shows immediately after a `ready_for_confirmation`/`needs_review` result,
+ * for a job an admin didn't (or couldn't) act on in that same request.
+ *
+ * The re-signed token carries exactly the same guarantee as the original:
+ * `signReviewPayload` is called here with values read straight from the
+ * admin-only, RLS-locked `ingestion_jobs` row -- never from a request body
+ * -- so this does not introduce a new trust boundary, only a second, later
+ * entry point into the one that already existed. `finalizeIngestionConfirmation`
+ * itself is completely unchanged and cannot tell the two apart.
+ *
+ * Deliberately covers BOTH `ready_for_confirmation` and true `needs_review`
+ * pipeline outcomes (ambiguous source match, no source match, hash
+ * mismatch) identically -- the DB only ever stores the single
+ * `needs_review` status for all of them (see pipeline.ts's note on this),
+ * and per product decision an admin manually picks source/item type from
+ * History either way; there is no different backend handling for one case
+ * versus the other, only what the live confirm form happened to prefill.
+ *
+ * Throws `JobNotReviewableError` if: the job doesn't exist, is already
+ * linked to a source item, is not `needs_review`, or -- the ambiguous-403
+ * case (no fetch ever succeeded to extract from), or any job that predates
+ * this PR -- has no persisted `retrievedUrl`/`rawContentHash` to build a
+ * token from at all. Callers should surface this as an ordinary
+ * not-actionable state, not a crash.
+ */
+export async function prepareHistoryReviewConfirmation(jobId: number): Promise<HistoryReviewPreparation> {
+  await requireAdmin("editor");
+
+  const [job] = await adminDb
+    .select({
+      id: ingestionJobs.id,
+      status: ingestionJobs.status,
+      sourceItemId: ingestionJobs.sourceItemId,
+      createdAt: ingestionJobs.createdAt,
+      retrievedUrl: ingestionJobs.retrievedUrl,
+      canonicalUrl: ingestionJobs.canonicalUrl,
+      rawContentHash: ingestionJobs.rawContentHash,
+      extractedTitle: ingestionJobs.extractedTitle,
+      extractedAuthor: ingestionJobs.extractedAuthor,
+      extractedPublishedAt: ingestionJobs.extractedPublishedAt,
+      extractedExcerpt: ingestionJobs.extractedExcerpt,
+    })
+    .from(ingestionJobs)
+    .where(eq(ingestionJobs.id, jobId))
+    .limit(1);
+
+  if (!job) throw new JobNotReviewableError(jobId, "job not found");
+  if (job.sourceItemId !== null) throw new JobNotReviewableError(jobId, "already linked to a source item");
+  if (job.status !== "needs_review") {
+    throw new JobNotReviewableError(jobId, `status is '${job.status}', not the expected reviewable state`);
+  }
+  if (!job.retrievedUrl || !job.rawContentHash) {
+    throw new JobNotReviewableError(
+      jobId,
+      "no persisted review metadata for this job -- either the fetch that produced it never returned content to extract from (e.g. the ambiguous-403 case), or it predates Phase 4 PR 7"
+    );
+  }
+
+  const reviewToken = signReviewPayload({
+    jobId: job.id,
+    url: job.retrievedUrl,
+    canonicalUrl: job.canonicalUrl,
+    excerpt: job.extractedExcerpt,
+    rawContentHash: job.rawContentHash,
+  });
+
+  return {
+    jobId: job.id,
+    reviewToken,
+    metadata: {
+      url: job.retrievedUrl,
+      canonicalUrl: job.canonicalUrl,
+      excerpt: job.extractedExcerpt,
+      rawContentHash: job.rawContentHash,
+      title: job.extractedTitle,
+      author: job.extractedAuthor,
+      publishedAt: job.extractedPublishedAt,
+    },
+    createdAt: job.createdAt,
+  };
 }

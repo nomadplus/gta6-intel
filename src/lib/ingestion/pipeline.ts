@@ -19,7 +19,30 @@ import {
   findCandidateSourceItemsByUrl,
   findHashCoincidenceSourceItemIds,
   findAllCandidateSources,
+  type IngestionReviewMetadataPatch,
 } from "@/db/mutations/ingestion";
+
+/**
+ * Phase 4 PR 7: maps the pipeline's transient `ReviewMetadata` to the
+ * subset of fields persisted onto `ingestion_jobs` (migration 0009) --
+ * kept as an explicit, named conversion rather than spreading the object
+ * inline at each call site, so it's obvious at a glance that `retrievedAt`/
+ * `httpStatus`/`contentType` are deliberately NOT persisted here (they
+ * either have their own dedicated params on completeJobReviewOutcome, or
+ * -- retrievedAt -- are adequately covered by the job's own createdAt/
+ * completedAt columns).
+ */
+function toReviewMetadataPatch(metadata: ReviewMetadata): IngestionReviewMetadataPatch {
+  return {
+    retrievedUrl: metadata.url,
+    canonicalUrl: metadata.canonicalUrl,
+    rawContentHash: metadata.rawContentHash,
+    extractedTitle: metadata.title,
+    extractedAuthor: metadata.author,
+    extractedPublishedAt: metadata.publishedAt,
+    extractedExcerpt: metadata.excerpt,
+  };
+}
 
 /**
  * Submits a URL for manual ingestion and drives it through to a typed
@@ -143,7 +166,7 @@ export async function submitUrlForIngestion(input: unknown): Promise<IngestionPi
       httpStatus: fetchResult.status,
       contentType: fetchResult.contentType,
       contentLength: fetchResult.byteLength,
-      sourceItemId: null,
+      reviewMetadata: toReviewMetadataPatch(reviewMetadata),
     });
     return {
       kind: "needs_review",
@@ -167,7 +190,7 @@ export async function submitUrlForIngestion(input: unknown): Promise<IngestionPi
       httpStatus: fetchResult.status,
       contentType: fetchResult.contentType,
       contentLength: fetchResult.byteLength,
-      sourceItemId: null,
+      reviewMetadata: toReviewMetadataPatch(reviewMetadata),
     });
     return {
       kind: "ready_for_confirmation",
@@ -184,7 +207,7 @@ export async function submitUrlForIngestion(input: unknown): Promise<IngestionPi
     httpStatus: fetchResult.status,
     contentType: fetchResult.contentType,
     contentLength: fetchResult.byteLength,
-    sourceItemId: null,
+    reviewMetadata: toReviewMetadataPatch(reviewMetadata),
   });
 
   if (proposal.kind === "ambiguous") {

@@ -384,6 +384,23 @@ export const ingestionJobs = pgTable(
     sourceItemId: integer("source_item_id").references(() => sourceItems.id),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     completedAt: timestamp("completed_at", { withTimezone: true }),
+    // Added in migration 0009 (Phase 4 PR 7) -- the pipeline's extracted
+    // review metadata, persisted so a 'needs_review'/'ready_for_confirmation'
+    // outcome can be resolved in a LATER admin session (via /admin/ingest/
+    // history), not only in the single request that produced it. See
+    // reviewPayloadSigning.ts's file header for why this previously only
+    // existed as an ephemeral signed token. `retrievedUrl` is the actual
+    // fetched URL after redirects (finalUrl) -- distinct from this row's
+    // `submittedUrl`/`normalizedUrl`, which are pre-fetch. Column shapes
+    // mirror the equivalent sourceItems columns exactly, since it's the same
+    // data one pipeline step earlier.
+    retrievedUrl: text("retrieved_url"),
+    canonicalUrl: text("canonical_url"),
+    rawContentHash: varchar("raw_content_hash", { length: 64 }),
+    extractedTitle: text("extracted_title"),
+    extractedAuthor: varchar("extracted_author", { length: 300 }),
+    extractedPublishedAt: timestamp("extracted_published_at", { withTimezone: true }),
+    extractedExcerpt: text("extracted_excerpt"),
   },
   (t) => ({
     // Shaped for the approved future in-flight-redundancy rule ("reuse a

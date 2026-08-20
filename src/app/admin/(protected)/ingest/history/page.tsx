@@ -18,9 +18,10 @@ export default async function IngestionJobHistoryPage() {
         </Link>
       </div>
       <p className="mt-2 max-w-2xl text-sm text-ink-400">
-        Read-only record of every ingestion attempt — what was submitted, how it was discovered,
-        its current status, and why it succeeded or failed. Nothing here can be retried or
-        re-processed from this page.
+        Record of every ingestion attempt — what was submitted, how it was discovered, its current
+        status, and why it succeeded or failed. Nothing is re-fetched or re-processed from here — a
+        job awaiting review can be confirmed from its own entry below, using only what was already
+        retrieved.
       </p>
 
       {jobs.length === 0 ? (
