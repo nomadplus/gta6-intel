@@ -9,7 +9,7 @@ import {
   mapSafeFetchFailureToIngestionOutcome,
   classifySuccessfulFetchForPaywall,
 } from "./statusMapping";
-import type { IngestionPipelineResult, ReviewMetadata } from "./pipelineTypes";
+import type { IngestionPipelineResult, IngestionJobOutcome, ReviewMetadata } from "./pipelineTypes";
 import {
   prepareIngestionSubmission,
   findOrCreateIngestionJob,
@@ -45,49 +45,49 @@ function toReviewMetadataPatch(metadata: ReviewMetadata): IngestionReviewMetadat
 }
 
 /**
- * Submits a URL for manual ingestion and drives it through to a typed
- * result. This is the ONE function PR 5's admin form is expected to
- * call for "fetch this URL" -- it composes every PR 1-3 foundation
- * piece plus this PR's dedup/source-identity/lifecycle logic, so no
- * ingestion logic needs to be duplicated in the future UI layer.
- *
- * Transaction shape follows Section 13 exactly:
- *   1. short transaction -- redundancy check / job creation
- *      (findOrCreateIngestionJob)
- *   2. external fetch, OUTSIDE any transaction (safeFetch call below)
- *   3. short transaction -- classify/update result (the various
- *      completeJob-prefixed calls, each independently transactional)
- * Finalization/confirmation (step 4, a separate transaction) is
- * `finalizeIngestionConfirmation` in db/mutations/ingestion.ts --
- * deliberately not called from here, since it requires an explicit,
- * separate admin action (Section 12).
+ * The subset of a claimed ingestion_jobs row that processIngestionJob
+ * needs. Deliberately a narrow structural type (not the full Drizzle row
+ * type) so both call sites -- the manual flow's freshly-created job and
+ * the automated processor's claimed row (src/db/mutations/
+ * ingestionProcessor.ts) -- can supply it without depending on each
+ * other's shape.
  */
-export async function submitUrlForIngestion(input: unknown): Promise<IngestionPipelineResult> {
-  const { admin, submittedUrl, normalizedUrl: preNormalizedUrl } = await prepareIngestionSubmission(input);
+export interface JobToProcess {
+  id: number;
+  submittedUrl: string;
+  normalizedUrl: string;
+  /**
+   * The job's attempt count as of THIS attempt (i.e. already
+   * incremented -- the value beginFetchAttempt / the processor's atomic
+   * claim just wrote). Drives retry backoff on failure (Phase 4 PR 9).
+   */
+  attemptCount: number;
+}
 
-  const jobResult = await findOrCreateIngestionJob({
-    submittedUrl,
-    normalizedUrl: preNormalizedUrl,
-    admin,
-  });
-
-  if (jobResult.reused) {
-    return {
-      kind: "existing_inflight",
-      jobId: jobResult.job.id,
-      existingJobId: jobResult.job.id,
-      existingStatus: jobResult.job.status as "queued" | "fetching",
-    };
-  }
-
-  const job = jobResult.job;
-  await markJobFetchStarted(job.id, job.attemptCount);
-
-  const fetchResult = await safeFetch(submittedUrl);
+/**
+ * Runs the fetch -> hash -> dedupe -> source-identity -> classify
+ * pipeline for a job that is ALREADY in 'fetching' (attempt_count
+ * already incremented for this attempt), and persists the outcome. This
+ * is the one function both `submitUrlForIngestion` (the manual,
+ * live-admin-request flow) and the automated processor
+ * (src/app/api/ingestion/process/route.ts, Phase 4 PR 9) call to
+ * actually do the work -- neither duplicates this logic, and this
+ * function itself has no opinion about who claimed the job or why.
+ *
+ * Does NOT call markJobFetchStarted/claim anything -- the caller is
+ * responsible for having already transitioned the job to 'fetching'
+ * (the manual flow via markJobFetchStarted; the processor via its own
+ * atomic claim query), since "how a job got claimed" is exactly the
+ * part that legitimately differs between the two callers and needs its
+ * own concurrency story in each.
+ */
+export async function processIngestionJob(job: JobToProcess): Promise<IngestionJobOutcome> {
+  const preNormalizedUrl = job.normalizedUrl;
+  const fetchResult = await safeFetch(job.submittedUrl);
 
   if (!fetchResult.ok) {
     const outcome = mapSafeFetchFailureToIngestionOutcome(fetchResult.error);
-    await completeJobFailure(job.id, outcome, fetchResult.error.retryAfter?.delayMs ?? null);
+    await completeJobFailure(job.id, outcome, job.attemptCount, fetchResult.error.retryAfter?.delayMs ?? null);
 
     if (outcome.resultKind === "needs_review") {
       // Currently only reachable via the ambiguous 403 case (see
@@ -105,17 +105,9 @@ export async function submitUrlForIngestion(input: unknown): Promise<IngestionPi
 
   const paywallStatus = classifySuccessfulFetchForPaywall(extracted.isAccessibleForFree);
   if (paywallStatus) {
-    await completeJobFailure(job.id, {
-      status: "paywalled",
-      failureReason: "The page's own structured data declares it is not accessible for free.",
-      resultKind: "failed",
-    });
-    return {
-      kind: "failed",
-      jobId: job.id,
-      status: "paywalled",
-      failureReason: "The page's own structured data declares it is not accessible for free.",
-    };
+    const failureReason = "The page's own structured data declares it is not accessible for free.";
+    await completeJobFailure(job.id, { status: "paywalled", failureReason, resultKind: "failed" }, job.attemptCount);
+    return { kind: "failed", jobId: job.id, status: "paywalled", failureReason };
   }
 
   // Section 8's dedup and Section 10's source-identity matching operate
@@ -221,4 +213,57 @@ export async function submitUrlForIngestion(input: unknown): Promise<IngestionPi
   }
 
   return { kind: "needs_review", jobId: job.id, reason: "no_source_match", metadata: reviewMetadata };
+}
+
+/**
+ * Submits a URL for manual ingestion and drives it through to a typed
+ * result. This is the ONE function PR 5's admin form is expected to
+ * call for "fetch this URL" -- it composes every PR 1-3 foundation
+ * piece plus this PR's dedup/source-identity/lifecycle logic, so no
+ * ingestion logic needs to be duplicated in the future UI layer.
+ *
+ * Transaction shape follows Section 13 exactly:
+ *   1. short transaction -- redundancy check / job creation
+ *      (findOrCreateIngestionJob)
+ *   2. external fetch, OUTSIDE any transaction (safeFetch call below)
+ *   3. short transaction -- classify/update result (the various
+ *      completeJob-prefixed calls, each independently transactional)
+ * Finalization/confirmation (step 4, a separate transaction) is
+ * `finalizeIngestionConfirmation` in db/mutations/ingestion.ts --
+ * deliberately not called from here, since it requires an explicit,
+ * separate admin action (Section 12).
+ *
+ * Steps 2/3 (the actual fetch/classify/complete work) are
+ * `processIngestionJob`, above -- shared verbatim with the automated
+ * processor (Phase 4 PR 9) so the manual admin-request flow and the
+ * background job processor can never drift into duplicated or
+ * inconsistent ingestion logic.
+ */
+export async function submitUrlForIngestion(input: unknown): Promise<IngestionPipelineResult> {
+  const { admin, submittedUrl, normalizedUrl: preNormalizedUrl } = await prepareIngestionSubmission(input);
+
+  const jobResult = await findOrCreateIngestionJob({
+    submittedUrl,
+    normalizedUrl: preNormalizedUrl,
+    admin,
+  });
+
+  if (jobResult.reused) {
+    return {
+      kind: "existing_inflight",
+      jobId: jobResult.job.id,
+      existingJobId: jobResult.job.id,
+      existingStatus: jobResult.job.status as "queued" | "fetching",
+    };
+  }
+
+  const job = jobResult.job;
+  await markJobFetchStarted(job.id, job.attemptCount);
+
+  return processIngestionJob({
+    id: job.id,
+    submittedUrl,
+    normalizedUrl: preNormalizedUrl,
+    attemptCount: job.attemptCount + 1,
+  });
 }
