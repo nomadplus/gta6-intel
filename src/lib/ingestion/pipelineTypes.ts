@@ -89,3 +89,12 @@ export type IngestionPipelineResult =
   | NeedsReviewResult
   | ReadyForConfirmationResult
   | FailedResult;
+
+/**
+ * The result shape of processing a job that already exists and is
+ * already in 'fetching' (Phase 4 PR 9) -- every IngestionPipelineResult
+ * kind except `existing_inflight`, which can only ever result from the
+ * create-or-reuse decision that happens before a job reaches 'fetching'
+ * in the first place (findOrCreateIngestionJob), not from processing one.
+ */
+export type IngestionJobOutcome = Exclude<IngestionPipelineResult, ExistingInflightResult>;

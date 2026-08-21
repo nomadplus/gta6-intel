@@ -166,16 +166,23 @@ export async function markJobFetchStarted(jobId: number, previousAttemptCount: n
   await adminDb.update(ingestionJobs).set(patch).where(eq(ingestionJobs.id, jobId));
 }
 
-/** A definitive non-success outcome (Section 4/13). */
+/**
+ * A definitive non-success outcome (Section 4/13). `attemptCount` must be
+ * the job's attempt count as of this failure (i.e. after the attempt
+ * that just failed was counted) -- it drives both retry-eligibility and
+ * backoff (Phase 4 PR 9, ingestionJobLifecycle.ts's completeWithFailure).
+ */
 export async function completeJobFailure(
   jobId: number,
   outcome: IngestionFailureOutcome,
+  attemptCount: number,
   retryAfterDelayMs?: number | null
 ): Promise<void> {
   const patch = completeWithFailure({
     status: outcome.status,
     now: new Date(),
     failureReason: outcome.failureReason,
+    attemptCount,
     retryAfterDelayMs,
   });
   await adminDb.update(ingestionJobs).set(patch).where(eq(ingestionJobs.id, jobId));

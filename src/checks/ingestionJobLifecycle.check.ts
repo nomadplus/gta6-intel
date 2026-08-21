@@ -9,6 +9,13 @@ import {
   completeWithOutcome,
   completeWithFailure,
   INFLIGHT_REDUNDANCY_WINDOW_MS,
+  MAX_INGESTION_ATTEMPTS,
+  RETRY_BASE_DELAY_MS,
+  MAX_RETRY_AFTER_DELAY_MS,
+  RECOVERY_STALE_THRESHOLD_MS,
+  isRetryableFailureStatus,
+  computeRetryDelayMs,
+  reclaimStaleFetchingJob,
   type InflightJobCandidate,
 } from "../lib/ingestion/ingestionJobLifecycle";
 
@@ -115,17 +122,158 @@ const NOW = new Date("2026-06-15T12:00:00Z");
 }
 
 {
-  const patch = completeWithFailure({ status: "fetch_failed", now: NOW, failureReason: "The request timed out." });
+  const patch = completeWithFailure({ status: "fetch_failed", now: NOW, failureReason: "The request timed out.", attemptCount: 1 });
   assert(patch.status === "fetch_failed", "completeWithFailure sets the given failure status");
   assert(patch.failureReason === "The request timed out.", "completeWithFailure carries the failure reason through");
-  assert(patch.nextRetryAt === null, "no Retry-After info -> nextRetryAt stays null");
 }
 
 {
-  const patch = completeWithFailure({ status: "rate_limited", now: NOW, failureReason: "429", retryAfterDelayMs: 30_000 });
+  const patch = completeWithFailure({ status: "rate_limited", now: NOW, failureReason: "429", attemptCount: 1, retryAfterDelayMs: 30_000 });
   assert(
     patch.nextRetryAt !== null && patch.nextRetryAt.getTime() === NOW.getTime() + 30_000,
     "a Retry-After delay is converted into an absolute nextRetryAt, relative to 'now'"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 PR 9: automated retry policy
+// ---------------------------------------------------------------------------
+
+// --- Retryable vs. non-retryable status classification ---------------------
+{
+  assert(isRetryableFailureStatus("fetch_failed"), "fetch_failed is retryable");
+  assert(isRetryableFailureStatus("rate_limited"), "rate_limited is retryable");
+  assert(!isRetryableFailureStatus("blocked_by_policy"), "blocked_by_policy is NOT retryable");
+  assert(!isRetryableFailureStatus("authentication_required"), "authentication_required is NOT retryable");
+  assert(!isRetryableFailureStatus("paywalled"), "paywalled is NOT retryable");
+  assert(!isRetryableFailureStatus("unsupported"), "unsupported is NOT retryable");
+  assert(!isRetryableFailureStatus("malformed"), "malformed is NOT retryable");
+  assert(!isRetryableFailureStatus("needs_review"), "needs_review is NOT retryable");
+}
+
+// --- A non-retryable status never gets nextRetryAt, even with attempts left -
+{
+  const patch = completeWithFailure({
+    status: "blocked_by_policy",
+    now: NOW,
+    failureReason: "blocked hostname",
+    attemptCount: 1,
+  });
+  assert(patch.nextRetryAt === null, "a non-retryable status with no Retry-After stays permanently terminal (nextRetryAt null)");
+}
+
+// --- A retryable status with no Retry-After header computes backoff --------
+{
+  const zeroJitter = () => 0;
+  const patch = completeWithFailure({
+    status: "fetch_failed",
+    now: NOW,
+    failureReason: "timeout",
+    attemptCount: 1,
+    random: zeroJitter,
+  });
+  assert(patch.nextRetryAt !== null, "a retryable status with no Retry-After still schedules a computed retry");
+  assert(
+    patch.nextRetryAt!.getTime() === NOW.getTime() + RETRY_BASE_DELAY_MS,
+    "first computed retry (attemptCount=1, zero jitter) uses exactly RETRY_BASE_DELAY_MS"
+  );
+}
+
+// --- Backoff doubles on each subsequent attempt -----------------------------
+{
+  const zeroJitter = () => 0;
+  assert(computeRetryDelayMs(1, zeroJitter) === RETRY_BASE_DELAY_MS, "attempt 1 -> base delay");
+  assert(computeRetryDelayMs(2, zeroJitter) === RETRY_BASE_DELAY_MS * 2, "attempt 2 -> 2x base delay");
+  assert(computeRetryDelayMs(3, zeroJitter) === RETRY_BASE_DELAY_MS * 4, "attempt 3 -> 4x base delay");
+}
+
+// --- Jitter adds up to (but never more than) RETRY_JITTER_RATIO -------------
+{
+  const maxJitter = () => 0.999999;
+  const delay = computeRetryDelayMs(1, maxJitter);
+  assert(delay > RETRY_BASE_DELAY_MS, "jitter pushes the delay above the bare base delay");
+  assert(delay < RETRY_BASE_DELAY_MS * 1.31, "jitter never exceeds roughly base * (1 + 0.3)");
+}
+
+// --- Exhaustion: at MAX_INGESTION_ATTEMPTS, no further retry is scheduled ---
+{
+  const patch = completeWithFailure({
+    status: "fetch_failed",
+    now: NOW,
+    failureReason: "timeout",
+    attemptCount: MAX_INGESTION_ATTEMPTS,
+  });
+  assert(
+    patch.nextRetryAt === null,
+    `a job at MAX_INGESTION_ATTEMPTS (${MAX_INGESTION_ATTEMPTS}) is left permanently terminal, not retried again`
+  );
+}
+{
+  // Even an honored Retry-After must not override exhaustion.
+  const patch = completeWithFailure({
+    status: "rate_limited",
+    now: NOW,
+    failureReason: "429",
+    attemptCount: MAX_INGESTION_ATTEMPTS,
+    retryAfterDelayMs: 5_000,
+  });
+  assert(patch.nextRetryAt === null, "exhaustion applies even when a valid Retry-After is present");
+}
+
+// --- Retry-After is capped, never honored past MAX_RETRY_AFTER_DELAY_MS ----
+{
+  const absurdlyLongDelayMs = 1000 * 60 * 60 * 24 * 365; // 1 year
+  const patch = completeWithFailure({
+    status: "rate_limited",
+    now: NOW,
+    failureReason: "429",
+    attemptCount: 1,
+    retryAfterDelayMs: absurdlyLongDelayMs,
+  });
+  assert(
+    patch.nextRetryAt!.getTime() === NOW.getTime() + MAX_RETRY_AFTER_DELAY_MS,
+    "an excessive upstream Retry-After is capped at MAX_RETRY_AFTER_DELAY_MS, not honored verbatim"
+  );
+}
+{
+  const modestDelayMs = 10_000; // well under the cap
+  const patch = completeWithFailure({
+    status: "rate_limited",
+    now: NOW,
+    failureReason: "429",
+    attemptCount: 1,
+    retryAfterDelayMs: modestDelayMs,
+  });
+  assert(
+    patch.nextRetryAt!.getTime() === NOW.getTime() + modestDelayMs,
+    "a Retry-After well under the cap is honored exactly, uncapped"
+  );
+}
+
+// --- Stale 'fetching' reclaim ------------------------------------------------
+{
+  const zeroJitter = () => 0;
+  const patch = reclaimStaleFetchingJob(1, NOW, zeroJitter);
+  assert(patch.status === "fetch_failed", "a reclaimed stale-fetching job is recorded as fetch_failed");
+  assert(patch.failureReason.includes("Reclaimed"), "the failure reason is distinguishable from a real fetch error");
+  assert(
+    patch.nextRetryAt!.getTime() === NOW.getTime() + RETRY_BASE_DELAY_MS,
+    "a reclaimed job with attempts remaining gets a normal computed backoff"
+  );
+}
+{
+  const patch = reclaimStaleFetchingJob(MAX_INGESTION_ATTEMPTS, NOW);
+  assert(
+    patch.nextRetryAt === null,
+    "a reclaimed job that has already exhausted its attempts is left permanently terminal, not retried again"
+  );
+}
+
+// --- Sanity: the stale threshold is comfortably beyond a single fetch's budget
+{
+  assert(
+    RECOVERY_STALE_THRESHOLD_MS > 45_000,
+    "RECOVERY_STALE_THRESHOLD_MS leaves headroom above safeFetch's 45s total timeout budget"
   );
 }
 

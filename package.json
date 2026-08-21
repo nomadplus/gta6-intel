@@ -25,7 +25,9 @@
     "check:ingestion-audit-logging": "tsx --conditions=react-server src/checks/ingestionAuditLogging.check.ts",
     "check:ingestion-review-recovery": "tsx --conditions=react-server src/checks/ingestionReviewRecovery.check.ts",
     "check:discovery-feeds": "tsx --conditions=react-server src/checks/discoveryFeeds.check.ts",
-    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch && npm run check:ingestion-content-hash && npm run check:ingestion-metadata-extraction && npm run check:ingestion-status-mapping && npm run check:ingestion-duplicate-detection && npm run check:ingestion-source-identity && npm run check:ingestion-job-lifecycle && npm run check:ingestion-audit-logging && npm run check:ingestion-review-recovery && npm run check:discovery-feeds",
+    "check:ingestion-processor": "tsx --conditions=react-server src/checks/ingestionProcessor.check.ts",
+    "check:require-cron-secret": "tsx --conditions=react-server src/checks/requireCronSecret.check.ts",
+    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch && npm run check:ingestion-content-hash && npm run check:ingestion-metadata-extraction && npm run check:ingestion-status-mapping && npm run check:ingestion-duplicate-detection && npm run check:ingestion-source-identity && npm run check:ingestion-job-lifecycle && npm run check:ingestion-audit-logging && npm run check:ingestion-review-recovery && npm run check:discovery-feeds && npm run check:ingestion-processor && npm run check:require-cron-secret",
     "db:seed": "tsx src/db/seed/seed.ts"
   },
   "keywords": [],
