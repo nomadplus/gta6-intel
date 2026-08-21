@@ -163,6 +163,113 @@ parameter), not merely byte-identical ones.
 form — a feed always references an existing `sources` row, per product
 decision; source creation stays in the existing Sources admin workflow.
 
+### RSS/Atom discovery poller (Phase 4 PR 10 — closes Phase 4)
+
+`src/app/api/discovery/poll/route.ts` is the automated poller that turns
+`discovery_feeds` configuration (PR 8) into `ingestion_jobs` rows for PR
+9's automated processor to pick up. It is a **separate route and cron
+entry** from PR 9's `/api/ingestion/process`, not a phase added to that
+route — two independent reasons:
+
+1. **Time-budget contention.** PR 9's batch (5 jobs × up to 45s worst
+   case each) can already use ~225s of the 300s Fluid Compute budget.
+   Adding feed fetches (also up to 45s each via `safeFetch`) into the
+   same invocation risked exceeding the limit on a bad day.
+2. **PR 9's claim query has a 5-minute floor.**
+   `claimEligibleIngestionJobsForProcessing` only treats a `'queued'` job
+   as eligible once it's older than `RECOVERY_STALE_THRESHOLD_MS` (5
+   minutes) — a job created moments earlier in the *same* invocation
+   would fail that check and sit untouched for a full extra day. `
+   vercel.json` schedules this poller at `04:00 UTC` and PR 9's processor
+   at `06:00 UTC` — a two-hour gap, not one, chosen specifically because
+   Vercel Hobby cron may fire "anywhere within the scheduled hour," so a
+   one-hour gap could in principle collapse to under 5 minutes. Two
+   hours comfortably clears that threshold with zero changes to PR 9's
+   existing claim logic.
+
+**Claiming (`src/db/mutations/discoveryPolling.ts`,
+`claimDueDiscoveryFeeds`):** a short transaction selects due, enabled
+feeds with `FOR UPDATE SKIP LOCKED` (same primitive PR 9 uses for
+`ingestion_jobs` — two overlapping invocations simply skip a feed row
+the other already holds), ordered oldest-`last_polled_at`-first so a
+backlog larger than one batch drains fairly. Within that same
+transaction, the claim writes `last_polled_at = now()` and
+`last_poll_status = 'polling'` — a lock alone provides no protection
+once the transaction commits and releases it, so the durable marker has
+to land first. Accepted trade-off: if the invocation crashes mid-batch,
+an already-claimed-but-unprocessed feed shows as "just polled" and waits
+a full interval before being reconsidered — no separate
+`last_poll_attempt_at`/stale-reclaim column was added for this in PR 10;
+proportionate at the project's current scale, revisit if it ever isn't.
+
+**Feed parsing (`src/lib/ingestion/feedParsing.ts`):** narrowed to
+exactly one thing — extracting each item/entry's article URL. No title,
+author, or date extraction here; that remains PR 4's
+`metadataExtraction.ts`, applied later against the actual fetched
+article page. Atom link selection prefers `rel="alternate"`, falling
+back to a link with no `rel` at all, and never selects `self`/
+`enclosure`/other rels.
+
+Uses `fast-xml-parser` (pinned to an exact version — 5.11.0 as of this
+PR; re-verify the pin at any future upgrade), defended in depth rather
+than trusted on the pin alone, because this library has a real history
+of DOCTYPE/entity-substitution vulnerabilities (unlimited entity
+expansion, a numeric-character-reference bypass of that fix, a repeated-
+DOCTYPE bypass of the expansion counters themselves, an entity-encoding
+XSS bypass, and a RangeError crash on out-of-range numeric entities —
+see `feedParsing.ts`'s file header for the full list with CVE/advisory
+IDs and fixed versions). Three layers, not one:
+
+1. Any feed body containing a `<!DOCTYPE` declaration is rejected
+   outright, before the parser ever sees it — legitimate RSS/Atom feeds
+   never declare one, so this closes the whole vulnerability class at
+   the door regardless of version or future bypass.
+2. `processEntities: false` disables DOCTYPE-driven and numeric-
+   character-reference substitution entirely.
+3. Because that leaves entities like `&amp;` undecoded, and a real
+   article URL can legitimately contain one in its query string, a
+   small dedicated decoder (`src/lib/ingestion/xmlEntityDecode.ts`) —
+   not fast-xml-parser's own entity handling — decodes the five
+   predefined XML entities and numeric character references in each
+   already-extracted, short URL string, with a hard input-length cap.
+
+**Dedupe (locked design, see migration 0012):** two layers, not one.
+The **application pre-check** (`createSystemDiscoveredJob`) skips
+creating a job if *any* prior `ingestion_jobs` row exists for a
+normalized URL — manual or system-discovered, any status — since
+re-queuing a URL a human already pushed through the pipeline has no
+value. The **database partial unique index**
+(`ingestion_jobs_discovery_feed_normalized_url_unique`, on
+`normalized_url` `WHERE discovery_feed_id IS NOT NULL`) is the
+*authoritative* protection against a race between two overlapping
+invocations: the pre-check alone cannot close that window, only a
+constraint can. A losing insert raises a Postgres `23505` unique
+violation, which the application catches and treats as "already
+discovered," not a hard failure — never aborting the rest of that
+feed's items. The index is deliberately scoped to
+`discovery_feed_id IS NOT NULL` so manual ingestion semantics are
+completely untouched: a manual resubmission of a URL a feed already
+discovered (or vice versa) is unaffected, since manual jobs always have
+`discovery_feed_id = NULL` and fall outside the index's predicate
+entirely.
+
+**`ingestion_jobs.discovery_feed_id`** (migration 0012, nullable FK to
+`discovery_feeds.id`) records which feed produced a system-discovered
+job — operational/pipeline provenance, populated only when
+`initiated_by = 'system'` and always `NULL` for manual submissions.
+Distinct from the epistemic `source_relationships` provenance graph
+described above.
+
+This route only ever creates `ingestion_jobs` (`status = 'queued'`) — it
+never fetches an article page, runs duplicate detection against
+`source_items`, or touches anything PR 9's processor owns. That
+separation (`discovery` vs. `processing`) is deliberate: the two stages
+are independently replaceable.
+
+With PR 10 merged, Phase 4 is complete: every `discovery_feeds` row can
+autonomously produce `ingestion_jobs`, and PR 9 autonomously processes
+them end to end, with no admin click required anywhere in the loop.
+
 ### Claims
 
 `claims.information_type`: `fact`, `official`, `report`, `leak`,

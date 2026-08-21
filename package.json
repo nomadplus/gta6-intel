@@ -27,7 +27,9 @@
     "check:discovery-feeds": "tsx --conditions=react-server src/checks/discoveryFeeds.check.ts",
     "check:ingestion-processor": "tsx --conditions=react-server src/checks/ingestionProcessor.check.ts",
     "check:require-cron-secret": "tsx --conditions=react-server src/checks/requireCronSecret.check.ts",
-    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch && npm run check:ingestion-content-hash && npm run check:ingestion-metadata-extraction && npm run check:ingestion-status-mapping && npm run check:ingestion-duplicate-detection && npm run check:ingestion-source-identity && npm run check:ingestion-job-lifecycle && npm run check:ingestion-audit-logging && npm run check:ingestion-review-recovery && npm run check:discovery-feeds && npm run check:ingestion-processor && npm run check:require-cron-secret",
+    "check:feed-parsing": "tsx src/checks/feedParsing.check.ts",
+    "check:discovery-polling": "tsx --conditions=react-server src/checks/discoveryPolling.check.ts",
+    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch && npm run check:ingestion-content-hash && npm run check:ingestion-metadata-extraction && npm run check:ingestion-status-mapping && npm run check:ingestion-duplicate-detection && npm run check:ingestion-source-identity && npm run check:ingestion-job-lifecycle && npm run check:ingestion-audit-logging && npm run check:ingestion-review-recovery && npm run check:discovery-feeds && npm run check:ingestion-processor && npm run check:require-cron-secret && npm run check:feed-parsing && npm run check:discovery-polling",
     "db:seed": "tsx src/db/seed/seed.ts"
   },
   "keywords": [],
@@ -38,6 +40,7 @@
     "@supabase/supabase-js": "^2.112.3",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
+    "fast-xml-parser": "5.11.0",
     "next": "^16.3.0",
     "node-html-parser": "9.0.1",
     "pg": "^8.23.0",
