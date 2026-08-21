@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { submitUrlForIngestion } from "@/lib/ingestion/pipeline";
 import { finalizeIngestionConfirmation } from "@/db/mutations/ingestion";
 import { signReviewPayload } from "@/lib/ingestion/reviewPayloadSigning";
+import { triggerClassifyRelevance } from "@/lib/ai/operations/classificationTrigger";
 import { formDataToObject, safeAction } from "@/lib/actionResult";
 import type {
   IngestionPipelineResult,
@@ -104,6 +105,30 @@ export async function confirmIngestionAction(
   const input = formDataToObject(formData);
   const outcome = await safeAction(() => finalizeIngestionConfirmation(input));
   if (!outcome.ok) return { status: "error", error: outcome.error };
+
+  // Phase 5 PR 3: classification is attempted strictly AFTER
+  // finalizeIngestionConfirmation's transaction has already committed --
+  // `outcome.ok` is only ever true once that transaction has returned, so
+  // the source_item is already durably stored by this point regardless
+  // of what happens next. This call lives at the server-action
+  // orchestration boundary, NOT inside src/db/mutations/ingestion.ts,
+  // which stays a pure database-persistence module with no AI/provider
+  // knowledge (Section 9/15). Isolated in its own try/catch: an ordinary
+  // classification failure (provider error, invalid structured output,
+  // kill switch, budget block, invalid model pricing) is already handled
+  // as a normal typed result inside triggerClassifyRelevance/
+  // classifyRelevance/runAiOperation -- none of those can reach here as a
+  // throw. This catch only guards against a truly unexpected throw (e.g.
+  // a missing ANTHROPIC_API_KEY), and either way, nothing here can
+  // reverse or misreport the already-successful confirmation below.
+  try {
+    await triggerClassifyRelevance(outcome.data.sourceItemId);
+  } catch (err) {
+    console.error(
+      `[classify_relevance] unexpected error classifying source item #${outcome.data.sourceItemId} after confirmation:`,
+      err
+    );
+  }
 
   revalidatePath("/admin/source-items");
   redirect(`/admin/source-items/${outcome.data.sourceItemId}`);

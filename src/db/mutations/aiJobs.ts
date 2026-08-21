@@ -2,6 +2,7 @@ import "server-only";
 import { eq } from "drizzle-orm";
 import { adminDb } from "@/db/adminClient";
 import { aiJobs, aiResults } from "@/db/schema";
+import { isUniqueViolation } from "./shared";
 import {
   buildPendingAiJobValues,
   buildRunningPatch,
@@ -25,17 +26,45 @@ import {
  * job claiming, which also has no admin session to check.
  */
 
-export interface CreatedAiJob {
-  id: number;
-}
+export type CreatePendingAiJobResult =
+  | { ok: true; id: number }
+  | {
+      /**
+       * Phase 5 PR 3: the INSERT itself was rejected by
+       * ai_jobs_classify_relevance_inflight_unique (migration 0014) --
+       * another in-flight (pending/running) classify_relevance job
+       * already exists for this exact source item. No row was created
+       * for THIS attempt; the existing in-flight row already fully
+       * represents the ongoing work, so there is nothing further to
+       * persist here.
+       */
+      ok: false;
+      reason: "already_in_flight";
+    };
 
-/** Inserts a new `ai_jobs` row in the 'pending' state. Returns its id for the caller to drive through the rest of the lifecycle. */
-export async function createPendingAiJob(input: PendingAiJobInput): Promise<CreatedAiJob> {
-  const [row] = await adminDb
-    .insert(aiJobs)
-    .values(buildPendingAiJobValues(input))
-    .returning({ id: aiJobs.id });
-  return row;
+/**
+ * Inserts a new `ai_jobs` row in the 'pending' state. Returns its id for
+ * the caller to drive through the rest of the lifecycle -- or, when
+ * `sourceItemId` is supplied for a classify_relevance operation and
+ * collides with an already in-flight job for that same source item, a
+ * typed `already_in_flight` result instead of a thrown error. This is an
+ * ordinary, expected outcome (two callers racing to classify the same
+ * source item), not a misconfiguration -- callers must not treat it as a
+ * crash.
+ */
+export async function createPendingAiJob(input: PendingAiJobInput): Promise<CreatePendingAiJobResult> {
+  try {
+    const [row] = await adminDb
+      .insert(aiJobs)
+      .values(buildPendingAiJobValues(input))
+      .returning({ id: aiJobs.id });
+    return { ok: true, id: row!.id };
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      return { ok: false, reason: "already_in_flight" };
+    }
+    throw err;
+  }
 }
 
 /** Transitions a job to 'running' immediately before the provider call begins. */

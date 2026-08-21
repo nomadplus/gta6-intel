@@ -206,14 +206,17 @@ async function main() {
       });
       assert(result.ok === false, "malformed structured output returns ok:false");
       if (!result.ok) {
-        createdJobIds.push(result.jobId);
-        assert(result.reason === "invalid_structured_output", `failure reason is 'invalid_structured_output' (got ${result.reason})`);
-        const job = await loadJob(result.jobId);
-        assert(job.status === "failed", "job row status is 'failed' on malformed output");
-        assert(job.error !== null && job.error.startsWith("invalid_structured_output:"), `job row error is prefixed with the failure reason (got ${job.error})`);
-        assert(job.tokensIn === 200 && job.tokensOut === 30, "token counts the provider DID report before failing validation are still persisted");
-        const results = await loadResultsForJob(result.jobId);
-        assert(results.length === 0, `zero ai_results rows exist for a failed job (got ${results.length})`);
+        assert(result.jobId !== null, "a job row IS created for this failure reason (not already_in_flight)");
+        if (result.jobId !== null) {
+          createdJobIds.push(result.jobId);
+          assert(result.reason === "invalid_structured_output", `failure reason is 'invalid_structured_output' (got ${result.reason})`);
+          const job = await loadJob(result.jobId);
+          assert(job.status === "failed", "job row status is 'failed' on malformed output");
+          assert(job.error !== null && job.error.startsWith("invalid_structured_output:"), `job row error is prefixed with the failure reason (got ${job.error})`);
+          assert(job.tokensIn === 200 && job.tokensOut === 30, "token counts the provider DID report before failing validation are still persisted");
+          const results = await loadResultsForJob(result.jobId);
+          assert(results.length === 0, `zero ai_results rows exist for a failed job (got ${results.length})`);
+        }
       }
     }
 
@@ -229,12 +232,15 @@ async function main() {
       });
       assert(result.ok === false, "provider_error returns ok:false");
       if (!result.ok) {
-        createdJobIds.push(result.jobId);
-        assert(result.reason === "provider_error", `failure reason is 'provider_error' (got ${result.reason})`);
-        const job = await loadJob(result.jobId);
-        assert(job.status === "failed", "job row status is 'failed' on a provider error");
-        const results = await loadResultsForJob(result.jobId);
-        assert(results.length === 0, "zero ai_results rows exist for a provider-error job");
+        assert(result.jobId !== null, "a job row IS created for this failure reason (not already_in_flight)");
+        if (result.jobId !== null) {
+          createdJobIds.push(result.jobId);
+          assert(result.reason === "provider_error", `failure reason is 'provider_error' (got ${result.reason})`);
+          const job = await loadJob(result.jobId);
+          assert(job.status === "failed", "job row status is 'failed' on a provider error");
+          const results = await loadResultsForJob(result.jobId);
+          assert(results.length === 0, "zero ai_results rows exist for a provider-error job");
+        }
       }
     }
 
@@ -250,11 +256,14 @@ async function main() {
       });
       assert(result.ok === false, "an unexpected throw from the provider is still caught, not propagated");
       if (!result.ok) {
-        createdJobIds.push(result.jobId);
-        assert(result.reason === "provider_error", "an unexpected throw is treated as provider_error");
-        assert(result.message.includes("network socket reset"), "the original error message is preserved");
-        const job = await loadJob(result.jobId);
-        assert(job.status === "failed", "job row still reaches a terminal 'failed' state despite the throw -- no job is left stuck in 'running'");
+        assert(result.jobId !== null, "a job row IS created for this failure reason (not already_in_flight)");
+        if (result.jobId !== null) {
+          createdJobIds.push(result.jobId);
+          assert(result.reason === "provider_error", "an unexpected throw is treated as provider_error");
+          assert(result.message.includes("network socket reset"), "the original error message is preserved");
+          const job = await loadJob(result.jobId);
+          assert(job.status === "failed", "job row still reaches a terminal 'failed' state despite the throw -- no job is left stuck in 'running'");
+        }
       }
     }
 

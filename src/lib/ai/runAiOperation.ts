@@ -40,6 +40,15 @@ export interface RunAiOperationInput<T> {
   /** Passed straight through to ai_results.claim_id if this operation happens to be about a specific claim. Opaque to this function. */
   claimId?: number | null;
   /**
+   * Phase 5 PR 3: opaque passthrough to ai_jobs.source_item_id, mirroring
+   * claimId above -- but written at PENDING-job-creation time (not just
+   * on success), since it's what the in-flight uniqueness guard
+   * (migration 0014) checks against. This function has no idea which
+   * operation actually uses this; any future source-item-scoped
+   * operation can supply it identically.
+   */
+  sourceItemId?: number | null;
+  /**
    * Explicit metadata passthrough to ai_results.confidence /
    * ai_results.reasoning -- the SAME mechanism as claimId above, not a
    * new one. This function never inspects `outputSchema`'s validated
@@ -65,7 +74,15 @@ export interface RunAiOperationSuccess<T> {
 
 export interface RunAiOperationFailure {
   ok: false;
-  jobId: number;
+  /**
+   * Phase 5 PR 3: null exactly when NO ai_jobs row was ever created for
+   * this call -- currently only the "already_in_flight" case, where the
+   * pending-job INSERT itself was rejected by
+   * ai_jobs_classify_relevance_inflight_unique before any row could exist. Every
+   * other failure reason still creates and terminalizes a real row, same
+   * as before, so jobId is only ever null for that one reason.
+   */
+  jobId: number | null;
   /**
    * Phase 5 PR 2 adds the three AiSafetyBlockedReason values alongside
    * PR 1's original two -- a blocked execution is a distinct KIND of
@@ -74,8 +91,11 @@ export interface RunAiOperationFailure {
    * result shape rather than a new one, matching how ai_jobs.error's text
    * (not a new enum value) is what actually distinguishes all five cases
    * on the persisted row -- see aiJobLifecycle.ts's buildFailurePatch.
+   * Phase 5 PR 3 adds a fourth kind, "already_in_flight" -- distinct from
+   * all of these because it never even creates an ai_jobs row (see
+   * jobId's doc comment above).
    */
-  reason: "provider_error" | "invalid_structured_output" | AiSafetyBlockedReason;
+  reason: "provider_error" | "invalid_structured_output" | AiSafetyBlockedReason | "already_in_flight";
   message: string;
 }
 
@@ -92,12 +112,31 @@ export async function runAiOperation<T>(input: RunAiOperationInput<T>): Promise<
   // dangling 'pending' job with no way to reach a terminal state.
   const budgetCeilingMicros = getMonthlyBudgetCeilingMicros();
 
-  const job = await createPendingAiJob({
+  const created = await createPendingAiJob({
     operation: input.operation,
     provider: input.provider.name,
     model,
     inputRef: input.inputRef ?? null,
+    sourceItemId: input.sourceItemId ?? null,
   });
+
+  // Phase 5 PR 3: the pending-job INSERT itself can be rejected by
+  // ai_jobs_classify_relevance_inflight_unique (migration 0014) -- another
+  // in-flight execution already exists for this exact source item's
+  // classify_relevance job. This is an ordinary, expected race
+  // outcome, not a misconfiguration or provider failure: NO row was
+  // created for this call, so jobId is null here (see
+  // RunAiOperationFailure.jobId's doc comment) and neither the safety
+  // gate nor the provider is ever reached.
+  if (!created.ok) {
+    return {
+      ok: false,
+      jobId: null,
+      reason: "already_in_flight",
+      message: `An in-flight ${input.operation} execution already exists for this source item.`,
+    };
+  }
+  const job = created;
 
   // --- SAFETY CHECK (Phase 5 PR 2) ---------------------------------------
   // The single central enforcement boundary: kill switch, unpriced model,

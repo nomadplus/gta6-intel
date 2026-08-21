@@ -34,17 +34,20 @@ console.log("=== ai_jobs lifecycle patch builders (Phase 5 PR 1 + PR 2) ===\n");
     provider: "anthropic",
     model: "claude-sonnet-5",
     inputRef: "source_item:42",
+    sourceItemId: 42,
   });
   assert(values.status === "pending", "a freshly built job starts in 'pending'");
   assert(values.operation === "classify_relevance", "operation is carried through unchanged");
   assert(values.provider === "anthropic", "provider is carried through unchanged");
   assert(values.model === "claude-sonnet-5", "model is carried through unchanged");
   assert(values.inputRef === "source_item:42", "inputRef is carried through unchanged");
+  assert(values.sourceItemId === 42, "sourceItemId (Phase 5 PR 3) is carried through unchanged");
 }
 
 {
   const values = buildPendingAiJobValues({ operation: "embed", provider: "fake", model: "test-model" });
   assert(values.inputRef === null, "omitted inputRef defaults to null, not undefined");
+  assert(values.sourceItemId === null, "omitted sourceItemId (Phase 5 PR 3) defaults to null, not undefined");
 }
 
 // --- buildRunningPatch -------------------------------------------------------

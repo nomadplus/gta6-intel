@@ -648,21 +648,51 @@ export const claimEvidence = pgTable(
  * AI + ADMIN AUDIT TRAIL
  * ========================================================================= */
 
-export const aiJobs = pgTable("ai_jobs", {
-  id: serial("id").primaryKey(),
-  operation: aiOperationEnum("operation").notNull(),
-  provider: varchar("provider", { length: 50 }).notNull(),
-  model: varchar("model", { length: 100 }).notNull(),
-  status: aiJobStatusEnum("status").notNull().default("pending"),
-  inputRef: text("input_ref"), // free-text description/pointer of what was analyzed
-  tokensIn: integer("tokens_in"),
-  tokensOut: integer("tokens_out"),
-  costEstimateUsd: numeric("cost_estimate_usd", { precision: 10, scale: 6 }),
-  startedAt: timestamp("started_at", { withTimezone: true }),
-  completedAt: timestamp("completed_at", { withTimezone: true }),
-  error: text("error"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const aiJobs = pgTable(
+  "ai_jobs",
+  {
+    id: serial("id").primaryKey(),
+    operation: aiOperationEnum("operation").notNull(),
+    provider: varchar("provider", { length: 50 }).notNull(),
+    model: varchar("model", { length: 100 }).notNull(),
+    status: aiJobStatusEnum("status").notNull().default("pending"),
+    inputRef: text("input_ref"), // free-text description/pointer of what was analyzed
+    // Added in migration 0014 (Phase 5 PR 3) -- opaque passthrough
+    // mirroring ai_results.claimId exactly, just one level up on the job
+    // row itself (populated at pending-job-creation time, not only on
+    // success), since the in-flight uniqueness index below needs it
+    // present from the start. Generic across any source-item-scoped
+    // operation -- classify_relevance today, potentially others later --
+    // this file has no operation-specific business logic.
+    sourceItemId: integer("source_item_id").references(() => sourceItems.id),
+    tokensIn: integer("tokens_in"),
+    tokensOut: integer("tokens_out"),
+    costEstimateUsd: numeric("cost_estimate_usd", { precision: 10, scale: 6 }),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    sourceItemIdIdx: index("ai_jobs_source_item_id_idx").on(t.sourceItemId),
+    // Phase 5 PR 3 (migration 0014): at most one IN-FLIGHT (pending/running)
+    // classify_relevance execution per source item -- the authoritative,
+    // concurrency-safe guard against the automatic post-confirm trigger
+    // and a manual admin recovery action racing to create two
+    // simultaneous attempts for the same item. Scoped to in-flight
+    // statuses only, so unlimited succeeded/failed history accumulates
+    // freely and a future deliberate re-analysis workflow is never
+    // blocked by this constraint. Deliberately scoped to
+    // operation = 'classify_relevance' specifically, NOT generically to
+    // every source-item-scoped operation -- PR3 owns classify_relevance's
+    // concurrency semantics only; a future extract_claims or similar
+    // operation would need its own explicitly-scoped index, deciding its
+    // own concurrency semantics rather than inheriting this one.
+    classifyRelevanceInflightUnique: uniqueIndex("ai_jobs_classify_relevance_inflight_unique")
+      .on(t.sourceItemId)
+      .where(sql`${t.operation} = 'classify_relevance' AND ${t.status} IN ('pending', 'running') AND ${t.sourceItemId} IS NOT NULL`),
+  })
+);
 
 export const aiResults = pgTable("ai_results", {
   id: serial("id").primaryKey(),

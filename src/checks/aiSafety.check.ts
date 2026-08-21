@@ -242,14 +242,17 @@ async function main() {
       assert(provider.receivedRequests.length === 0, `(${label}) the provider was NEVER invoked -- proves the block happens before provider.complete()`);
       if (!result.ok) {
         assert(result.reason === "kill_switch_engaged", `(${label}) blocked reason is 'kill_switch_engaged' (got ${result.reason})`);
-        createdJobIds.push(result.jobId);
-        const job = await loadJob(result.jobId);
-        assert(job.status === "failed", `(${label}) the blocked job's row is 'failed', not stuck in 'pending' or 'running'`);
-        assert(job.startedAt === null, `(${label}) a killed-switch-blocked job never passes through 'running' -- startedAt stays null`);
-        assert(job.costEstimateUsd === null, `(${label}) a blocked job persists no cost -- nothing was spent`);
-        assert(job.error !== null && job.error.startsWith("kill_switch_engaged:"), `(${label}) job.error is prefixed with the blocked reason (got ${job.error})`);
-        const results = await loadResultsForJob(result.jobId);
-        assert(results.length === 0, `(${label}) zero ai_results rows exist for a kill-switch-blocked job`);
+        assert(result.jobId !== null, `(${label}) a job row IS created for a kill-switch block (not already_in_flight)`);
+        if (result.jobId !== null) {
+          createdJobIds.push(result.jobId);
+          const job = await loadJob(result.jobId);
+          assert(job.status === "failed", `(${label}) the blocked job's row is 'failed', not stuck in 'pending' or 'running'`);
+          assert(job.startedAt === null, `(${label}) a killed-switch-blocked job never passes through 'running' -- startedAt stays null`);
+          assert(job.costEstimateUsd === null, `(${label}) a blocked job persists no cost -- nothing was spent`);
+          assert(job.error !== null && job.error.startsWith("kill_switch_engaged:"), `(${label}) job.error is prefixed with the blocked reason (got ${job.error})`);
+          const results = await loadResultsForJob(result.jobId);
+          assert(results.length === 0, `(${label}) zero ai_results rows exist for a kill-switch-blocked job`);
+        }
       }
       restoreDefaultTestEnv();
     }
@@ -270,12 +273,15 @@ async function main() {
       assert(provider.receivedRequests.length === 0, "the provider was never invoked for an unpriced model");
       if (!result.ok) {
         assert(result.reason === "unknown_model_pricing", `blocked reason is 'unknown_model_pricing' (got ${result.reason})`);
-        createdJobIds.push(result.jobId);
-        const job = await loadJob(result.jobId);
-        assert(job.status === "failed", "the blocked job's row is 'failed'");
-        assert(job.costEstimateUsd === null, "no cost is persisted for an unpriced-model block");
-        const results = await loadResultsForJob(result.jobId);
-        assert(results.length === 0, "zero ai_results rows exist for an unpriced-model-blocked job");
+        assert(result.jobId !== null, "a job row IS created for an unpriced-model block (not already_in_flight)");
+        if (result.jobId !== null) {
+          createdJobIds.push(result.jobId);
+          const job = await loadJob(result.jobId);
+          assert(job.status === "failed", "the blocked job's row is 'failed'");
+          assert(job.costEstimateUsd === null, "no cost is persisted for an unpriced-model block");
+          const results = await loadResultsForJob(result.jobId);
+          assert(results.length === 0, "zero ai_results rows exist for an unpriced-model-blocked job");
+        }
       }
     }
 
@@ -326,12 +332,15 @@ async function main() {
       });
       assert(result.ok === false, "malformed structured output still returns ok:false (unchanged PR1 behavior)");
       if (!result.ok) {
-        createdJobIds.push(result.jobId);
-        const job = await loadJob(result.jobId);
-        assert(
-          job.costEstimateUsd === expectedUsdString,
-          `PR2: a failure that reached the provider (invalid_structured_output) still persists its real cost (expected ${expectedUsdString}, got ${job.costEstimateUsd})`
-        );
+        assert(result.jobId !== null, "a job row IS created for a malformed-output failure (not already_in_flight)");
+        if (result.jobId !== null) {
+          createdJobIds.push(result.jobId);
+          const job = await loadJob(result.jobId);
+          assert(
+            job.costEstimateUsd === expectedUsdString,
+            `PR2: a failure that reached the provider (invalid_structured_output) still persists its real cost (expected ${expectedUsdString}, got ${job.costEstimateUsd})`
+          );
+        }
       }
     }
 
@@ -383,11 +392,14 @@ async function main() {
       assert(provider.receivedRequests.length === 0, "the provider was never invoked once the ceiling was reached");
       if (!result.ok) {
         assert(result.reason === "budget_exceeded", `blocked reason is 'budget_exceeded' (got ${result.reason})`);
-        createdJobIds.push(result.jobId);
-        const job = await loadJob(result.jobId);
-        assert(job.costEstimateUsd === null, "a budget-blocked job persists no cost");
-        const results = await loadResultsForJob(result.jobId);
-        assert(results.length === 0, "zero ai_results rows exist for a budget-blocked job");
+        assert(result.jobId !== null, "a job row IS created for a budget block (not already_in_flight)");
+        if (result.jobId !== null) {
+          createdJobIds.push(result.jobId);
+          const job = await loadJob(result.jobId);
+          assert(job.costEstimateUsd === null, "a budget-blocked job persists no cost");
+          const results = await loadResultsForJob(result.jobId);
+          assert(results.length === 0, "zero ai_results rows exist for a budget-blocked job");
+        }
       }
       restoreDefaultTestEnv();
     }
@@ -425,7 +437,8 @@ async function main() {
       assert(provider.receivedRequests.length === 0, "the provider was never invoked with a zero budget ceiling");
       if (!result.ok) {
         assert(result.reason === "budget_exceeded", `blocked reason is 'budget_exceeded' for a zero ceiling (got ${result.reason})`);
-        createdJobIds.push(result.jobId);
+        assert(result.jobId !== null, "a job row IS created for a zero-budget block (not already_in_flight)");
+        if (result.jobId !== null) createdJobIds.push(result.jobId);
       }
       restoreDefaultTestEnv();
     }

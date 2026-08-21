@@ -27,6 +27,17 @@ export interface PendingAiJobInput {
   provider: string;
   model: string;
   inputRef?: string | null;
+  /**
+   * Phase 5 PR 3: opaque passthrough, mirrors ai_results' claimId exactly
+   * but populated at PENDING-job-creation time rather than only on
+   * success -- the partial unique index on source_item_id (scoped to
+   * operation = 'classify_relevance', migration 0014) needs it present
+   * from the moment the row is inserted, since that INSERT is exactly
+   * what the index either accepts
+   * or rejects. This file remains entirely operation-agnostic: it has no
+   * idea this is used by classify_relevance specifically.
+   */
+  sourceItemId?: number | null;
 }
 
 export interface PendingAiJobValues {
@@ -35,6 +46,7 @@ export interface PendingAiJobValues {
   model: string;
   status: "pending";
   inputRef: string | null;
+  sourceItemId: number | null;
 }
 
 /** Section 19 (observability): every field here is exactly what gets persisted -- no defaults are silently applied beyond status itself. */
@@ -45,6 +57,7 @@ export function buildPendingAiJobValues(input: PendingAiJobInput): PendingAiJobV
     model: input.model,
     status: "pending",
     inputRef: input.inputRef ?? null,
+    sourceItemId: input.sourceItemId ?? null,
   };
 }
 

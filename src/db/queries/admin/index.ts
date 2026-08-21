@@ -353,3 +353,116 @@ export async function getDashboardStats() {
   `);
   return result.rows[0];
 }
+
+/**
+ * Phase 5 PR 3: the minimal source-item shape classify_relevance needs.
+ * Lives here (a plain read, alongside every other admin/AI-adjacent read
+ * over source_items in this file) rather than in
+ * src/db/mutations/ingestion.ts or classificationRecovery.ts -- neither
+ * of those DB-mutation modules should know that AI classification exists
+ * (Section 9/15).
+ */
+export async function getSourceItemForClassification(sourceItemId: number) {
+  const rows = await adminDb
+    .select({ id: sourceItems.id, url: sourceItems.url, title: sourceItems.title, excerpt: sourceItems.excerpt })
+    .from(sourceItems)
+    .where(eq(sourceItems.id, sourceItemId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export interface SourceItemClassificationStatusRow {
+  sourceItemId: number;
+  title: string | null;
+  url: string;
+  jobId: number | null;
+  jobStatus: "pending" | "running" | "succeeded" | "failed" | null;
+  jobError: string | null;
+  jobCreatedAt: Date | null;
+  jobStartedAt: Date | null;
+  jobCompletedAt: Date | null;
+  /** Only populated for a succeeded job -- parsed from ai_results.structured_output, since classify_relevance deliberately leaves ai_results.confidence/reasoning NULL (see classifyRelevance.ts's header comment). */
+  relevance: "relevant" | "irrelevant" | "needs_review" | null;
+  confidence: number | null;
+  reasoning: string | null;
+}
+
+/**
+ * The most recent classify_relevance ai_jobs row (if any) per source
+ * item, via a LATERAL join -- Drizzle's query builder has no clean way
+ * to express "top 1 row per group," so this is raw SQL, same convention
+ * as getSourceItemRelationships/getDashboardStats above. Feeds
+ * computeClassificationDisplayStatus (src/lib/ai/classificationRecoveryLifecycle.ts)
+ * to render exactly one of unclassified / in_progress / stale / failed /
+ * succeeded per item -- see that function's header for why a fresh
+ * in-flight job must never collapse into "missing" or "failed".
+ */
+export async function listSourceItemClassificationStatus(limit = 50) {
+  const result = await adminDb.execute<{
+    source_item_id: number;
+    title: string | null;
+    url: string;
+    job_id: number | null;
+    job_status: "pending" | "running" | "succeeded" | "failed" | null;
+    job_error: string | null;
+    job_created_at: Date | null;
+    job_started_at: Date | null;
+    job_completed_at: Date | null;
+    structured_output: unknown;
+  }>(sql`
+    SELECT
+      si.id AS source_item_id,
+      si.title,
+      si.url,
+      j.id AS job_id,
+      j.status AS job_status,
+      j.error AS job_error,
+      j.created_at AS job_created_at,
+      j.started_at AS job_started_at,
+      j.completed_at AS job_completed_at,
+      r.structured_output AS structured_output
+    FROM source_items si
+    LEFT JOIN LATERAL (
+      SELECT aj.id, aj.status, aj.error, aj.created_at, aj.started_at, aj.completed_at
+      FROM ai_jobs aj
+      WHERE aj.operation = 'classify_relevance' AND aj.source_item_id = si.id
+      ORDER BY aj.created_at DESC
+      LIMIT 1
+    ) j ON true
+    LEFT JOIN ai_results r ON r.ai_job_id = j.id
+    ORDER BY si.created_at DESC
+    LIMIT ${limit}
+  `);
+
+  return result.rows.map((row): SourceItemClassificationStatusRow => {
+    // structured_output is only ever present for a succeeded job -- a
+    // lightweight shape check for display purposes, not a re-validation
+    // of the schema (classifyRelevance's own Zod schema already validated
+    // it before it was persisted).
+    const structured =
+      row.structured_output && typeof row.structured_output === "object"
+        ? (row.structured_output as { relevance?: unknown; confidence?: unknown; reasoning?: unknown })
+        : null;
+    const relevance =
+      structured && (structured.relevance === "relevant" || structured.relevance === "irrelevant" || structured.relevance === "needs_review")
+        ? structured.relevance
+        : null;
+    const confidence = structured && typeof structured.confidence === "number" ? structured.confidence : null;
+    const reasoning = structured && typeof structured.reasoning === "string" ? structured.reasoning : null;
+
+    return {
+      sourceItemId: row.source_item_id,
+      title: row.title,
+      url: row.url,
+      jobId: row.job_id,
+      jobStatus: row.job_status,
+      jobError: row.job_error,
+      jobCreatedAt: row.job_created_at,
+      jobStartedAt: row.job_started_at,
+      jobCompletedAt: row.job_completed_at,
+      relevance,
+      confidence,
+      reasoning,
+    };
+  });
+}
