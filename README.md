@@ -200,6 +200,8 @@ production.
 | `NEXT_PUBLIC_SITE_URL` | `src/lib/siteConfig.ts` (sitemap, robots, metadata) | canonical public base URL; set to `https://gta6-intel.vercel.app` for staging |
 | `LOCAL_FAKE_ADMIN_AUTH_USER_ID` | `src/lib/auth/session.ts` | **local development only** — see "Supabase Auth" above |
 | `INGESTION_REVIEW_SIGNING_SECRET` | `src/lib/ingestion/reviewPayloadSigning.ts` | HMAC secret binding manual-ingestion review data (retrieved URL, content hash) to the admin's confirm request, so hidden form fields can't substitute tampered values — see that file's header comment. Generate with e.g. `openssl rand -hex 32`; rotating it invalidates any in-flight (unconfirmed) review tokens, which is safe — the admin just resubmits the URL. |
+| `ANTHROPIC_API_KEY` | `src/lib/ai/providers/anthropicProvider.ts` (via `src/lib/ai/config.ts`) | Anthropic API key, read lazily only when `getAnthropicProvider()` is actually called -- not required to build/typecheck/run checks against the fake provider. Never required in the standard `npm run check` suite; only needed for the opt-in `check:ai-anthropic-live` smoke test (see "Test / check commands"). |
+| `AI_DEFAULT_MODEL` | `src/lib/ai/config.ts` | Default model id used by `runAiOperation()` when a caller doesn't supply an explicit per-call override. Read lazily, same reasoning as above. |
 
 ---
 
@@ -257,6 +259,16 @@ Also run before considering any change complete:
 npm run typecheck
 npm run build
 ```
+
+**`npm run check:ai-anthropic-live` is deliberately excluded from `npm run check`.**
+It makes a real, billed call to the Anthropic API and requires
+`ANTHROPIC_API_KEY` plus an explicit `AI_LIVE_TEST_OPT_IN=yes` opt-in —
+see `src/checks/aiAnthropicLive.check.ts`'s header comment. The standard
+suite (`npm run check`, including `check:ai-job-lifecycle` and
+`check:ai-run-operation`) stays deterministic, offline-capable apart from
+the local check database, zero-cost, and safe for CI — it exercises the
+AI provider abstraction only against the in-memory fake provider
+(`src/checks/helpers/fakeAiProvider.ts`).
 
 ## Vercel deployment
 

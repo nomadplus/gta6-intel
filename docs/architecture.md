@@ -323,6 +323,95 @@ transitions that actually became effective go there. `direct_change`
 exists for human edits with no AI proposal behind them at all
 (`ai_result_id` is nullable on `admin_decisions` for exactly this case).
 
+### AI provider abstraction (Phase 5 PR 1)
+
+`src/lib/ai/` is the provider-neutral contract layer every future real
+AI operation (`classifyRelevance`, `extractClaims`, `compareClaims`,
+`analyseProvenance`, `evaluateEvidence`, `recommendStatus`,
+`detectDuplicates`) is expected to call through, rather than talking to
+an SDK or to `ai_jobs`/`ai_results` directly:
+
+- **`types.ts`** — the `AiOperation` union (a plain literal mirror of the
+  `ai_operation` enum, kept dependency-free from drizzle-orm on purpose)
+  and the `AiProvider` interface: one method, `complete<T>()`, taking an
+  operation-specific Zod `outputSchema` supplied by the *caller* — this
+  file has no opinion about what any specific operation's schema looks
+  like, so adding a new operation never requires editing it.
+- **`config.ts`** — `getDefaultModel()` / `getAnthropicApiKey()`, both
+  read lazily (at call time, not import time) so importing anything
+  under `src/lib/ai/` never fails a build/typecheck/check run in an
+  environment that hasn't configured `AI_DEFAULT_MODEL` or
+  `ANTHROPIC_API_KEY` — only code paths that actually construct a real
+  provider or resolve a default model need them set.
+- **`providers/anthropicProvider.ts`** — the one real implementation.
+  Uses a single forced tool call (`tool_choice: {type:"tool", ...}`)
+  whose `input_schema` is the caller's Zod schema converted via Zod 4's
+  native `z.toJSONSchema()` (no extra dependency needed for that
+  conversion), then re-validates the tool call's input against the same
+  schema before returning it — never a blind cast of whatever the model
+  claims to have produced. `getAnthropicProvider()` is a lazy,
+  memoized factory; constructing it is the point at which "we need a
+  real Anthropic key" becomes true, not module import.
+- **`aiJobLifecycle.ts`** — pure patch-builder functions for the
+  `ai_jobs` `pending → running → succeeded/failed` lifecycle, mirroring
+  `src/lib/ingestion/ingestionJobLifecycle.ts`'s pure/I-O split exactly.
+  No retry/backoff logic exists here — `ai_jobs` has no
+  `attempt_count`/`next_retry_at` columns yet, and none were added in
+  this PR.
+- **`runAiOperation.ts`** — the one generic orchestrator: creates the
+  pending job, marks it running, calls the given `AiProvider`, validates
+  the result, and persists success (job + result, one transaction) or
+  failure (job only — `ai_results.structured_output` is `NOT NULL`, so a
+  failed job correctly produces zero result rows). `confidence` and
+  `reasoning` are accepted only as explicit, optional passthrough
+  parameters (the same mechanism as `claimId`) — this function never
+  inspects the validated structured output for a `confidence`- or
+  `reasoning`-named property to populate those columns automatically.
+  `structuredOutput` is always the complete, untouched validated
+  operation output, independent of whatever `ai_results.confidence`/
+  `ai_results.reasoning` end up holding. A future operation that wants
+  those two columns populated (e.g. `recommendStatus`) maps its own
+  output into them explicitly when it calls `runAiOperation` — PR 1
+  leaves both `NULL` for every current generic execution, which is the
+  intended behavior, not a gap.
+- **`db/mutations/aiJobs.ts`** — the actual `ai_jobs`/`ai_results`
+  reads/writes, operation-agnostic. No `requireAdmin()`/audit-log call
+  here, same reasoning as `ingestionProcessor.ts`'s job claiming: this
+  is an automated operation's own bookkeeping, not a live admin request.
+
+**Provider strategy**: Anthropic is the only real provider implemented.
+A test-only `FakeAiProvider` (`src/checks/helpers/fakeAiProvider.ts`)
+implements the same `AiProvider` interface for checks — it is not
+reachable as a production-configurable provider (no env var or registry
+selects it; the only way to get one is to import the check-helper file
+directly, which no application code outside `src/checks` does).
+
+**`ai_job_status` has no separate value distinguishing a provider-side
+failure from a structured-output validation failure** — both land in
+`'failed'`, with the distinction preserved in `ai_jobs.error`'s text
+(prefixed `provider_error:` or `invalid_structured_output:`). This was a
+deliberate choice to avoid an unnecessary schema addition for PR 1.
+
+**`ai_jobs.cost_estimate_usd` is passive persistence only in this PR** —
+`runAiOperation`/`aiJobLifecycle.ts` will format and store an explicitly
+supplied estimate, but nothing here computes one from token counts or
+a pricing table. Provider/model pricing, budget enforcement, and any
+cost-based routing are explicitly Phase 5 PR 2's territory.
+
+**`detect_duplicates`** was added as its own `ai_operation` value
+(migration `0013`) rather than folded into `compare_claims` — Phase 4
+already performs deterministic/exact duplicate detection at ingestion
+time; this reserves a distinct, independently observable operation for
+the future *semantic* near-duplicate detection Phase 5 PR 6 will add
+(jobs, costs, retries, and provider/model comparison all need to be
+attributable to that operation specifically, not lumped into general
+claim comparison).
+
+No application code in this PR calls `runAiOperation()` from ingestion,
+classifies any real source item, extracts any claim, or writes any
+`ai_results` row from real model output — Phase 5 PR 1 is the execution
+primitive only; every real operation is a later PR.
+
 ### Status history (the two append-only ledgers)
 
 `claim_investigation_status_history` and

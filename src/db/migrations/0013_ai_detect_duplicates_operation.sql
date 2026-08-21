@@ -1,0 +1,22 @@
+-- =============================================================================
+-- Migration 0013: Phase 5 PR 1 -- ai_operation 'detect_duplicates' value
+--
+-- Adds a dedicated ai_operation enum value for future semantic
+-- near-duplicate detection (Phase 5 PR 6). Phase 4 already performs
+-- deterministic/exact duplicate detection at ingestion time
+-- (src/lib/ingestion/duplicateDetection.ts) -- this is a distinct,
+-- semantic operation that must be independently observable in ai_jobs
+-- for jobs, costs, evaluation, retries, debugging, and provider/model
+-- comparison, so it is NOT folded into 'compare_claims'.
+--
+-- ALTER TYPE ... ADD VALUE cannot be used in the same transaction as a
+-- statement that reads/writes using the new value (PostgreSQL restriction
+-- on enum value visibility mid-transaction), so this migration contains
+-- ONLY this one statement, deliberately -- consistent with every other
+-- enum-value addition in this project (see migration 0008).
+--
+-- No application code in this PR writes rows using this value yet -- see
+-- docs/architecture.md's Phase 5 PR 1 note. That begins in Phase 5 PR 6.
+-- =============================================================================
+
+ALTER TYPE "ai_operation" ADD VALUE 'detect_duplicates';

@@ -29,13 +29,17 @@
     "check:require-cron-secret": "tsx --conditions=react-server src/checks/requireCronSecret.check.ts",
     "check:feed-parsing": "tsx src/checks/feedParsing.check.ts",
     "check:discovery-polling": "tsx --conditions=react-server src/checks/discoveryPolling.check.ts",
-    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch && npm run check:ingestion-content-hash && npm run check:ingestion-metadata-extraction && npm run check:ingestion-status-mapping && npm run check:ingestion-duplicate-detection && npm run check:ingestion-source-identity && npm run check:ingestion-job-lifecycle && npm run check:ingestion-audit-logging && npm run check:ingestion-review-recovery && npm run check:discovery-feeds && npm run check:ingestion-processor && npm run check:require-cron-secret && npm run check:feed-parsing && npm run check:discovery-polling",
+    "check:ai-job-lifecycle": "tsx src/checks/aiJobLifecycle.check.ts",
+    "check:ai-run-operation": "tsx --conditions=react-server src/checks/aiRunOperation.check.ts",
+    "check:ai-anthropic-live": "tsx --conditions=react-server src/checks/aiAnthropicLive.check.ts",
+    "check": "npm run check:admin-auth && npm run check:status-presentation && npm run check:ingestion-url-normalization && npm run check:ingestion-url-safety && npm run check:ingestion-safe-fetch && npm run check:ingestion-content-hash && npm run check:ingestion-metadata-extraction && npm run check:ingestion-status-mapping && npm run check:ingestion-duplicate-detection && npm run check:ingestion-source-identity && npm run check:ingestion-job-lifecycle && npm run check:ingestion-audit-logging && npm run check:ingestion-review-recovery && npm run check:discovery-feeds && npm run check:ingestion-processor && npm run check:require-cron-secret && npm run check:feed-parsing && npm run check:discovery-polling && npm run check:ai-job-lifecycle && npm run check:ai-run-operation",
     "db:seed": "tsx src/db/seed/seed.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0",
     "@supabase/ssr": "^0.12.4",
     "@supabase/supabase-js": "^2.112.3",
     "dotenv": "^17.4.2",

@@ -92,6 +92,12 @@ export const aiOperationEnum = pgEnum("ai_operation", [
   "evaluate_evidence",
   "recommend_status",
   "embed",
+  // Added in migration 0013 (Phase 5 PR 1) -- deliberately kept separate
+  // from compare_claims. Phase 4 already performs deterministic/exact
+  // duplicate detection; this covers a future semantic near-duplicate
+  // operation that needs its own independently observable jobs/costs/
+  // retries, not a variant of general claim comparison.
+  "detect_duplicates",
 ]);
 
 export const aiJobStatusEnum = pgEnum("ai_job_status", [
