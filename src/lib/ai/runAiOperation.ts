@@ -2,6 +2,10 @@ import "server-only";
 import type { z } from "zod";
 import { createPendingAiJob, markAiJobRunning, completeAiJobSuccess, completeAiJobFailure } from "@/db/mutations/aiJobs";
 import { getDefaultModel } from "./config";
+import { getMonthlyBudgetCeilingMicros } from "./safety/budget";
+import { evaluateAiSafety, type AiSafetyBlockedReason } from "./safety/evaluateAiSafety";
+import { calculateCostMicros } from "./safety/pricing";
+import { microsToUsdString } from "./safety/money";
 import type { AiOperation, AiProvider, AiCompletionResult } from "./types";
 
 /**
@@ -15,6 +19,13 @@ import type { AiOperation, AiProvider, AiCompletionResult } from "./types";
  *
  * This file contains no operation-specific prompts, schemas, or business
  * logic -- see types.ts's header comment for why that separation matters.
+ *
+ * Phase 5 PR 2 adds the mandatory safety checkpoint (see "SAFETY CHECK"
+ * below) between job creation and the actual provider call -- this is the
+ * single central enforcement boundary described in
+ * src/lib/ai/safety/evaluateAiSafety.ts's header. Every current and
+ * future caller of runAiOperation() is protected automatically; no caller
+ * needs to remember to check a budget or kill switch itself.
  */
 
 export interface RunAiOperationInput<T> {
@@ -55,7 +66,16 @@ export interface RunAiOperationSuccess<T> {
 export interface RunAiOperationFailure {
   ok: false;
   jobId: number;
-  reason: "provider_error" | "invalid_structured_output";
+  /**
+   * Phase 5 PR 2 adds the three AiSafetyBlockedReason values alongside
+   * PR 1's original two -- a blocked execution is a distinct KIND of
+   * failure (it never reached the provider at all) from a provider-side
+   * or validation failure, but it is still surfaced through this same
+   * result shape rather than a new one, matching how ai_jobs.error's text
+   * (not a new enum value) is what actually distinguishes all five cases
+   * on the persisted row -- see aiJobLifecycle.ts's buildFailurePatch.
+   */
+  reason: "provider_error" | "invalid_structured_output" | AiSafetyBlockedReason;
   message: string;
 }
 
@@ -64,12 +84,35 @@ export type RunAiOperationResult<T> = RunAiOperationSuccess<T> | RunAiOperationF
 export async function runAiOperation<T>(input: RunAiOperationInput<T>): Promise<RunAiOperationResult<T>> {
   const model = input.model ?? getDefaultModel();
 
+  // Resolved BEFORE any job row is created, same ordering as
+  // getDefaultModel() above -- AI_MONTHLY_BUDGET_USD is mandatory
+  // (MissingAiBudgetConfigError if unset, MalformedAiBudgetConfigError if
+  // set but invalid) -- both are true misconfigurations, not ordinary
+  // operational outcomes, so they throw here rather than producing a
+  // dangling 'pending' job with no way to reach a terminal state.
+  const budgetCeilingMicros = getMonthlyBudgetCeilingMicros();
+
   const job = await createPendingAiJob({
     operation: input.operation,
     provider: input.provider.name,
     model,
     inputRef: input.inputRef ?? null,
   });
+
+  // --- SAFETY CHECK (Phase 5 PR 2) ---------------------------------------
+  // The single central enforcement boundary: kill switch, unpriced model,
+  // and monthly budget ceiling are all evaluated here, strictly before
+  // markAiJobRunning()/provider.complete() are ever reached. A blocked
+  // call is recorded straight to 'failed' -- it deliberately never passes
+  // through 'running', since no provider call was attempted -- with zero
+  // cost persisted, since nothing was spent. See evaluateAiSafety.ts.
+  const safety = await evaluateAiSafety({ model, budgetCeilingMicros });
+  if (!safety.allowed) {
+    const message = safety.message;
+    await completeAiJobFailure({ jobId: job.id, error: `${safety.reason}: ${message}` });
+    return { ok: false, jobId: job.id, reason: safety.reason, message };
+  }
+  const { pricing } = safety;
 
   await markAiJobRunning(job.id);
 
@@ -87,26 +130,41 @@ export async function runAiOperation<T>(input: RunAiOperationInput<T>): Promise<
     // A conforming AiProvider should never throw (see types.ts), but a
     // job must always reach a terminal state regardless -- an unexpected
     // throw is treated as a provider_error, same as a well-behaved
-    // provider's own reported failure would be.
+    // provider's own reported failure would be. No token counts are
+    // available from a bare throw, so cost is left null -- unmeasurable,
+    // not zero (see budget.ts's hasUnmeasuredRows).
     const message = err instanceof Error ? err.message : String(err);
     await completeAiJobFailure({ jobId: job.id, error: `provider_error: ${message}` });
     return { ok: false, jobId: job.id, reason: "provider_error", message };
   }
 
   if (!result.ok) {
+    // Phase 5 PR 2: a failure this far in (provider_error after a partial
+    // response, or invalid_structured_output) may still have consumed
+    // real, billable tokens -- compute and persist cost whenever the
+    // provider actually reported token counts, same pricing used for the
+    // success path below.
+    const tokensIn = result.tokensIn ?? null;
+    const tokensOut = result.tokensOut ?? null;
+    const costEstimateUsd =
+      tokensIn !== null && tokensOut !== null ? microsToUsdString(calculateCostMicros(pricing, tokensIn, tokensOut)) : null;
     await completeAiJobFailure({
       jobId: job.id,
       error: `${result.reason}: ${result.message}`,
-      tokensIn: result.tokensIn ?? null,
-      tokensOut: result.tokensOut ?? null,
+      tokensIn,
+      tokensOut,
+      costEstimateUsd,
     });
     return { ok: false, jobId: job.id, reason: result.reason, message: result.message };
   }
+
+  const costEstimateUsd = microsToUsdString(calculateCostMicros(pricing, result.tokensIn, result.tokensOut));
 
   const completed = await completeAiJobSuccess({
     jobId: job.id,
     tokensIn: result.tokensIn,
     tokensOut: result.tokensOut,
+    costEstimateUsd,
     structuredOutput: result.data,
     confidence: input.confidence ?? null,
     reasoning: input.reasoning ?? null,

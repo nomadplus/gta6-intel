@@ -68,25 +68,34 @@ export interface SuccessAiJobPatch {
 }
 
 /**
- * `costEstimateUsd` is left null unless the caller explicitly supplies
- * one -- PR 1 has no per-model pricing table (that is squarely Phase 5
- * PR 2's cost-control territory, per the approved PR1 scope), so this
- * does not invent one. Stored as a string because Drizzle's `numeric`
- * column type expects string input, matching how the Phase 1 seed data
- * writes it (see src/db/seed/seed.ts).
+ * `costEstimateUsd` (Phase 5 PR 2): the caller supplies an already
+ * exact-formatted numeric(10,6) string -- see
+ * src/lib/ai/safety/money.ts's `microsToUsdString()` -- rather than a raw
+ * JS number for this function to `.toFixed()` itself. PR 1's original
+ * signature took a `number` and called `.toFixed(6)` on it directly, but
+ * that call site never actually ran in practice (no pricing table
+ * existed yet, so it was always null); doing float-to-string formatting
+ * here would reintroduce exactly the binary-floating-point imprecision
+ * this project's own `z.coerce.boolean()` lesson warns against for a
+ * different column type, now that PR 2 actually populates this value
+ * from real per-token pricing. Computing the exact string is the
+ * caller's job (runAiOperation.ts, via the safety/pricing module); this
+ * function only ever passes the string straight through to the
+ * `numeric` column, matching how the Phase 1 seed data writes it (see
+ * src/db/seed/seed.ts).
  */
 export function buildSuccessPatch(params: {
   now: Date;
   tokensIn: number;
   tokensOut: number;
-  costEstimateUsd?: number | null;
+  costEstimateUsd?: string | null;
 }): SuccessAiJobPatch {
   return {
     status: "succeeded",
     completedAt: params.now,
     tokensIn: params.tokensIn,
     tokensOut: params.tokensOut,
-    costEstimateUsd: params.costEstimateUsd != null ? params.costEstimateUsd.toFixed(6) : null,
+    costEstimateUsd: params.costEstimateUsd ?? null,
     error: null,
   };
 }
@@ -97,21 +106,33 @@ export interface FailureAiJobPatch {
   error: string;
   tokensIn: number | null;
   tokensOut: number | null;
+  costEstimateUsd: string | null;
 }
 
 /**
- * Covers BOTH a provider-side failure and a structured-output validation
- * failure (AiCompletionFailureReason distinguishes them) -- `ai_job_status`
- * intentionally has no separate value for the two, per the approved PR1
- * scope ("don't introduce unnecessary schema"). The distinction is
+ * Covers a provider-side failure, a structured-output validation failure,
+ * AND (Phase 5 PR 2) a safety-blocked execution that never reached the
+ * provider at all (kill switch / unknown model pricing / budget
+ * exceeded) -- `ai_job_status` intentionally has no separate value for
+ * any of these, per the approved PR1 scope ("don't introduce unnecessary
+ * schema"), extended by PR2 rather than replaced. The distinction is
  * preserved in `error`'s text (see runAiOperation.ts), not in a new enum
  * value.
+ *
+ * `costEstimateUsd` (Phase 5 PR 2): a failure can still have consumed
+ * real, billable tokens -- e.g. invalid_structured_output means the
+ * provider call succeeded and was billed, only the response shape was
+ * rejected afterward. Omitting cost on the failure path (as PR1 did)
+ * would make the monthly budget ceiling systematically undercount spend.
+ * A safety-blocked failure (never reached the provider) correctly passes
+ * no cost here, since nothing was spent.
  */
 export function buildFailurePatch(params: {
   now: Date;
   error: string;
   tokensIn?: number | null;
   tokensOut?: number | null;
+  costEstimateUsd?: string | null;
 }): FailureAiJobPatch {
   return {
     status: "failed",
@@ -119,5 +140,6 @@ export function buildFailurePatch(params: {
     error: params.error,
     tokensIn: params.tokensIn ?? null,
     tokensOut: params.tokensOut ?? null,
+    costEstimateUsd: params.costEstimateUsd ?? null,
   };
 }

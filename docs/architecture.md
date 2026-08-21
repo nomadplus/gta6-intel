@@ -412,6 +412,97 @@ classifies any real source item, extracts any claim, or writes any
 `ai_results` row from real model output — Phase 5 PR 1 is the execution
 primitive only; every real operation is a later PR.
 
+### AI cost controls & kill switch (Phase 5 PR 2)
+
+`src/lib/ai/safety/` adds the mandatory safety checkpoint every call to
+`runAiOperation()` passes through, between job creation and the actual
+provider invocation — this is the single central enforcement boundary;
+no future operation (`classifyRelevance`, `extractClaims`, ...) needs to
+remember to check a budget or kill switch itself.
+
+- **`killSwitch.ts`** — `isKillSwitchEngaged()`. `AI_KILL_SWITCH_ENGAGED`
+  unset or exactly `"false"` means disengaged (normal operation, the
+  opposite default direction from most config in this project, since this
+  is an override switch, not a mandatory credential). Any other value
+  engages it — ambiguity favors stopping for an emergency switch. Applies
+  uniformly to every `AiProvider`, including the test-only fake provider,
+  deliberately: distinguishing "real" from "test" execution would require
+  providers to self-report their own billability, a weaker, spoofable
+  signal than a single provider-agnostic guard.
+- **`pricing.ts`** — a static map of per-model prices, in integer
+  **micro-USD per million tokens** (a `bigint`, e.g. `3_000_000n` for
+  $3.00/MTok) — a direct, exact transcription of Anthropic's published
+  rate card, verified against `platform.claude.com/docs/en/about-claude/
+  pricing` at authoring time. `calculateCostMicros()` computes exact
+  BigInt cost with **no floating-point arithmetic anywhere** — token
+  counts and prices are both integers, multiplied and summed as BigInt,
+  then divided by `1_000_000n` (BigInt integer division, which truncates
+  toward zero). That final division is the one place a sub-micro-USD
+  remainder can exist (e.g. 7 tokens at a hypothetical $0.30/MTok rate is
+  a true cost of 2.1 micro-USD, unrepresentable at the `numeric(10,6)`
+  storage scale) — the remainder is deliberately truncated (floored), a
+  documented, bounded-negligible choice (under $0.000001 per call) rather
+  than a silent one. An unknown/unpriced model **fails closed** — the
+  call is blocked before the provider is ever invoked, not silently
+  allowed through with an unmeasured cost, since that would make the
+  model's spend permanently invisible to the ceiling below.
+- **`budget.ts`** — `AI_MONTHLY_BUDGET_USD` is **mandatory** (there is
+  deliberately no "unset means unlimited spend" fallback: PR 2 exists
+  specifically to establish the spend-safety boundary before automated AI
+  execution begins, so forgetting to set this variable must fail closed,
+  not silently disable the primary cost safeguard) and, once configured,
+  a **soft, preflight** monthly spend threshold — explicitly NOT a hard
+  or concurrency-safe ceiling. It only checks whether spend already
+  recorded in `ai_jobs` (summed over the UTC calendar month, across every
+  job status, since a failure that still reached the provider is still
+  billable) has reached the configured amount. Two distinct overrun
+  mechanisms follow from that, both documented in the file's header: (1)
+  a **single-call overrun** exists even with one caller and zero
+  concurrency, since the cost of the call being admitted is unknowable
+  until the provider responds; (2) **concurrency** compounds this, since
+  multiple simultaneous callers can each observe "not yet over the
+  ceiling" before any of their cost is recorded. A hard, concurrency-safe
+  reservation ledger would close both gaps but is deliberately deferred —
+  Phase 5 PR 2 excludes ingestion-triggered/batched AI execution, so
+  there is no concurrent caller yet to justify that complexity; build it
+  when a future PR actually introduces one. An absent value throws
+  `MissingAiBudgetConfigError`; an empty, negative, or otherwise
+  unparseable value throws `MalformedAiBudgetConfigError` — neither ever
+  silently becomes "no limit." `"0"` is a valid, accepted value: it
+  parses to a ceiling of exactly 0 micro-USD, which (compared against a
+  month-to-date spend that is always >= 0) blocks every single AI call
+  once evaluated, with no special-cased "zero means off" branch anywhere
+  in this file or in `evaluateAiSafety.ts`.
+- **`money.ts`** — the shared exact-arithmetic primitives:
+  `microsToUsdString()`/`parseUsdStringToMicros()`, both `bigint`-based,
+  used by every other file in this directory. No `number`, `parseFloat`,
+  or `.toFixed()` participates in any cost or budget calculation anywhere
+  in `src/lib/ai/safety/`.
+- **`evaluateAiSafety.ts`** — the single function `runAiOperation()`
+  calls: kill switch, then unpriced-model, then month-to-date spend (now
+  unconditional, since a budget ceiling is always resolved), in that
+  order. Returns a typed `{allowed: true, pricing}` or `{allowed: false,
+  reason, message}` — never throws for an ordinary, expected operational
+  outcome. The two things that DO throw are a missing or malformed
+  `AI_MONTHLY_BUDGET_USD` (`MissingAiBudgetConfigError` /
+  `MalformedAiBudgetConfigError`), and `runAiOperation()` deliberately
+  resolves that value **before** creating the `ai_jobs` row (the same
+  "resolve config, then create the job" ordering already used for
+  `getDefaultModel()`) — so neither ever strands a dangling `pending`
+  row; no row is created for either case at all. The three ordinary
+  blocked outcomes (kill switch / unpriced model / budget exceeded,
+  including a `"0"` ceiling) are evaluated strictly after job creation
+  but before `markAiJobRunning()`, and are recorded straight `pending →
+  failed` — deliberately skipping `running`, since no provider call was
+  attempted, and persisting no cost, since nothing was spent.
+
+`aiJobLifecycle.ts`'s `buildFailurePatch` and `db/mutations/aiJobs.ts`'s
+`completeAiJobFailure` were extended (not replaced) in this PR to accept
+an optional `costEstimateUsd` — PR 1 only supported persisting cost on
+the success path, but a failure that still reached the provider (e.g.
+`invalid_structured_output`) is still billable, and omitting its cost
+would have made the monthly budget systematically undercount real spend.
+
 ### Status history (the two append-only ledgers)
 
 `claim_investigation_status_history` and

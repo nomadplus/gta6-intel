@@ -24,7 +24,7 @@ function assert(condition: boolean, message: string) {
   }
 }
 
-console.log("=== ai_jobs lifecycle patch builders (Phase 5 PR 1) ===\n");
+console.log("=== ai_jobs lifecycle patch builders (Phase 5 PR 1 + PR 2) ===\n");
 
 // --- buildPendingAiJobValues ------------------------------------------------
 
@@ -64,13 +64,17 @@ console.log("=== ai_jobs lifecycle patch builders (Phase 5 PR 1) ===\n");
   assert(patch.status === "succeeded", "success patch sets status to 'succeeded'");
   assert(patch.completedAt === now, "success patch sets completedAt to the injected clock value");
   assert(patch.tokensIn === 100 && patch.tokensOut === 40, "success patch carries token counts through unchanged");
-  assert(patch.costEstimateUsd === null, "costEstimateUsd defaults to null when the caller supplies none (no pricing table in PR1)");
+  assert(patch.costEstimateUsd === null, "costEstimateUsd defaults to null when the caller supplies none");
   assert(patch.error === null, "success patch always clears error to null");
 }
 
 {
-  const patch = buildSuccessPatch({ now: new Date(), tokensIn: 1, tokensOut: 1, costEstimateUsd: 0.00628 });
-  assert(patch.costEstimateUsd === "0.006280", `an explicitly supplied costEstimateUsd is formatted as a fixed-precision string for the numeric(10,6) column (got ${patch.costEstimateUsd})`);
+  // Phase 5 PR 2: buildSuccessPatch takes an already exact-formatted
+  // numeric(10,6) string (produced by src/lib/ai/safety/money.ts's
+  // microsToUsdString()), not a raw JS number -- this function performs
+  // no float-to-string formatting itself, see its own header comment.
+  const patch = buildSuccessPatch({ now: new Date(), tokensIn: 1, tokensOut: 1, costEstimateUsd: "0.006280" });
+  assert(patch.costEstimateUsd === "0.006280", `an explicitly supplied costEstimateUsd string passes through unchanged (got ${patch.costEstimateUsd})`);
 }
 
 // --- buildFailurePatch --------------------------------------------------------
@@ -87,6 +91,21 @@ console.log("=== ai_jobs lifecycle patch builders (Phase 5 PR 1) ===\n");
 {
   const patch = buildFailurePatch({ now: new Date(), error: "invalid_structured_output: bad shape", tokensIn: 50, tokensOut: 0 });
   assert(patch.tokensIn === 50 && patch.tokensOut === 0, "token counts ARE persisted on a validation failure when the provider did return usage before failing validation");
+  assert(patch.costEstimateUsd === null, "costEstimateUsd defaults to null on failure when the caller supplies none");
+}
+
+{
+  // Phase 5 PR 2: a failure can still have consumed billable tokens
+  // (e.g. invalid_structured_output reached the provider) -- cost must
+  // be persistable on the failure path too, not just on success.
+  const patch = buildFailurePatch({
+    now: new Date(),
+    error: "invalid_structured_output: bad shape",
+    tokensIn: 50,
+    tokensOut: 10,
+    costEstimateUsd: "0.000200",
+  });
+  assert(patch.costEstimateUsd === "0.000200", `an explicitly supplied costEstimateUsd is persisted on a failure patch too (got ${patch.costEstimateUsd})`);
 }
 
 console.log(failures === 0 ? "\nAll ai_jobs lifecycle checks passed." : `\n${failures} check(s) FAILED.`);

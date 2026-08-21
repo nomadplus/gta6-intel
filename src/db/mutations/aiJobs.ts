@@ -48,7 +48,8 @@ export interface CompleteAiJobSuccessInput {
   now?: Date;
   tokensIn: number;
   tokensOut: number;
-  costEstimateUsd?: number | null;
+  /** Phase 5 PR 2: an already exact-formatted numeric(10,6) string -- see aiJobLifecycle.ts's buildSuccessPatch header for why this is a string, not a raw number. */
+  costEstimateUsd?: string | null;
   /** The already Zod-validated structured output -- never an unvalidated raw provider payload. */
   structuredOutput: unknown;
   /** Optional -- most operations won't populate these in PR1 since no real operation exists yet; see runAiOperation.ts's duck-typed extraction. */
@@ -104,6 +105,8 @@ export interface CompleteAiJobFailureInput {
   error: string;
   tokensIn?: number | null;
   tokensOut?: number | null;
+  /** Phase 5 PR 2: an already exact-formatted numeric(10,6) string. Populated when a failure still consumed billable tokens (e.g. invalid_structured_output reached the provider); left null for a failure that never reached the provider (e.g. a safety-blocked execution -- see evaluateAiSafety.ts). */
+  costEstimateUsd?: string | null;
 }
 
 /** Marks the job 'failed'. Deliberately writes NO ai_results row -- there is nothing valid to store, and ai_results.structured_output is NOT NULL, so a failed job correctly produces zero result rows. */
@@ -117,6 +120,7 @@ export async function completeAiJobFailure(input: CompleteAiJobFailureInput): Pr
         error: input.error,
         tokensIn: input.tokensIn,
         tokensOut: input.tokensOut,
+        costEstimateUsd: input.costEstimateUsd,
       })
     )
     .where(eq(aiJobs.id, input.jobId));
