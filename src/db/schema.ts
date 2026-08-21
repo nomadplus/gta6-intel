@@ -404,6 +404,14 @@ export const ingestionJobs = pgTable(
     extractedAuthor: varchar("extracted_author", { length: 300 }),
     extractedPublishedAt: timestamp("extracted_published_at", { withTimezone: true }),
     extractedExcerpt: text("extracted_excerpt"),
+    // Added in migration 0012 (Phase 4 PR 10) — nullable, populated ONLY
+    // for system-discovered jobs (initiated_by = 'system'); always NULL
+    // for manual submissions. Records WHICH discovery_feeds row produced
+    // this job — operational/pipeline provenance, distinct from the
+    // epistemic source_relationships graph (see that table's comment).
+    // See migration 0012's header for why this also anchors the
+    // dedupe/race-safety constraint below.
+    discoveryFeedId: integer("discovery_feed_id").references(() => discoveryFeeds.id),
   },
   (t) => ({
     // Shaped for the approved future in-flight-redundancy rule ("reuse a
@@ -416,6 +424,20 @@ export const ingestionJobs = pgTable(
     inflightLookupIdx: index("ingestion_jobs_inflight_lookup_idx")
       .on(t.normalizedUrl, t.createdAt)
       .where(sql`${t.status} IN ('queued', 'fetching')`),
+    // Admin/observability join direction ("which jobs did this feed
+    // produce") — distinct from the dedupe index below, which is keyed
+    // on normalizedUrl, not discoveryFeedId.
+    discoveryFeedIdIdx: index("ingestion_jobs_discovery_feed_id_idx").on(t.discoveryFeedId),
+    // Phase 4 PR 10 (migration 0012): the AUTHORITATIVE concurrency-safe
+    // dedupe constraint for RSS-discovered jobs — see that migration's
+    // header for the full race-safety and manual-ingestion-preservation
+    // rationale. This index (not a plain one) is what makes two
+    // overlapping poll invocations racing on the same normalizedUrl safe:
+    // one INSERT succeeds, the other fails with a unique violation that
+    // the application catches and treats as "already discovered."
+    discoveryFeedNormalizedUrlUnique: uniqueIndex("ingestion_jobs_discovery_feed_normalized_url_unique")
+      .on(t.normalizedUrl)
+      .where(sql`${t.discoveryFeedId} IS NOT NULL`),
   })
 );
 

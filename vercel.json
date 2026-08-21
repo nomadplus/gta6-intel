@@ -1,6 +1,10 @@
 {
   "crons": [
     {
+      "path": "/api/discovery/poll",
+      "schedule": "0 4 * * *"
+    },
+    {
       "path": "/api/ingestion/process",
       "schedule": "0 6 * * *"
     }
