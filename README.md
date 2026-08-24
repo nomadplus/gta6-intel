@@ -172,8 +172,8 @@ dashboard, tracked in `supabase_migrations.schema_migrations` — the
 Drizzle migration runner itself is not used to apply migrations against
 Supabase.
 
-**A fresh install requires the migrations in order, 0000 → 0005, followed
-by `scripts/setup-db-roles.sql`** (see below) to grant `app_role`/
+**A fresh install requires every migration in numeric order, followed by
+`scripts/setup-db-roles.sql`** (see below) to grant `app_role`/
 `admin_role` a real password. This full path is verified — see
 `docs/architecture.md` for what was found and fixed during the migration
 history reconciliation, and how it was tested.
@@ -224,6 +224,19 @@ production.
    psql "$MIGRATOR_DATABASE_URL" -v ON_ERROR_STOP=1 -f src/db/migrations/0004_admin_foundation.sql
    psql "$MIGRATOR_DATABASE_URL" -v ON_ERROR_STOP=1 -f src/db/migrations/0005_fix_admin_role_sequence_grants.sql
    ```
+   Continue with every later numbered migration in the same order. On a
+   standard local PostgreSQL installation (not Supabase), create the two
+   Supabase Data API placeholder roles before applying `0006`:
+   ```sql
+   DO $$
+   BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN CREATE ROLE anon NOLOGIN; END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN CREATE ROLE authenticated NOLOGIN; END IF;
+   END
+   $$;
+   ```
+   Supabase already provides these roles; the local-only step lets the
+   Data-API lockdown migration run unchanged.
 4. Provision passwords for `app_role`/`admin_role` (created `NOLOGIN` by
    the migrations above):
    ```
@@ -253,6 +266,7 @@ or via the npm script alias:
 
 ```
 npm run check:status-presentation
+npm run check:claim-proposal-review
 ```
 
 Also run before considering any change complete:

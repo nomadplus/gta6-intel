@@ -503,6 +503,33 @@ the success path, but a failure that still reached the provider (e.g.
 `invalid_structured_output`) is still billable, and omitting its cost
 would have made the monthly budget systematically undercount real spend.
 
+### Extracted-claim review (Phase 5 PR 5)
+
+`extract_claims` produces one immutable `ai_results.structured_output`
+document containing zero or more candidates. A single `admin_decisions`
+row can identify that parent result, but cannot identify one candidate
+within it. `claim_proposal_reviews` therefore records an immutable,
+database-unique `(ai_result_id, candidate_index)` bridge to the human
+decision and—only for an approval—the newly created `claims` row.
+
+The review mutation re-reads and validates the stored extraction result
+against the actual source item's title/excerpt. It does not accept a source
+item id or supporting quotation from the browser. An approval is one
+transaction: it creates the claim, optional topic links, a single
+`claim_sources` row with that persisted quotation, the approval decision,
+both initial status-history rows, the proposal-review bridge, and the
+append-only general audit entries. A rejection creates only its decision,
+proposal-review row, and audit entry—never a claim, evidence record, or
+provenance link. Neither action invokes an AI provider.
+
+The reviewer may amend claim metadata and choose both initial statuses. The
+UI defaults conservatively to `unverified` and `unknown`; an official source
+does not silently imply `confirmed`. Candidate reviews are append-only: a
+mistake is handled by subsequent normal claim administration, not by
+erasing the record of the original human decision. Semantic matching to an
+existing claim remains deliberately out of scope for this PR; Phase 5 PR 6
+owns near-duplicate analysis.
+
 ### Status history (the two append-only ledgers)
 
 `claim_investigation_status_history` and

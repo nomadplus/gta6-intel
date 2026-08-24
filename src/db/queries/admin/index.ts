@@ -1,5 +1,5 @@
 import "server-only";
-import { desc, eq, sql } from "drizzle-orm";
+import { desc, eq, inArray, sql } from "drizzle-orm";
 import { adminDb } from "@/db/adminClient";
 import {
   claims,
@@ -15,6 +15,7 @@ import {
   adminUsers,
   aiResults,
   adminDecisions,
+  claimProposalReviews,
   aiJobs,
   ingestionJobs,
   discoveryProviders,
@@ -258,6 +259,7 @@ export async function listAiReviewRecords(limit = 50) {
   return adminDb
     .select({
       aiResultId: aiResults.id,
+      decisionId: adminDecisions.id,
       claimId: aiResults.claimId,
       confidence: aiResults.confidence,
       reasoning: aiResults.reasoning,
@@ -536,11 +538,17 @@ function parseRelevanceFromStructuredOutput(structuredOutput: unknown): "relevan
 }
 
 export interface ExtractedClaimCandidate {
+  candidateIndex: number;
   statement: string;
   informationType: string;
   supportingExcerpt: string;
   confidence: number;
   reasoning: string;
+  review: {
+    action: "approve" | "reject";
+    notes: string | null;
+    materializedClaimId: number | null;
+  } | null;
 }
 
 export interface SourceItemExtractionStatusRow {
@@ -555,6 +563,8 @@ export interface SourceItemExtractionStatusRow {
   jobCreatedAt: Date | null;
   jobStartedAt: Date | null;
   jobCompletedAt: Date | null;
+  /** Result containing candidates; null unless the current latest job succeeded. */
+  aiResultId: number | null;
   /** [] both for "extraction not yet run" and for "ran, found zero claims" -- jobStatus distinguishes the two (null vs 'succeeded'). */
   candidates: ExtractedClaimCandidate[];
   /** Only ever non-null alongside an empty candidates array -- see extractClaims.ts's schema constraint. */
@@ -584,6 +594,7 @@ export async function listSourceItemExtractionStatus(limit = 50) {
     job_created_at: Date | null;
     job_started_at: Date | null;
     job_completed_at: Date | null;
+    ai_result_id: number | null;
     structured_output: unknown;
   }>(sql`
     SELECT
@@ -597,6 +608,7 @@ export async function listSourceItemExtractionStatus(limit = 50) {
       j.created_at AS job_created_at,
       j.started_at AS job_started_at,
       j.completed_at AS job_completed_at,
+      r.id AS ai_result_id,
       r.structured_output AS structured_output
     FROM source_items si
     LEFT JOIN LATERAL (
@@ -619,6 +631,27 @@ export async function listSourceItemExtractionStatus(limit = 50) {
     LIMIT ${limit}
   `);
 
+  // One extraction result can hold multiple candidate decisions. Fetch all
+  // those decisions in one batch, rather than adding a query per source item
+  // or candidate to the review page.
+  const resultIds = result.rows.flatMap((row) => (row.ai_result_id === null ? [] : [row.ai_result_id]));
+  const reviewRows = resultIds.length === 0
+    ? []
+    : await adminDb
+        .select({
+          aiResultId: claimProposalReviews.aiResultId,
+          candidateIndex: claimProposalReviews.candidateIndex,
+          action: adminDecisions.action,
+          notes: adminDecisions.notes,
+          materializedClaimId: claimProposalReviews.materializedClaimId,
+        })
+        .from(claimProposalReviews)
+        .innerJoin(adminDecisions, eq(adminDecisions.id, claimProposalReviews.adminDecisionId))
+        .where(inArray(claimProposalReviews.aiResultId, resultIds));
+  const reviewsByCandidate = new Map(
+    reviewRows.map((review) => [`${review.aiResultId}:${review.candidateIndex}`, review])
+  );
+
   return result.rows.map((row): SourceItemExtractionStatusRow => {
     const latestSuccessfulRelevance = parseRelevanceFromStructuredOutput(row.latest_relevance_structured_output);
 
@@ -632,16 +665,31 @@ export async function listSourceItemExtractionStatus(limit = 50) {
     if (structured && typeof structured === "object") {
       const claimsField = (structured as { claims?: unknown }).claims;
       if (Array.isArray(claimsField)) {
-        candidates = claimsField.filter(
-          (c): c is ExtractedClaimCandidate =>
-            !!c &&
-            typeof c === "object" &&
-            typeof (c as ExtractedClaimCandidate).statement === "string" &&
-            typeof (c as ExtractedClaimCandidate).informationType === "string" &&
-            typeof (c as ExtractedClaimCandidate).supportingExcerpt === "string" &&
-            typeof (c as ExtractedClaimCandidate).confidence === "number" &&
-            typeof (c as ExtractedClaimCandidate).reasoning === "string"
-        );
+        candidates = claimsField.flatMap((c, candidateIndex): ExtractedClaimCandidate[] => {
+          if (
+            !c ||
+            typeof c !== "object" ||
+            typeof (c as Omit<ExtractedClaimCandidate, "candidateIndex" | "review">).statement !== "string" ||
+            typeof (c as Omit<ExtractedClaimCandidate, "candidateIndex" | "review">).informationType !== "string" ||
+            typeof (c as Omit<ExtractedClaimCandidate, "candidateIndex" | "review">).supportingExcerpt !== "string" ||
+            typeof (c as Omit<ExtractedClaimCandidate, "candidateIndex" | "review">).confidence !== "number" ||
+            typeof (c as Omit<ExtractedClaimCandidate, "candidateIndex" | "review">).reasoning !== "string"
+          ) {
+            return [];
+          }
+          const review = row.ai_result_id === null ? undefined : reviewsByCandidate.get(`${row.ai_result_id}:${candidateIndex}`);
+          return [{
+            candidateIndex,
+            statement: (c as { statement: string }).statement,
+            informationType: (c as { informationType: string }).informationType,
+            supportingExcerpt: (c as { supportingExcerpt: string }).supportingExcerpt,
+            confidence: (c as { confidence: number }).confidence,
+            reasoning: (c as { reasoning: string }).reasoning,
+            review: review && (review.action === "approve" || review.action === "reject")
+              ? { action: review.action, notes: review.notes, materializedClaimId: review.materializedClaimId }
+              : null,
+          }];
+        });
       }
       const noteField = (structured as { noExtractableClaimsNote?: unknown }).noExtractableClaimsNote;
       noExtractableClaimsNote = typeof noteField === "string" ? noteField : null;
@@ -658,6 +706,7 @@ export async function listSourceItemExtractionStatus(limit = 50) {
       jobCreatedAt: row.job_created_at,
       jobStartedAt: row.job_started_at,
       jobCompletedAt: row.job_completed_at,
+      aiResultId: row.ai_result_id,
       candidates,
       noExtractableClaimsNote,
     };

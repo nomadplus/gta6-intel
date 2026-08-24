@@ -60,6 +60,30 @@ export const createClaimSchema = z.object({
   reason: z.string().trim().min(5, "A brief reason for the initial status is required").max(1000),
 });
 
+// Phase 5 PR 5: the reviewer supplies editable claim metadata, but the
+// candidate itself is always re-read from the persisted ai_result on the
+// server. In particular, sourceItemId and supportingExcerpt are never form
+// inputs: they come from the successful extract_claims job being reviewed.
+export const approveClaimProposalSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  candidateIndex: z.coerce.number().int().min(0),
+  projectId: z.coerce.number().int().positive(),
+  statement: z.string().trim().min(10, "Statement is too short").max(2000),
+  slug: slugSchema,
+  informationType: z.enum(informationTypes),
+  firstReportedAt: z.coerce.date().optional(),
+  topicIds: z.array(z.coerce.number().int().positive()).default([]),
+  initialInvestigationStatus: z.enum(investigationStatuses).default("unverified"),
+  initialDevelopmentOutcome: z.enum(developmentOutcomes).default("unknown"),
+  reason: z.string().trim().min(5, "A review reason is required").max(1000),
+});
+
+export const rejectClaimProposalSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  candidateIndex: z.coerce.number().int().min(0),
+  notes: z.string().trim().min(5, "A rejection reason is required").max(1000),
+});
+
 export const updateClaimMetadataSchema = z.object({
   claimId: z.coerce.number().int().positive(),
   statement: z.string().trim().min(10).max(2000),

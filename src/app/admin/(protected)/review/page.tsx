@@ -1,8 +1,19 @@
-import { listAiReviewRecords, listSourceItemClassificationStatus, listSourceItemExtractionStatus } from "@/db/queries/admin";
+import { listAiReviewRecords, listSourceItemClassificationStatus, listSourceItemExtractionStatus, listTopicsForAdmin } from "@/db/queries/admin";
 import { computeClassificationDisplayStatus, type ClassificationDisplayStatus } from "@/lib/ai/classificationRecoveryLifecycle";
 import { computeExtractionDisplayStatus, type ExtractionDisplayStatus } from "@/lib/ai/extractClaimsRecoveryLifecycle";
 import { canTriggerExtraction, extractionButtonLabel } from "@/lib/ai/extractionActionability";
-import { runClassificationRecoveryAction, runExtractClaimsAction } from "./actions";
+import { developmentOutcomeDisplay, informationTypeLabel, investigationStatusDisplay } from "@/lib/statusDisplay";
+import { approveClaimProposalAction, rejectClaimProposalAction, runClassificationRecoveryAction, runExtractClaimsAction } from "./actions";
+
+function suggestedSlug(statement: string, candidateIndex: number): string {
+  const slug = statement
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 220)
+    .replace(/-+$/g, "");
+  return slug || `extracted-claim-${candidateIndex + 1}`;
+}
 
 const STATUS_LABEL: Record<ClassificationDisplayStatus, string> = {
   unclassified: "Unclassified",
@@ -50,13 +61,17 @@ export default async function AdminReviewPage({
     recoveryError?: string;
     extractStatus?: string;
     extractError?: string;
+    proposalError?: string;
+    proposalStatus?: string;
+    claimId?: string;
     sourceItemId?: string;
   }>;
 }) {
-  const { recoveryStatus, recoveryError, extractStatus, extractError, sourceItemId } = await searchParams;
+  const { recoveryStatus, recoveryError, extractStatus, extractError, proposalError, proposalStatus, claimId, sourceItemId } = await searchParams;
   const records = await listAiReviewRecords();
   const classificationRows = await listSourceItemClassificationStatus();
   const extractionRows = await listSourceItemExtractionStatus();
+  const topics = await listTopicsForAdmin();
   const now = new Date();
 
   return (
@@ -67,8 +82,8 @@ export default async function AdminReviewPage({
         classify_relevance (Phase 5 PR 3) and extract_claims (Phase 5 PR 4) processing queues below.
         Both AI operations produce advisory output only — a classification or an extracted claim
         candidate is a recommendation for human review, never an automatic change to any claim,
-        evidence, or source-item record. Claim proposals from extraction are not yet materialized
-        into real claims here; that human-in-the-loop review workflow is Phase 5 PR 5.
+        evidence, or source-item record. Extraction candidates below can only become claims through
+        an explicit editor review; accepting one records the decision and its source provenance.
       </p>
 
       {recoveryError && (
@@ -91,6 +106,17 @@ export default async function AdminReviewPage({
         <p className="mt-4 text-sm text-ink-400">
           Claim extraction for source item #{sourceItemId}:{" "}
           <span className="font-mono text-ink-100">{extractStatus}</span>
+        </p>
+      )}
+      {proposalError && (
+        <p className="mt-4 border border-signal-disproven/50 px-3 py-2 text-sm text-signal-disproven">
+          {proposalError}
+        </p>
+      )}
+      {proposalStatus && (
+        <p className="mt-4 text-sm text-ink-400">
+          Claim proposal review: <span className="font-mono text-ink-100">{proposalStatus}</span>
+          {proposalStatus === "approved" && claimId && <> — claim #{claimId} created.</>}
         </p>
       )}
 
@@ -167,8 +193,9 @@ export default async function AdminReviewPage({
         eligible only once its <em>latest successful</em> classify_relevance result is exactly
         "relevant"; a never-classified, only-ever-failed, or currently-in-flight-with-no-prior-success
         item shows as ineligible below and cannot trigger extraction, even by direct request. Nothing
-        here creates, edits, or deletes a claim, evidence record, or provenance relationship — a
-        successful extraction only produces reviewable candidate propositions in this list.
+        here changes a claim automatically. An editor may review, edit, approve, or reject each
+        candidate independently. Approval creates a claim and one supporting source citation in a
+        single audited transaction; rejection creates no claim, evidence, or provenance record.
       </p>
 
       {extractionRows.length === 0 ? (
@@ -219,14 +246,79 @@ export default async function AdminReviewPage({
                         {row.noExtractableClaimsNote && <> — {row.noExtractableClaimsNote}</>}
                       </p>
                     ) : (
-                      row.candidates.map((candidate, i) => (
-                        <div key={i} className="border-l-2 border-hairline pl-3 text-xs text-ink-400">
+                      row.candidates.map((candidate) => (
+                        <div key={candidate.candidateIndex} className="border-l-2 border-hairline pl-3 text-xs text-ink-400">
                           <p className="text-ink-100">{candidate.statement}</p>
                           <p className="mt-1 font-mono text-[10px] uppercase tracking-wide text-ink-600">
                             {candidate.informationType} · confidence {candidate.confidence.toFixed(2)}
                           </p>
                           <p className="mt-1">"{candidate.supportingExcerpt}"</p>
                           <p className="mt-1 text-ink-600">{candidate.reasoning}</p>
+                          {candidate.review ? (
+                            <p className={`mt-3 border-l-2 pl-2 ${candidate.review.action === "reject" ? "border-signal-disproven text-signal-disproven" : "border-signal-confirmed text-signal-confirmed"}`}>
+                              {candidate.review.action === "approve" ? "Approved" : "Rejected"}
+                              {candidate.review.materializedClaimId && <> — claim #{candidate.review.materializedClaimId}</>}
+                              {candidate.review.notes && <>: {candidate.review.notes}</>}
+                            </p>
+                          ) : row.aiResultId !== null ? (
+                            <details className="mt-3 border border-hairline p-3">
+                              <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wide text-accent-brass">
+                                Review this candidate
+                              </summary>
+                              <p className="mt-3 text-ink-600">
+                                The quoted source text is fixed provenance. You may edit the proposed claim metadata before approval.
+                              </p>
+
+                              <form action={approveClaimProposalAction} className="mt-3 space-y-3">
+                                <input type="hidden" name="aiResultId" value={row.aiResultId} />
+                                <input type="hidden" name="candidateIndex" value={candidate.candidateIndex} />
+                                <input type="hidden" name="projectId" value="1" />
+                                <ReviewField label="Canonical statement">
+                                  <textarea name="statement" required rows={3} defaultValue={candidate.statement} className={reviewInputClass} />
+                                </ReviewField>
+                                <ReviewField label="Slug">
+                                  <input name="slug" required defaultValue={suggestedSlug(candidate.statement, candidate.candidateIndex)} className={reviewInputClass} />
+                                </ReviewField>
+                                <ReviewField label="Information type">
+                                  <select name="informationType" required defaultValue={candidate.informationType} className={reviewInputClass}>
+                                    {Object.entries(informationTypeLabel).map(([value, label]) => (
+                                      <option key={value} value={value}>{label}</option>
+                                    ))}
+                                  </select>
+                                </ReviewField>
+                                <ReviewField label="First reported date (optional)">
+                                  <input type="date" name="firstReportedAt" className={reviewInputClass} />
+                                </ReviewField>
+                                <ReviewField label="Topics">
+                                  <select name="topicIds" multiple className={`${reviewInputClass} h-28`}>
+                                    {topics.map((topic) => <option key={topic.id} value={topic.id}>{topic.name}</option>)}
+                                  </select>
+                                </ReviewField>
+                                <ReviewField label="Initial investigation status">
+                                  <select name="initialInvestigationStatus" defaultValue="unverified" className={reviewInputClass}>
+                                    {Object.entries(investigationStatusDisplay).map(([value, display]) => <option key={value} value={value}>{display.label}</option>)}
+                                  </select>
+                                </ReviewField>
+                                <ReviewField label="Initial development outcome">
+                                  <select name="initialDevelopmentOutcome" defaultValue="unknown" className={reviewInputClass}>
+                                    {Object.entries(developmentOutcomeDisplay).map(([value, display]) => <option key={value} value={value}>{display.label}</option>)}
+                                  </select>
+                                </ReviewField>
+                                <ReviewField label="Reason for approval and initial statuses">
+                                  <textarea name="reason" required rows={2} defaultValue="Approved after review of the quoted source material." className={reviewInputClass} />
+                                </ReviewField>
+                                <button type="submit" className={reviewApproveClass}>Approve and create claim</button>
+                              </form>
+
+                              <form action={rejectClaimProposalAction} className="mt-3 border-t border-hairline pt-3">
+                                <input type="hidden" name="aiResultId" value={row.aiResultId} />
+                                <input type="hidden" name="candidateIndex" value={candidate.candidateIndex} />
+                                <label className="mb-1 block font-mono text-[10px] uppercase tracking-wide text-ink-600">Rejection reason</label>
+                                <textarea name="notes" required rows={2} className={reviewInputClass} />
+                                <button type="submit" className={reviewRejectClass}>Reject candidate</button>
+                              </form>
+                            </details>
+                          ) : null}
                         </div>
                       ))
                     )}
@@ -267,7 +359,7 @@ export default async function AdminReviewPage({
       ) : (
         <ul className="mt-6 divide-y divide-hairline border border-hairline text-sm">
           {records.map((r) => (
-            <li key={r.aiResultId} className="p-4">
+            <li key={`${r.aiResultId}-${r.decisionId ?? "none"}`} className="p-4">
               <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-wide text-ink-600">
                 <span>{r.provider} / {r.model}</span>
                 <span>·</span>
@@ -290,6 +382,19 @@ export default async function AdminReviewPage({
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+const reviewInputClass = "w-full border border-hairline bg-bg-void px-2 py-1 text-xs text-ink-100 focus-visible:border-accent-brass";
+const reviewApproveClass = "border border-signal-confirmed px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-signal-confirmed hover:bg-signal-confirmed hover:text-bg-void";
+const reviewRejectClass = "mt-2 border border-signal-disproven px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-signal-disproven hover:bg-signal-disproven hover:text-bg-void";
+
+function ReviewField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wide text-ink-600">{label}</label>
+      {children}
     </div>
   );
 }

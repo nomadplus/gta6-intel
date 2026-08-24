@@ -229,6 +229,11 @@ export const adminAuditEntityTypeEnum = pgEnum("admin_audit_entity_type", [
   // Added in migration 0010 (Phase 4 PR 8) -- discovery feed
   // create/update/enable/disable actions.
   "discovery_feed",
+  // Added in migration 0016 (Phase 5 PR 5) -- a human decision on one
+  // candidate within an extract_claims result. This is deliberately more
+  // precise than the parent ai_result: one result can contain several
+  // independently approved or rejected candidates.
+  "claim_proposal_review",
 ]);
 
 export const adminAuditLog = pgTable("admin_audit_log", {
@@ -712,6 +717,36 @@ export const adminDecisions = pgTable("admin_decisions", {
   notes: text("notes"),
   decidedAt: timestamp("decided_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+/* =========================================================================
+ * CLAIM-PROPOSAL REVIEW (Phase 5 PR 5)
+ *
+ * `ai_results` stores one extract_claims response, which can contain up to
+ * eight candidates. An admin_decisions row alone therefore cannot identify
+ * which candidate was accepted or rejected. This append-only bridge gives
+ * each candidate a stable identity: (ai_result_id, candidate_index).
+ *
+ * The accepted claim is optional because rejected proposals must be retained
+ * without creating a claim. `admin_decision_id` carries the actual approve /
+ * reject action and reviewer identity, while this row establishes the exact
+ * candidate to which it applies.
+ * ========================================================================= */
+export const claimProposalReviews = pgTable(
+  "claim_proposal_reviews",
+  {
+    id: serial("id").primaryKey(),
+    aiResultId: integer("ai_result_id").notNull().references(() => aiResults.id),
+    candidateIndex: integer("candidate_index").notNull(),
+    adminDecisionId: integer("admin_decision_id").notNull().references(() => adminDecisions.id),
+    materializedClaimId: integer("materialized_claim_id").references(() => claims.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    oneReviewPerCandidate: uniqueIndex("claim_proposal_reviews_candidate_unique").on(t.aiResultId, t.candidateIndex),
+    oneProposalPerDecision: uniqueIndex("claim_proposal_reviews_decision_unique").on(t.adminDecisionId),
+    candidateIndexNonnegative: check("claim_proposal_reviews_candidate_index_nonnegative", sql`${t.candidateIndex} >= 0`),
+  })
+);
 
 /* =========================================================================
  * STATUS HISTORY — the two append-only, immutable ledgers.

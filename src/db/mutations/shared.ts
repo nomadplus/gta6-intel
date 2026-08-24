@@ -51,7 +51,9 @@ export type AdminAuditEntityType =
   // is a manual mirror rather than derived from the Drizzle enum.
   | "ingestion_job"
   // Added in migration 0010 (Phase 4 PR 8).
-  | "discovery_feed";
+  | "discovery_feed"
+  // Added in migration 0016 (Phase 5 PR 5).
+  | "claim_proposal_review";
 
 /**
  * Writes one admin_audit_log row. Metadata must be structured context

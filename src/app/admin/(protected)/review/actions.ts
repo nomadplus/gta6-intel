@@ -5,6 +5,7 @@ import { reclaimStaleInFlightClassificationJob } from "@/db/mutations/classifica
 import { triggerClassifyRelevance } from "@/lib/ai/operations/classificationTrigger";
 import { reclaimStaleInFlightExtractClaimsJob } from "@/db/mutations/extractClaimsRecovery";
 import { triggerExtractClaims } from "@/lib/ai/operations/extractClaimsTrigger";
+import { approveClaimProposal, rejectClaimProposal } from "@/db/mutations/claimProposalReviews";
 import { formDataToObject, safeAction } from "@/lib/actionResult";
 
 /**
@@ -104,4 +105,31 @@ export async function runExtractClaimsAction(formData: FormData) {
   const result = extractOutcome.data;
   const status = result.ok ? "succeeded" : result.reason;
   redirect(`/admin/review?extractStatus=${status}&sourceItemId=${sourceItemId}`);
+}
+
+/**
+ * Phase 5 PR 5: these actions only review a candidate already persisted by a
+ * successful extract_claims job. They never invoke a model. The mutation
+ * itself re-reads the candidate and source provenance from the database, so
+ * no hidden form value can substitute an excerpt or source item.
+ */
+export async function approveClaimProposalAction(formData: FormData) {
+  const input = formDataToObject(formData, ["topicIds"]);
+  const outcome = await safeAction(() => approveClaimProposal(input));
+  if (!outcome.ok) {
+    redirect(`/admin/review?proposalError=${encodeURIComponent(outcome.error)}`);
+  }
+  revalidatePath("/admin/review");
+  revalidatePath("/admin/claims");
+  redirect(`/admin/review?proposalStatus=approved&claimId=${outcome.data.claim.id}`);
+}
+
+export async function rejectClaimProposalAction(formData: FormData) {
+  const input = formDataToObject(formData);
+  const outcome = await safeAction(() => rejectClaimProposal(input));
+  if (!outcome.ok) {
+    redirect(`/admin/review?proposalError=${encodeURIComponent(outcome.error)}`);
+  }
+  revalidatePath("/admin/review");
+  redirect("/admin/review?proposalStatus=rejected");
 }
