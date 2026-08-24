@@ -58,6 +58,17 @@ export interface AiCompletionRequest<T> {
    * provider or the orchestrator -- purely for observability.
    */
   inputRef?: string;
+  /**
+   * Phase 5 PR 4: optional per-request override of the provider's max
+   * output tokens. Omitted -> the provider's own default is used
+   * unchanged -- classify_relevance's existing behavior is untouched by
+   * this addition. Exists so an operation whose worst-case structured
+   * output is computable from its own schema (e.g. extractClaims, capped
+   * at MAX_EXTRACTED_CLAIMS candidates) can bound its own spend/latency
+   * tighter than the provider's flat default, without every other
+   * operation having to adopt the same number.
+   */
+  maxOutputTokens?: number;
 }
 
 export interface AiTokenUsage {

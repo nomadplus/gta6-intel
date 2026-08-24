@@ -61,6 +61,14 @@ export interface RunAiOperationInput<T> {
    */
   confidence?: number | null;
   reasoning?: string | null;
+  /**
+   * Phase 5 PR 4: opaque passthrough to AiCompletionRequest.maxOutputTokens
+   * (types.ts) -- this function has no opinion on what a sensible value
+   * is for any given operation; it just forwards whatever the caller
+   * supplies straight to the provider call below. Omitted -> the
+   * provider's own default applies, unchanged from PR1/PR2/PR3 behavior.
+   */
+  maxOutputTokens?: number;
 }
 
 export interface RunAiOperationSuccess<T> {
@@ -164,6 +172,7 @@ export async function runAiOperation<T>(input: RunAiOperationInput<T>): Promise<
       userPrompt: input.userPrompt,
       outputSchema: input.outputSchema,
       inputRef: input.inputRef,
+      maxOutputTokens: input.maxOutputTokens,
     });
   } catch (err) {
     // A conforming AiProvider should never throw (see types.ts), but a

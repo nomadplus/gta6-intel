@@ -1,34 +1,27 @@
 /**
- * Pure decision logic for the Phase 5 PR 3 classify_relevance recovery
- * path -- no I/O, same shape/rationale as
- * src/lib/ingestion/ingestionJobLifecycle.ts (patches) and
- * src/lib/ai/aiJobLifecycle.ts (ai_jobs patches): deterministic,
- * injected-clock functions that are checkable with in-memory objects and
- * no database, kept separate from the actual reads/writes
+ * Phase 5 PR 3 classify_relevance recovery path -- thin, domain-specific
+ * wrapper. As of Phase 5 PR 4, the genuinely operation-agnostic logic
+ * (age/staleness calculation, the five-state display mapping) lives in
+ * src/lib/ai/aiJobRecoveryLifecycle.ts, shared with extract_claims's own
+ * wrapper (extractClaimsRecoveryLifecycle.ts). This file now only adds
+ * what IS classification-specific: its own independently-tunable
+ * staleness threshold constant, and mapping the shared "missing" state
+ * to this operation's own vocabulary ("unclassified"). Every exported
+ * name and signature below is unchanged from PR 3 -- existing callers
  * (src/db/mutations/classificationRecovery.ts,
- * src/db/queries/admin/index.ts).
- *
- * Covers two closely related but distinct questions:
- *   1. Is a given in-flight (pending/running) ai_jobs row stale enough to
- *      be reclaimed? (isStaleInFlightClassificationJob)
- *   2. Given the most recent classify_relevance job (if any) for a source
- *      item, what should the admin review UI display?
- *      (computeClassificationDisplayStatus)
- *
- * Both are used by the recovery mutation (to decide whether to
- * terminalize a stale row before attempting a fresh classification) and
- * by the admin query/page (to decide which of five states -- unclassified
- * / in_progress / stale / failed / succeeded -- to render), so a single
- * shared definition of "stale" can never drift between the two.
+ * src/db/queries/admin/index.ts, src/app/admin/(protected)/review/page.tsx,
+ * src/checks/classificationRecoveryLifecycle.check.ts) require no edits.
  */
+import { isStaleInFlightAiJob, computeAiJobDisplayStatus, aiJobAgeMs, type AiJobDisplayStatus } from "./aiJobRecoveryLifecycle";
 
 /**
  * Staleness window for an in-flight classify_relevance job. Deliberately
  * its own named constant, not a reuse of ingestion's
- * RECOVERY_STALE_THRESHOLD_MS, even though the initial value is the
- * same -- these are different operational contexts (an ingestion fetch
- * attempt vs. a single AI provider call) and may need independent tuning
- * later.
+ * RECOVERY_STALE_THRESHOLD_MS or extract_claims's own threshold, even
+ * though the initial value is the same for all of them -- these are
+ * different operational contexts (an ingestion fetch attempt vs. a
+ * single AI provider call vs. a different AI provider call) and may
+ * need independent tuning later.
  */
 export const CLASSIFICATION_RECOVERY_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -39,21 +32,8 @@ export interface InFlightClassificationJobSnapshot {
   startedAt: Date | null;
 }
 
-/**
- * The reference instant for staleness differs by state: a 'running'
- * job's relevant clock is when the provider call actually began
- * (startedAt) -- anchoring on createdAt instead could incorrectly
- * reclaim a legitimately recent provider execution that spent real time
- * sitting 'pending' first (e.g. behind a slow safety check). A 'pending'
- * job has no startedAt yet by definition, so createdAt (queue time) is
- * the only available anchor. Mirrors
- * ingestionJobLifecycle.ts/ingestionProcessor.ts's own stale-'fetching'
- * reclaim, which likewise anchors staleness on the timestamp marking
- * entry into the state actually being evaluated, not job creation time.
- */
 export function classificationJobAgeMs(job: InFlightClassificationJobSnapshot, now: Date): number {
-  const referenceInstant = job.status === "running" && job.startedAt ? job.startedAt : job.createdAt;
-  return now.getTime() - referenceInstant.getTime();
+  return aiJobAgeMs(job, now);
 }
 
 export function isStaleInFlightClassificationJob(
@@ -61,9 +41,14 @@ export function isStaleInFlightClassificationJob(
   now: Date,
   thresholdMs: number = CLASSIFICATION_RECOVERY_STALE_THRESHOLD_MS
 ): boolean {
-  return classificationJobAgeMs(job, now) > thresholdMs;
+  return isStaleInFlightAiJob(job, now, thresholdMs);
 }
 
+/**
+ * classify_relevance's own vocabulary for the shared 'missing' state --
+ * unchanged from PR 3's "unclassified", so every existing caller
+ * (notably the admin review page) keeps working without edits.
+ */
 export type ClassificationDisplayStatus = "unclassified" | "in_progress" | "stale" | "failed" | "succeeded";
 
 export interface ClassificationJobForDisplay {
@@ -72,32 +57,20 @@ export interface ClassificationJobForDisplay {
   startedAt: Date | null;
 }
 
+function toClassificationDisplayStatus(shared: AiJobDisplayStatus): ClassificationDisplayStatus {
+  return shared === "missing" ? "unclassified" : shared;
+}
+
 /**
  * Maps the most recent classify_relevance ai_jobs row for a source item
  * (or null, if none exists at all) onto exactly one of five admin-facing
- * states. Never collapses a fresh in-flight job into 'unclassified' or
- * 'failed' -- that distinction is the entire point of this function
- * existing separately from a naive "job === null ? missing : job.status".
+ * states. Delegates the actual state computation to the shared module;
+ * only relabels 'missing' -> 'unclassified' for this operation's callers.
  */
 export function computeClassificationDisplayStatus(
   job: ClassificationJobForDisplay | null,
   now: Date,
   thresholdMs: number = CLASSIFICATION_RECOVERY_STALE_THRESHOLD_MS
 ): ClassificationDisplayStatus {
-  if (!job) return "unclassified";
-  if (job.status === "succeeded") return "succeeded";
-  if (job.status === "failed") return "failed";
-  // job.status is 'pending' or 'running' here. Rebuilt as an explicit
-  // object (rather than passing `job` through directly) so the narrowed
-  // property type actually applies at this call site -- TypeScript
-  // narrows `job.status` within this function, but not the declared type
-  // of the `job` variable itself when passed whole to another function
-  // expecting a narrower interface.
-  return isStaleInFlightClassificationJob(
-    { status: job.status, createdAt: job.createdAt, startedAt: job.startedAt },
-    now,
-    thresholdMs
-  )
-    ? "stale"
-    : "in_progress";
+  return toClassificationDisplayStatus(computeAiJobDisplayStatus(job, now, thresholdMs));
 }

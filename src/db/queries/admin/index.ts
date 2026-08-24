@@ -466,3 +466,200 @@ export async function listSourceItemClassificationStatus(limit = 50) {
     };
   });
 }
+
+/**
+ * Phase 5 PR 4: the minimal source-item shape extractClaims needs --
+ * structurally identical to getSourceItemForClassification above (same
+ * fields), kept as its own function rather than a rename of that one, to
+ * avoid an unrelated refactor of an existing, working, differently-named
+ * function (Section 2).
+ */
+export async function getSourceItemForClaimExtraction(sourceItemId: number) {
+  const rows = await adminDb
+    .select({ id: sourceItems.id, url: sourceItems.url, title: sourceItems.title, excerpt: sourceItems.excerpt })
+    .from(sourceItems)
+    .where(eq(sourceItems.id, sourceItemId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * Phase 5 PR 4 eligibility gate for extract_claims. Exact, locked
+ * semantics:
+ *   - Considers ONLY succeeded classify_relevance jobs -- a job that is
+ *     pending/running/failed is invisible to this query entirely,
+ *     regardless of how recent it is. A newer failed/pending/running
+ *     classification therefore does NOT invalidate an older succeeded
+ *     'relevant' result.
+ *   - Returns the relevance value of the MOST RECENTLY COMPLETED
+ *     succeeded job -- ORDER BY completed_at DESC (with id DESC as a
+ *     deterministic tiebreaker for the vanishingly unlikely case of two
+ *     rows sharing a completed_at timestamp), NOT created_at, since
+ *     completed_at is the correct anchor for "most recently completed."
+ *   - A newer SUCCEEDED 'irrelevant' or 'needs_review' job DOES
+ *     supersede an older succeeded 'relevant' one, since both are
+ *     eligible for selection and the newer one sorts first.
+ *   - No succeeded classify_relevance job has ever existed for this
+ *     source item -> null (ineligible). This covers "never classified
+ *     at all" and "only ever failed / still in flight" identically.
+ *
+ * extractClaimsTrigger.ts's single-item eligibility check calls this
+ * function directly (appropriate for a per-call guard); the admin list
+ * display below (listSourceItemExtractionStatus) computes the identical
+ * semantics in one set-based query rather than calling this function
+ * once per row, to avoid N+1 round-trips against a potentially large
+ * source_items table.
+ */
+export async function getLatestSuccessfulClassifyRelevanceResult(
+  sourceItemId: number
+): Promise<"relevant" | "irrelevant" | "needs_review" | null> {
+  const result = await adminDb.execute<{ structured_output: unknown }>(sql`
+    SELECT r.structured_output
+    FROM ai_jobs j
+    JOIN ai_results r ON r.ai_job_id = j.id
+    WHERE j.operation = 'classify_relevance'
+      AND j.source_item_id = ${sourceItemId}
+      AND j.status = 'succeeded'
+    ORDER BY j.completed_at DESC, j.id DESC
+    LIMIT 1
+  `);
+  return parseRelevanceFromStructuredOutput(result.rows[0]?.structured_output);
+}
+
+/** Shared parsing helper -- used by both the single-item eligibility query above and the set-based list query below, so the two can never silently diverge in what counts as a valid relevance value. */
+function parseRelevanceFromStructuredOutput(structuredOutput: unknown): "relevant" | "irrelevant" | "needs_review" | null {
+  if (structuredOutput && typeof structuredOutput === "object" && "relevance" in structuredOutput) {
+    const value = (structuredOutput as { relevance?: unknown }).relevance;
+    if (value === "relevant" || value === "irrelevant" || value === "needs_review") return value;
+  }
+  return null;
+}
+
+export interface ExtractedClaimCandidate {
+  statement: string;
+  informationType: string;
+  supportingExcerpt: string;
+  confidence: number;
+  reasoning: string;
+}
+
+export interface SourceItemExtractionStatusRow {
+  sourceItemId: number;
+  title: string | null;
+  url: string;
+  /** The eligibility gate's result (see getLatestSuccessfulClassifyRelevanceResult) -- null means ineligible: never successfully classified. */
+  latestSuccessfulRelevance: "relevant" | "irrelevant" | "needs_review" | null;
+  jobId: number | null;
+  jobStatus: "pending" | "running" | "succeeded" | "failed" | null;
+  jobError: string | null;
+  jobCreatedAt: Date | null;
+  jobStartedAt: Date | null;
+  jobCompletedAt: Date | null;
+  /** [] both for "extraction not yet run" and for "ran, found zero claims" -- jobStatus distinguishes the two (null vs 'succeeded'). */
+  candidates: ExtractedClaimCandidate[];
+  /** Only ever non-null alongside an empty candidates array -- see extractClaims.ts's schema constraint. */
+  noExtractableClaimsNote: string | null;
+}
+
+/**
+ * Phase 5 PR 4 admin display query. ONE set-based SQL statement (two
+ * LATERAL joins resolved server-side by Postgres, not one query per row
+ * issued from application code) -- structurally the same pattern as
+ * listSourceItemClassificationStatus above, extended with a second
+ * LATERAL subquery that computes this item's eligibility using the
+ * EXACT SAME semantics as getLatestSuccessfulClassifyRelevanceResult
+ * (succeeded-only, ORDER BY completed_at DESC, id DESC) -- duplicated as
+ * inline SQL here rather than calling that function per row, which is
+ * precisely the N+1 pattern this query is designed to avoid.
+ */
+export async function listSourceItemExtractionStatus(limit = 50) {
+  const result = await adminDb.execute<{
+    source_item_id: number;
+    title: string | null;
+    url: string;
+    latest_relevance_structured_output: unknown;
+    job_id: number | null;
+    job_status: "pending" | "running" | "succeeded" | "failed" | null;
+    job_error: string | null;
+    job_created_at: Date | null;
+    job_started_at: Date | null;
+    job_completed_at: Date | null;
+    structured_output: unknown;
+  }>(sql`
+    SELECT
+      si.id AS source_item_id,
+      si.title,
+      si.url,
+      rel.structured_output AS latest_relevance_structured_output,
+      j.id AS job_id,
+      j.status AS job_status,
+      j.error AS job_error,
+      j.created_at AS job_created_at,
+      j.started_at AS job_started_at,
+      j.completed_at AS job_completed_at,
+      r.structured_output AS structured_output
+    FROM source_items si
+    LEFT JOIN LATERAL (
+      SELECT cr.structured_output
+      FROM ai_jobs cj
+      JOIN ai_results cr ON cr.ai_job_id = cj.id
+      WHERE cj.operation = 'classify_relevance' AND cj.source_item_id = si.id AND cj.status = 'succeeded'
+      ORDER BY cj.completed_at DESC, cj.id DESC
+      LIMIT 1
+    ) rel ON true
+    LEFT JOIN LATERAL (
+      SELECT aj.id, aj.status, aj.error, aj.created_at, aj.started_at, aj.completed_at
+      FROM ai_jobs aj
+      WHERE aj.operation = 'extract_claims' AND aj.source_item_id = si.id
+      ORDER BY aj.created_at DESC
+      LIMIT 1
+    ) j ON true
+    LEFT JOIN ai_results r ON r.ai_job_id = j.id
+    ORDER BY si.created_at DESC
+    LIMIT ${limit}
+  `);
+
+  return result.rows.map((row): SourceItemExtractionStatusRow => {
+    const latestSuccessfulRelevance = parseRelevanceFromStructuredOutput(row.latest_relevance_structured_output);
+
+    // structured_output is only ever present for a succeeded extract_claims
+    // job -- a lightweight shape check for display purposes, not a
+    // re-validation of the schema (extractClaims's own Zod schema already
+    // validated it before it was persisted).
+    let candidates: ExtractedClaimCandidate[] = [];
+    let noExtractableClaimsNote: string | null = null;
+    const structured = row.structured_output;
+    if (structured && typeof structured === "object") {
+      const claimsField = (structured as { claims?: unknown }).claims;
+      if (Array.isArray(claimsField)) {
+        candidates = claimsField.filter(
+          (c): c is ExtractedClaimCandidate =>
+            !!c &&
+            typeof c === "object" &&
+            typeof (c as ExtractedClaimCandidate).statement === "string" &&
+            typeof (c as ExtractedClaimCandidate).informationType === "string" &&
+            typeof (c as ExtractedClaimCandidate).supportingExcerpt === "string" &&
+            typeof (c as ExtractedClaimCandidate).confidence === "number" &&
+            typeof (c as ExtractedClaimCandidate).reasoning === "string"
+        );
+      }
+      const noteField = (structured as { noExtractableClaimsNote?: unknown }).noExtractableClaimsNote;
+      noExtractableClaimsNote = typeof noteField === "string" ? noteField : null;
+    }
+
+    return {
+      sourceItemId: row.source_item_id,
+      title: row.title,
+      url: row.url,
+      latestSuccessfulRelevance,
+      jobId: row.job_id,
+      jobStatus: row.job_status,
+      jobError: row.job_error,
+      jobCreatedAt: row.job_created_at,
+      jobStartedAt: row.job_started_at,
+      jobCompletedAt: row.job_completed_at,
+      candidates,
+      noExtractableClaimsNote,
+    };
+  });
+}

@@ -42,7 +42,10 @@ export class AnthropicProvider implements AiProvider {
     try {
       response = await this.client.messages.create({
         model: request.model,
-        max_tokens: 4096,
+        // Phase 5 PR 4: request.maxOutputTokens is an optional per-call
+        // override (types.ts) -- omitted, this stays exactly 4096, same
+        // as every operation before this PR.
+        max_tokens: request.maxOutputTokens ?? 4096,
         system: request.systemPrompt,
         messages: [{ role: "user", content: request.userPrompt }],
         tools: [
