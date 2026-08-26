@@ -14,9 +14,11 @@ import {
 } from "@/db/schema";
 import { adminDb } from "@/db/adminClient";
 import { buildExtractClaimsOutputSchema, type ExtractClaimsOutput } from "@/lib/ai/operations/extractClaims";
-import { approveClaimProposalSchema, rejectClaimProposalSchema } from "@/lib/validation/adminSchemas";
+import { approveClaimProposalSchema, rejectClaimProposalSchema, resolveAsExistingClaimSchema } from "@/lib/validation/adminSchemas";
 import { requireAdmin } from "@/lib/auth/requireAdmin";
-import { isUniqueViolation, logAdminAction, withAuditedTransaction } from "./shared";
+import { isProposalReviewed, getLatestDetectDuplicatesMatches, getClaimByIdForResolution } from "@/db/queries/admin";
+import { insertClaimSourceLinkTx } from "./claimSources";
+import { isUniqueViolation, logAdminAction, withAuditedTransaction, type DbExecutor } from "./shared";
 
 export class ClaimProposalAlreadyReviewedError extends Error {
   constructor() {
@@ -32,7 +34,24 @@ export class ClaimProposalNotFoundError extends Error {
   }
 }
 
-type ProposalContext = {
+export class ExistingClaimNotAPersistedMatchError extends Error {
+  constructor() {
+    super(
+      "The submitted existing claim is not one of this candidate's persisted duplicate-check matches -- " +
+        "resolution must reference a match this candidate's own latest successful duplicate check actually returned."
+    );
+    this.name = "ExistingClaimNotAPersistedMatchError";
+  }
+}
+
+export class ExistingClaimNotFoundError extends Error {
+  constructor(claimId: number) {
+    super(`Claim #${claimId} could not be found -- cannot resolve a proposal to a claim that does not exist.`);
+    this.name = "ExistingClaimNotFoundError";
+  }
+}
+
+export type ProposalContext = {
   aiResultId: number;
   candidateIndex: number;
   sourceItemId: number;
@@ -40,12 +59,39 @@ type ProposalContext = {
 };
 
 /**
- * Re-reads the persisted AI result and source item; no candidate content,
- * source id, or supporting excerpt is accepted from an HTML form. This keeps
- * the provenance link tied to the exact successful extraction a human saw.
+ * Re-reads and re-validates the persisted AI result and source item; no
+ * candidate content, source id, or supporting excerpt is ever accepted
+ * from an HTML form or from a browser-supplied value. This keeps the
+ * provenance link tied to the exact successful extraction a human (or,
+ * for detectDuplicatesTrigger.ts's eligibility check, an orchestration
+ * caller) saw.
+ *
+ * Deliberately NEUTRAL -- returns null rather than throwing when the
+ * candidate cannot be resolved. This function needs extract_claims' own
+ * Zod schema (buildExtractClaimsOutputSchema) to parse the candidate out
+ * of stored JSON, which is why it lives here rather than in the generic
+ * query layer (src/db/queries/admin/index.ts) -- that module deliberately
+ * imports nothing from src/lib/ai, so a helper that needs an AI
+ * operation's own schema does not belong there. Both this file's own
+ * mutations below AND src/lib/ai/operations/detectDuplicatesTrigger.ts
+ * import this function directly and each throw their OWN domain error on
+ * a null result (ClaimProposalNotFoundError here; a duplicate-check-
+ * specific error there) -- one implementation, two error translations,
+ * exactly the "orchestration/mutation layers own domain errors, this
+ * function owns the read" split.
+ *
+ * Accepts a DbExecutor so it can run either as a standalone read (plain
+ * adminDb, e.g. detectDuplicatesTrigger.ts's eligibility check) or as
+ * part of a larger atomic transaction (resolveProposalAsExistingClaim's
+ * tx, re-verifying against transaction-consistent state rather than a
+ * possibly-stale prior read).
  */
-async function getProposalContext(aiResultId: number, candidateIndex: number): Promise<ProposalContext> {
-  const rows = await adminDb
+export async function getExtractionCandidate(
+  db: DbExecutor,
+  aiResultId: number,
+  candidateIndex: number
+): Promise<ProposalContext | null> {
+  const rows = await db
     .select({
       aiResultId: aiResults.id,
       structuredOutput: aiResults.structuredOutput,
@@ -60,7 +106,7 @@ async function getProposalContext(aiResultId: number, candidateIndex: number): P
     .limit(1);
 
   const row = rows[0];
-  if (!row) throw new ClaimProposalNotFoundError();
+  if (!row) return null;
 
   const parsed = buildExtractClaimsOutputSchema({
     id: row.sourceItemId,
@@ -69,18 +115,23 @@ async function getProposalContext(aiResultId: number, candidateIndex: number): P
     excerpt: row.sourceExcerpt,
   }).safeParse(row.structuredOutput);
   const candidate = parsed.success ? parsed.data.claims[candidateIndex] : undefined;
-  if (!candidate) throw new ClaimProposalNotFoundError();
+  if (!candidate) return null;
 
   return { aiResultId: row.aiResultId, candidateIndex, sourceItemId: row.sourceItemId, candidate };
 }
 
-async function assertProposalIsUnreviewed(aiResultId: number, candidateIndex: number) {
-  const rows = await adminDb
-    .select({ id: claimProposalReviews.id })
-    .from(claimProposalReviews)
-    .where(and(eq(claimProposalReviews.aiResultId, aiResultId), eq(claimProposalReviews.candidateIndex, candidateIndex)))
-    .limit(1);
-  if (rows[0]) throw new ClaimProposalAlreadyReviewedError();
+/**
+ * Throwing wrapper around the neutral isProposalReviewed query fact --
+ * this file's own domain error (ClaimProposalAlreadyReviewedError) is
+ * thrown here, at the mutation layer, not inside the query helper itself.
+ * Accepts a DbExecutor so resolveProposalAsExistingClaim can re-check this
+ * against transaction-consistent state, inside its own transaction,
+ * rather than trusting a read from before the transaction began.
+ */
+async function assertProposalIsUnreviewed(db: DbExecutor, aiResultId: number, candidateIndex: number): Promise<void> {
+  if (await isProposalReviewed(db, aiResultId, candidateIndex)) {
+    throw new ClaimProposalAlreadyReviewedError();
+  }
 }
 
 function isProposalReviewUniqueViolation(err: unknown): boolean {
@@ -99,8 +150,9 @@ function isProposalReviewUniqueViolation(err: unknown): boolean {
 export async function approveClaimProposal(input: unknown) {
   const admin = await requireAdmin("editor");
   const data = approveClaimProposalSchema.parse(input);
-  const proposal = await getProposalContext(data.aiResultId, data.candidateIndex);
-  await assertProposalIsUnreviewed(proposal.aiResultId, proposal.candidateIndex);
+  const proposal = await getExtractionCandidate(adminDb, data.aiResultId, data.candidateIndex);
+  if (!proposal) throw new ClaimProposalNotFoundError();
+  await assertProposalIsUnreviewed(adminDb, proposal.aiResultId, proposal.candidateIndex);
 
   try {
     return await withAuditedTransaction(async (tx) => {
@@ -198,8 +250,9 @@ export async function approveClaimProposal(input: unknown) {
 export async function rejectClaimProposal(input: unknown) {
   const admin = await requireAdmin("editor");
   const data = rejectClaimProposalSchema.parse(input);
-  const proposal = await getProposalContext(data.aiResultId, data.candidateIndex);
-  await assertProposalIsUnreviewed(proposal.aiResultId, proposal.candidateIndex);
+  const proposal = await getExtractionCandidate(adminDb, data.aiResultId, data.candidateIndex);
+  if (!proposal) throw new ClaimProposalNotFoundError();
+  await assertProposalIsUnreviewed(adminDb, proposal.aiResultId, proposal.candidateIndex);
 
   try {
     return await withAuditedTransaction(async (tx) => {
@@ -223,6 +276,111 @@ export async function rejectClaimProposal(input: unknown) {
         metadata: { aiResultId: proposal.aiResultId, candidateIndex: proposal.candidateIndex },
       });
       return { review };
+    });
+  } catch (err) {
+    if (isProposalReviewUniqueViolation(err)) throw new ClaimProposalAlreadyReviewedError();
+    throw err;
+  }
+}
+
+/**
+ * Phase 5 PR 6: resolves one persisted extract_claims candidate to a
+ * PRE-EXISTING claim, rather than materializing a new one -- the "Use
+ * existing claim" human action. Attaches the candidate's source/excerpt
+ * to the existing claim as provenance and closes out the review; never
+ * mutates the existing claim's statement, investigation status, or
+ * development outcome.
+ *
+ * Every one of the five correctness checks below re-reads
+ * transaction-consistent state from WITHIN this function's one
+ * transaction -- never trusting a value the browser submitted beyond
+ * using it as a lookup key, and never trusting a page render from a
+ * moment earlier as authorization:
+ *   1. the candidate itself still resolves from the persisted extraction;
+ *   2. the proposal has not already been reviewed by anyone;
+ *   3. the exact existingClaimId submitted appears in THIS candidate's own
+ *      latest successful persisted detect_duplicates result;
+ *   4. (implied by 3 returning a match) the check in 3 IS the tamper-proof
+ *      verification -- an invented/stale id simply won't appear;
+ *   5. the existing claim still exists.
+ * Only then does it write: the source link (idempotent -- see
+ * insertClaimSourceLinkTx), the admin_decisions row
+ * (action: 'link_existing_claim'), the claim_proposal_reviews row
+ * (materializedClaimId = the EXISTING claim's id -- that column's FK
+ * accepts any claims.id, new or pre-existing, with no CHECK constraint
+ * tying it to a specific action -- confirmed by inspection of migration
+ * 0016), and the two audit-log entries. All five writes are one
+ * transaction; a failure at any point rolls back every write made so far
+ * in this call, including a freshly-inserted (but not yet committed)
+ * claim_sources row.
+ */
+export async function resolveProposalAsExistingClaim(input: unknown) {
+  const admin = await requireAdmin("editor");
+  const data = resolveAsExistingClaimSchema.parse(input);
+
+  try {
+    return await withAuditedTransaction(async (tx) => {
+      const proposal = await getExtractionCandidate(tx, data.aiResultId, data.candidateIndex);
+      if (!proposal) throw new ClaimProposalNotFoundError();
+
+      await assertProposalIsUnreviewed(tx, proposal.aiResultId, proposal.candidateIndex);
+
+      const matches = await getLatestDetectDuplicatesMatches(tx, proposal.aiResultId, proposal.candidateIndex);
+      const match = matches?.find((m) => m.existingClaimId === data.existingClaimId);
+      if (!match) throw new ExistingClaimNotAPersistedMatchError();
+
+      const existingClaim = await getClaimByIdForResolution(tx, data.existingClaimId);
+      if (!existingClaim) throw new ExistingClaimNotFoundError(data.existingClaimId);
+
+      const linkResult = await insertClaimSourceLinkTx(tx, {
+        claimId: existingClaim.id,
+        sourceItemId: proposal.sourceItemId,
+        stance: "supports",
+        supportingExcerpt: proposal.candidate.supportingExcerpt,
+      });
+
+      const [decision] = await tx
+        .insert(adminDecisions)
+        .values({
+          aiResultId: proposal.aiResultId,
+          adminUserId: admin.id,
+          action: "link_existing_claim",
+          notes: data.reason,
+        })
+        .returning();
+
+      const [review] = await tx
+        .insert(claimProposalReviews)
+        .values({
+          aiResultId: proposal.aiResultId,
+          candidateIndex: proposal.candidateIndex,
+          adminDecisionId: decision.id,
+          materializedClaimId: existingClaim.id,
+        })
+        .returning();
+
+      await logAdminAction(tx, admin, {
+        action: "link",
+        entityType: "claim_source",
+        entityId: linkResult.link.id,
+        summary: linkResult.wasNewLink
+          ? `Linked source item #${proposal.sourceItemId} to existing claim #${existingClaim.id} (supports) via duplicate resolution`
+          : `Source item #${proposal.sourceItemId} was already linked to existing claim #${existingClaim.id}; no new link created`,
+      });
+      await logAdminAction(tx, admin, {
+        action: "create",
+        entityType: "claim_proposal_review",
+        entityId: review.id,
+        summary: `Resolved extraction candidate ${proposal.candidateIndex + 1} from AI result #${proposal.aiResultId} as existing claim #${existingClaim.id}`,
+        metadata: {
+          aiResultId: proposal.aiResultId,
+          candidateIndex: proposal.candidateIndex,
+          existingClaimId: existingClaim.id,
+          createdNewSourceLink: linkResult.wasNewLink,
+        },
+      });
+
+      return { review, existingClaim };
     });
   } catch (err) {
     if (isProposalReviewUniqueViolation(err)) throw new ClaimProposalAlreadyReviewedError();

@@ -530,6 +530,150 @@ erasing the record of the original human decision. Semantic matching to an
 existing claim remains deliberately out of scope for this PR; Phase 5 PR 6
 owns near-duplicate analysis.
 
+### Semantic duplicate detection (Phase 5 PR 6)
+
+`detect_duplicates` checks one persisted, **unreviewed** `extract_claims`
+candidate against a bounded set of existing claims for a genuine
+near-duplicate — the same underlying atomic proposition, not merely the
+same topic or entity. Like every other AI operation in this project, it is
+advisory only: nothing in `detectDuplicates.ts`/`detectDuplicatesTrigger.ts`
+ever writes to `claims`, `claim_sources`, `claim_relationships`, or either
+status-history ledger. `compare_claims` remains a separate, still-unused
+operation — its own home in a future PR is not decided here.
+
+**Candidate identity and eligibility.** A candidate is identified exactly
+the way PR5's `claim_proposal_reviews` already does —
+`(ai_result_id, candidate_index)` — re-read and re-validated from the
+persisted `extract_claims` result on every call, never trusted from a
+form. A candidate that has already been reviewed (approved, rejected, or
+resolved to an existing claim) is ineligible for a **new** duplicate
+check, retry, or recovery attempt — checked before any retrieval work,
+before any `ai_jobs` row is created, and before any provider call, so a
+reviewed proposal produces zero new job rows and zero AI spend. A job
+that was already in flight when a candidate became reviewed is left
+completely alone; it is never cancelled, and its eventual result remains
+valid historical advisory data.
+
+**Retrieval is tiered and cost-bounded**, using two constants in
+`detectDuplicatesTrigger.ts`: at or below
+`DUPLICATE_CHECK_ALL_CLAIMS_THRESHOLD` (30) existing claims, every claim
+is sent to the model; above it, existing claims are ranked by `pg_trgm`
+lexical similarity (`extensions.similarity(...)`, migration `0017`) and
+only the top `DUPLICATE_CHECK_PREFILTER_LIMIT` (20) are sent — this keeps
+the AI call's input size, and therefore its cost, flat regardless of
+whether the claims table has 100 or 10,000 rows. No trigram index backs
+this query in this PR — a sequential scan is fast at this project's
+current scale, and adding one now would be premature. If the retrieval
+set is empty, **no `ai_jobs` row is created and no provider is called** —
+`triggerDetectDuplicates` returns a distinct `no_existing_claims` outcome,
+the same "ineligible, stop before any job row exists" shape
+`extractClaimsTrigger.ts` already uses for its own eligibility gate.
+
+**IMPORTANT, current architectural limitation: duplicate detection is
+scoped to project 1 only, not genuinely project-aware.** `source_items`/
+`sources` carry no `project_id` in this schema — only `claims.projectId`
+does, and that value is chosen by a human at **approval** time (see
+`approveClaimProposal`'s `data.projectId`), never derivable from a source
+item or an unreviewed extraction candidate. The schema itself does
+structurally support multiple projects (`claims.projectId`,
+`topics.projectId`, and their per-project unique indexes), and nothing at
+the database level enforces exactly one project row — but every existing
+admin write path that creates a claim already hardcodes the identical
+literal project id `1`, with zero project-selector UI anywhere in this
+application (`src/app/admin/(protected)/claims/new/page.tsx`,
+`review/page.tsx`'s approve form, and `topics/page.tsx`). PR6's
+`DUPLICATE_CHECK_DEFAULT_PROJECT_ID = 1` constant in
+`detectDuplicatesTrigger.ts` matches that existing convention rather than
+inventing a different one — retrieval unscoped by project would have made
+PR6 the only place in the codebase behaving inconsistently with every
+sibling admin mutation. `triggerDetectDuplicates` and
+`getDuplicateCheckRetrievalSet` both accept an optional `projectId`
+parameter (defaulting to that constant) purely so this exact limitation
+can be proven deterministically in a check, against a genuinely isolated,
+empty project — no production or admin code path ever supplies that
+argument explicitly, and no browser-submitted project id is ever
+accepted. **Before this product becomes genuinely multi-project**, a real
+source-item/project association must be added (and, with it, all four
+hardcoded `"1"` literals replaced by an actual project-selection
+mechanism) — this PR deliberately does not build that association.
+
+**AI output contract.** The output schema is parameterized, per call, by
+the exact set of existing-claim ids actually offered to the model —
+mirroring `extractClaims.ts`'s own "schema built fresh from the real
+input" pattern. A returned `existingClaimId` outside that exact set fails
+Zod validation inside the provider before `runAiOperation` ever returns
+success, surfacing as a normal `invalid_structured_output` failure with
+zero `ai_results` rows — the model can never fabricate a match. At most
+`MAX_DUPLICATE_MATCHES` (5) matches are returned, each with a `confidence`
+(0–1) and bounded `reasoning`; duplicate `existingClaimId` values within
+one result are rejected; an empty `matches` array (optionally with a
+`noLikelyDuplicateNote`) is a normal, successful "no likely duplicate"
+outcome, not a failure. `DETECT_DUPLICATES_MAX_OUTPUT_TOKENS` (768) is
+derived directly from this schema's own worst-case size, the same
+justification style `EXTRACT_CLAIMS_MAX_OUTPUT_TOKENS` used. The prompt
+defines "duplicate" narrowly and explicitly forbids relationship
+vocabulary (`refines`/`contradicts`/`subsumes`/`related`) — those concepts
+belong to a separate, later operation, not this one.
+
+**Persistence and concurrency.** `ai_jobs` gained a second, narrower
+scoped identity alongside `source_item_id`: `extraction_ai_result_id` /
+`extraction_candidate_index` (migration `0018`), populated only for
+`operation = 'detect_duplicates'` and enforced both directions by one
+combined `CHECK` constraint (`ai_jobs_detect_duplicates_operation_
+consistency`) rather than two separate ones — a candidate either has both
+fields populated (when its operation is `detect_duplicates`) or neither
+(every other operation). A partial unique index on that same pair, scoped
+to `pending`/`running` rows, is the in-flight concurrency guard —
+`createPendingAiJob()`'s existing generic unique-violation handling covers
+it automatically, no new code needed. `extraction_ai_result_id` uses an
+explicit `ON DELETE RESTRICT` FK to `ai_results.id` (this project's other
+FKs rely on the implicit default, behaviorally identical for a
+non-deferred constraint — this one is just explicit about intent).
+Recovery (`detectDuplicatesRecovery.ts`) mirrors
+`extractClaimsRecovery.ts` exactly — the same plain, blocking `FOR UPDATE`
+targeted-row lock (never `SKIP LOCKED`, since exactly one candidate is
+targeted, nothing to skip to) — with the reviewed-proposal eligibility
+gate checked *before* the lock is acquired, so a genuinely stale in-flight
+job for an already-reviewed candidate is left completely untouched rather
+than reclaimed.
+
+**The "Use existing claim" human resolution.** When an admin agrees a
+candidate is the same fact as an existing claim,
+`resolveProposalAsExistingClaim` (`claimProposalReviews.ts`) attaches the
+candidate's source/excerpt as provenance to that **existing** claim
+instead of creating a new one — one atomic transaction, mirroring
+`approveClaimProposal`'s shape but skipping the claim/topic/status-history
+inserts entirely, since attaching a new source must never silently
+reinterpret an already-settled claim's status. All five correctness
+checks — the candidate still resolves from the persisted extraction, the
+proposal is still unreviewed, the submitted `existingClaimId` genuinely
+appears in this exact candidate's own latest successful persisted
+`detect_duplicates` result, and the existing claim still exists — are
+re-verified from *within* that same transaction, never trusted from a
+prior read or a browser-submitted value beyond using it as a lookup key.
+`claim_sources_unique` (migration `0000`) is on `(claim_id, source_item_id)`
+only, so `insertClaimSourceLinkTx` (`claimSources.ts`) uses `INSERT ...
+ON CONFLICT DO NOTHING` — deliberately, not a caught unique-violation
+exception, since the latter would poison the rest of the same Postgres
+transaction — and treats an already-existing link as idempotent success,
+**never** overwriting its existing `stance`/`supportingExcerpt`. This
+primitive is typed to accept only a real transaction handle
+(`DbTransaction`, not the wider `DbExecutor` other read helpers accept),
+so the type system — not just a comment — prevents it from ever being
+called outside an existing atomic transaction. The resolution is recorded
+with a dedicated `admin_decisions.action` value, `link_existing_claim`
+(migration `0019`, isolated in its own `ALTER TYPE ... ADD VALUE` per this
+project's own convention for enum additions) — `claim_proposal_reviews.
+materialized_claim_id` needed no schema change at all, since it was
+already a plain nullable FK to `claims.id` with no constraint tying it to
+any specific decision action (confirmed by direct inspection of migration
+`0016`). The existing one-review-per-candidate unique index remains the
+final race barrier: two concurrent terminal decisions on the same
+candidate (approve-new vs. use-existing, reject vs. use-existing, or two
+concurrent use-existing attempts) always resolve to exactly one winner,
+with the loser's entire transaction — including any source link it had
+just inserted — rolled back atomically.
+
 ### Status history (the two append-only ledgers)
 
 `claim_investigation_status_history` and

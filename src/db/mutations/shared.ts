@@ -6,6 +6,25 @@ import type { AuthorizedAdmin } from "@/lib/auth/requireAdmin";
 const POSTGRES_UNIQUE_VIOLATION = "23505";
 
 /**
+ * Phase 5 PR 6: the shared executor type for helpers that must run both
+ * outside a transaction (a plain adminDb call) and inside one (composed
+ * as part of a larger atomic write, e.g. resolveProposalAsExistingClaim
+ * in claimProposalReviews.ts). Derived directly from adminDb.transaction's
+ * own callback parameter type -- the same derivation logAdminAction below
+ * already uses for its own `tx` parameter -- rather than importing
+ * Drizzle's internal transaction types directly or reaching for `any`.
+ *
+ * DbTransaction is deliberately exported separately (not folded only into
+ * DbExecutor) for primitives that must NEVER be callable outside an
+ * existing transaction -- see insertClaimSourceLinkTx in claimSources.ts,
+ * which exists specifically so a source-link insert participates in its
+ * caller's atomic transaction, and which the type system should refuse
+ * to let anyone call with a bare adminDb.
+ */
+export type DbTransaction = Parameters<Parameters<typeof adminDb.transaction>[0]>[0];
+export type DbExecutor = typeof adminDb | DbTransaction;
+
+/**
  * Detects a Postgres unique-violation regardless of how this Drizzle
  * version happens to expose it. Confirmed by direct probe: node-postgres
  * itself puts the code at err.code, but this Drizzle version wraps query
@@ -62,7 +81,7 @@ export type AdminAuditEntityType =
  * as the mutation it's logging, so the write and the log are atomic.
  */
 export async function logAdminAction(
-  tx: Parameters<Parameters<typeof adminDb.transaction>[0]>[0],
+  tx: DbTransaction,
   admin: AuthorizedAdmin,
   entry: {
     action: AdminAuditAction;
@@ -88,7 +107,7 @@ export async function logAdminAction(
  * partway through never leaves a partially-written record (Section 17).
  */
 export async function withAuditedTransaction<T>(
-  fn: (tx: Parameters<Parameters<typeof adminDb.transaction>[0]>[0]) => Promise<T>
+  fn: (tx: DbTransaction) => Promise<T>
 ): Promise<T> {
   return adminDb.transaction(fn);
 }

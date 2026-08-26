@@ -1,0 +1,56 @@
+-- =============================================================================
+-- Migration 0017: Phase 5 PR 6 -- enable pg_trgm for deterministic lexical
+-- pre-filtering of duplicate-detection candidates.
+--
+-- Installed into a dedicated "extensions" schema, NOT "public" and NOT
+-- whatever the connection's search_path happens to resolve to -- this is
+-- Supabase's own standard convention (Supabase already provisions an
+-- "extensions" schema on every project for exactly this purpose), and it
+-- keeps "public" free of extension-owned objects. Application code calls
+-- extensions.similarity(...) explicitly (see
+-- src/db/queries/admin/index.ts's duplicate-candidate retrieval query) --
+-- never relying on search_path to find it implicitly.
+--
+-- CREATE SCHEMA IF NOT EXISTS is a genuine no-op on Supabase (the schema
+-- already exists there) and a real, one-time creation on a fresh local
+-- Postgres install -- the same migration file runs unchanged in both
+-- environments.
+--
+-- CREATE EXTENSION IF NOT EXISTS keys off the extension NAME, not its
+-- schema -- if pg_trgm is somehow already installed elsewhere on a given
+-- database (e.g. a prior manual install into "public"), this statement
+-- is a silent no-op and pg_trgm is NOT moved into "extensions". Before
+-- this migration is ever applied to production Supabase, run:
+--
+--   SELECT extname, extnamespace::regnamespace AS schema
+--   FROM pg_extension WHERE extname = 'pg_trgm';
+--
+-- against the live database first. If a row comes back with a schema
+-- other than "extensions", the retrieval query's qualified call must be
+-- updated to match the actual schema before merging, rather than
+-- discovering the mismatch as a production runtime error.
+--
+-- No trigram index is created here (deliberately -- see
+-- docs/architecture.md's Phase 5 PR 6 section once written, and the PR6
+-- planning discussion): a sequential scan computing similarity() per row
+-- is fast at this project's current and near-term claim-count scale, and
+-- an index only pays for itself at a scale that doesn't exist yet.
+--
+-- GRANT USAGE ON SCHEMA is required and was confirmed by direct local
+-- testing, not assumed: creating a new schema does NOT give PUBLIC (and
+-- therefore admin_role) implicit USAGE on it, unlike the pre-existing
+-- "public" schema's legacy default. Without this grant,
+-- extensions.similarity(...) fails with "permission denied for schema
+-- extensions" for admin_role -- confirmed by testing this exact
+-- migration against a fresh local database before writing this comment.
+-- admin_role is the only role that needs it: the duplicate-detection
+-- retrieval query (src/db/queries/admin/index.ts) runs exclusively as
+-- admin_role, the same role every other admin mutation/query in this
+-- project already uses -- app_role (the public, read-only site
+-- connection) never calls this function and gets no grant here.
+-- =============================================================================
+
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
+
+GRANT USAGE ON SCHEMA extensions TO admin_role;

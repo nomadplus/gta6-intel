@@ -34,6 +34,8 @@ import {
   approveClaimProposal,
   ClaimProposalAlreadyReviewedError,
   rejectClaimProposal,
+  resolveProposalAsExistingClaim,
+  ExistingClaimNotAPersistedMatchError,
 } from "../db/mutations/claimProposalReviews";
 
 let failures = 0;
@@ -186,6 +188,222 @@ async function main() {
     assert(claimCountAfterReject[0]?.count === claimCountBeforeReject[0]?.count, "rejection creates no claim");
     assert(sourceLinkCountAfterReject[0]?.count === sourceLinkCountBeforeReject[0]?.count, "rejection creates no provenance link");
     assert(afterEvidence[0]?.count === beforeEvidence[0]?.count, "neither decision auto-creates evidence");
+
+    // =====================================================================
+    // Phase 5 PR 6: "Use existing claim" human resolution
+    // =====================================================================
+    console.log("\n=== resolveProposalAsExistingClaim (Phase 5 PR 6) ===\n");
+
+    /** One genuine extraction candidate + a genuine succeeded detect_duplicates result naming `matchClaimId` as a persisted match, for resolveProposalAsExistingClaim to reference. */
+    async function createCandidateWithDuplicateMatch(statement: string, matchClaimId: number) {
+      const url = `https://example.test/pr6-resolve-${randomUUID()}`;
+      const [candidateSourceItem] = await db
+        .insert(sourceItems)
+        .values({ sourceId: 1, itemTypeId: 1, url, normalizedUrl: url, title: "PR6 use-existing-claim fixture", excerpt: statement })
+        .returning();
+      const [candidateJob] = await db
+        .insert(aiJobs)
+        .values({ operation: "extract_claims", provider: "fake", model: "test-model", status: "succeeded", sourceItemId: candidateSourceItem.id, completedAt: new Date() })
+        .returning();
+      const [candidateResult] = await db
+        .insert(aiResults)
+        .values({ aiJobId: candidateJob.id, structuredOutput: { claims: [{ statement, informationType: "report", supportingExcerpt: statement, confidence: 0.9, reasoning: "fixture" }] } })
+        .returning();
+
+      const [ddJob] = await db
+        .insert(aiJobs)
+        .values({ operation: "detect_duplicates", provider: "fake", model: "test-model", status: "succeeded", extractionAiResultId: candidateResult.id, extractionCandidateIndex: 0, completedAt: new Date() })
+        .returning();
+      await db.insert(aiResults).values({ aiJobId: ddJob.id, structuredOutput: { matches: [{ existingClaimId: matchClaimId, confidence: 0.9, reasoning: "fixture match" }] } });
+
+      return { aiResultId: candidateResult.id, sourceItemId: candidateSourceItem.id };
+    }
+
+    async function createFixtureClaim(statement: string): Promise<number> {
+      const [row] = await db.insert(claims).values({ projectId: 1, slug: `pr6-resolve-claim-${randomUUID()}`, statement, informationType: "report" }).returning();
+      return row.id;
+    }
+
+    // --- tampered existingClaimId: rejected ------------------------------
+    {
+      const existingClaimId = await createFixtureClaim("GTA VI features a coastal city district.");
+      const otherClaimId = await createFixtureClaim("GTA VI features a mountain region.");
+      const { aiResultId } = await createCandidateWithDuplicateMatch("The map has a coastal city area.", existingClaimId);
+
+      let tamperThrew = false;
+      try {
+        // otherClaimId was never a persisted match for THIS candidate.
+        await resolveProposalAsExistingClaim({ aiResultId, candidateIndex: 0, existingClaimId: otherClaimId, reason: "tampered id" });
+      } catch (err) {
+        tamperThrew = err instanceof ExistingClaimNotAPersistedMatchError;
+      }
+      assert(tamperThrew, "tampered existingClaimId (not a persisted match for this candidate) is rejected");
+
+      const reviewRows = await db.select().from(claimProposalReviews).where(and(eq(claimProposalReviews.aiResultId, aiResultId), eq(claimProposalReviews.candidateIndex, 0)));
+      assert(reviewRows.length === 0, "tampered existingClaimId: no review row was created");
+    }
+
+    // --- successful resolution: provenance attached, review closed, no status-history mutation ---
+    {
+      const existingClaimId = await createFixtureClaim("GTA VI includes a functioning subway system.");
+      const { aiResultId, sourceItemId } = await createCandidateWithDuplicateMatch("The game has a working metro/subway.", existingClaimId);
+
+      const invBefore = await db.select().from(claimInvestigationStatusHistory).where(eq(claimInvestigationStatusHistory.claimId, existingClaimId));
+      const devBefore = await db.select().from(claimDevelopmentOutcomeHistory).where(eq(claimDevelopmentOutcomeHistory.claimId, existingClaimId));
+      assert(invBefore.length === 0 && devBefore.length === 0, "setup: the existing claim has no status history yet");
+
+      const resolved = await resolveProposalAsExistingClaim({ aiResultId, candidateIndex: 0, existingClaimId, reason: "Same underlying subway fact." });
+      assert(resolved.existingClaim.id === existingClaimId, "successful resolution: returns the existing (not a new) claim");
+
+      const decisionRows = await db
+        .select({ action: adminDecisions.action, materializedClaimId: claimProposalReviews.materializedClaimId })
+        .from(claimProposalReviews)
+        .innerJoin(adminDecisions, eq(adminDecisions.id, claimProposalReviews.adminDecisionId))
+        .where(and(eq(claimProposalReviews.aiResultId, aiResultId), eq(claimProposalReviews.candidateIndex, 0)));
+      assert(decisionRows.length === 1, "successful resolution: exactly one review row exists");
+      assert(decisionRows[0]?.action === "link_existing_claim", "successful resolution: admin_decisions.action is 'link_existing_claim'");
+      assert(decisionRows[0]?.materializedClaimId === existingClaimId, "successful resolution: materializedClaimId references the EXISTING claim, not a new one");
+
+      const linkRows = await db.select().from(claimSources).where(and(eq(claimSources.claimId, existingClaimId), eq(claimSources.sourceItemId, sourceItemId)));
+      assert(linkRows.length === 1, "successful resolution: exactly one claim_sources provenance link was created");
+      assert(linkRows[0]?.stance === "supports", "successful resolution: the new link's stance is 'supports'");
+
+      const claimCountAfterResolve = await db.select({ count: sql<number>`count(*)::int` }).from(claims);
+      const invAfter = await db.select().from(claimInvestigationStatusHistory).where(eq(claimInvestigationStatusHistory.claimId, existingClaimId));
+      const devAfter = await db.select().from(claimDevelopmentOutcomeHistory).where(eq(claimDevelopmentOutcomeHistory.claimId, existingClaimId));
+      assert(invAfter.length === 0, "successful resolution: NO investigation-status-history row was created for the existing claim");
+      assert(devAfter.length === 0, "successful resolution: NO development-outcome-history row was created for the existing claim");
+      void claimCountAfterResolve;
+
+      // --- already-reviewed: cannot be resolved (or approved/rejected) again ---
+      let secondThrew = false;
+      try {
+        await resolveProposalAsExistingClaim({ aiResultId, candidateIndex: 0, existingClaimId, reason: "second attempt" });
+      } catch (err) {
+        secondThrew = err instanceof ClaimProposalAlreadyReviewedError;
+      }
+      assert(secondThrew, "a resolved candidate cannot be resolved again");
+
+      // --- idempotent already-linked source: no overwrite, resolution still closes ---
+      const secondExistingClaimId = await createFixtureClaim("A second existing claim to test idempotent re-resolution against.");
+      const { aiResultId: secondAiResultId } = await createCandidateWithDuplicateMatch("Another candidate statement for idempotency.", secondExistingClaimId);
+      // Pre-link the same (claim, source item) pair the candidate itself would try to link -- using a DIFFERENT source item than the candidate's own, to isolate the idempotency check to claimSources' own (claimId, sourceItemId) uniqueness rather than reusing the same fixture twice.
+      const { aiResultId: thirdAiResultId, sourceItemId: thirdSourceItemId } = await createCandidateWithDuplicateMatch("A candidate whose source item gets pre-linked.", secondExistingClaimId);
+      const [preLinked] = await db
+        .insert(claimSources)
+        .values({ claimId: secondExistingClaimId, sourceItemId: thirdSourceItemId, stance: "supports", supportingExcerpt: "Pre-existing provenance text that must not be overwritten." })
+        .returning();
+
+      const idempotentResolved = await resolveProposalAsExistingClaim({ aiResultId: thirdAiResultId, candidateIndex: 0, existingClaimId: secondExistingClaimId, reason: "idempotent re-link" });
+      assert(idempotentResolved.existingClaim.id === secondExistingClaimId, "idempotent resolution: still succeeds and closes the review even though the source was already linked");
+
+      const linksAfterIdempotent = await db.select().from(claimSources).where(and(eq(claimSources.claimId, secondExistingClaimId), eq(claimSources.sourceItemId, thirdSourceItemId)));
+      assert(linksAfterIdempotent.length === 1, "idempotent resolution: still exactly ONE claim_sources row for that (claim, source item) pair -- no duplicate insert");
+      assert(
+        linksAfterIdempotent[0]?.supportingExcerpt === "Pre-existing provenance text that must not be overwritten.",
+        "idempotent resolution: the pre-existing supportingExcerpt is preserved verbatim, never overwritten"
+      );
+      assert(linksAfterIdempotent[0]?.id === preLinked.id, "idempotent resolution: the pre-existing claim_sources row itself is untouched (same id)");
+
+      const secondReviewRows = await db
+        .select({ action: adminDecisions.action })
+        .from(claimProposalReviews)
+        .innerJoin(adminDecisions, eq(adminDecisions.id, claimProposalReviews.adminDecisionId))
+        .where(and(eq(claimProposalReviews.aiResultId, thirdAiResultId), eq(claimProposalReviews.candidateIndex, 0)));
+      assert(secondReviewRows.length === 1 && secondReviewRows[0]?.action === "link_existing_claim", "idempotent resolution: the review still closes normally as link_existing_claim");
+      void secondAiResultId;
+    }
+
+    // --- concurrent approve-new vs use-existing-claim: exactly one wins --
+    {
+      const existingClaimId = await createFixtureClaim("A claim used as the 'existing' side of a race.");
+      const { aiResultId } = await createCandidateWithDuplicateMatch("A race-condition fixture candidate statement.", existingClaimId);
+
+      const [approveOutcome, resolveOutcome] = await Promise.allSettled([
+        approveClaimProposal({
+          aiResultId,
+          candidateIndex: 0,
+          projectId: 1,
+          statement: "A race-condition fixture candidate statement.",
+          slug: `pr6-race-approve-${randomUUID()}`,
+          informationType: "report",
+          topicIds: [],
+          initialInvestigationStatus: "unverified",
+          initialDevelopmentOutcome: "unknown",
+          reason: "racing approval",
+        }),
+        resolveProposalAsExistingClaim({ aiResultId, candidateIndex: 0, existingClaimId, reason: "racing resolution" }),
+      ]);
+
+      const outcomes = [approveOutcome, resolveOutcome];
+      const wins = outcomes.filter((o) => o.status === "fulfilled");
+      const losses = outcomes.filter((o) => o.status === "rejected");
+      assert(wins.length === 1, `approve-vs-use-existing race: exactly one attempt wins (got ${wins.length})`);
+      assert(losses.length === 1, `approve-vs-use-existing race: exactly one attempt loses (got ${losses.length})`);
+      if (losses[0]?.status === "rejected") {
+        assert(losses[0].reason instanceof ClaimProposalAlreadyReviewedError, "approve-vs-use-existing race: the losing attempt fails with ClaimProposalAlreadyReviewedError");
+      }
+      const finalReviewRows = await db.select().from(claimProposalReviews).where(and(eq(claimProposalReviews.aiResultId, aiResultId), eq(claimProposalReviews.candidateIndex, 0)));
+      assert(finalReviewRows.length === 1, "approve-vs-use-existing race: exactly one terminal review row exists for this candidate");
+    }
+
+    // --- concurrent reject vs use-existing-claim: exactly one wins -------
+    {
+      const existingClaimId = await createFixtureClaim("Another claim used as the 'existing' side of a second race.");
+      const { aiResultId } = await createCandidateWithDuplicateMatch("A second race-condition fixture candidate statement.", existingClaimId);
+
+      const [rejectOutcome, resolveOutcome] = await Promise.allSettled([
+        rejectClaimProposal({ aiResultId, candidateIndex: 0, notes: "racing rejection" }),
+        resolveProposalAsExistingClaim({ aiResultId, candidateIndex: 0, existingClaimId, reason: "racing resolution" }),
+      ]);
+
+      const outcomes = [rejectOutcome, resolveOutcome];
+      const wins = outcomes.filter((o) => o.status === "fulfilled");
+      const losses = outcomes.filter((o) => o.status === "rejected");
+      assert(wins.length === 1, `reject-vs-use-existing race: exactly one attempt wins (got ${wins.length})`);
+      assert(losses.length === 1, `reject-vs-use-existing race: exactly one attempt loses (got ${losses.length})`);
+      if (losses[0]?.status === "rejected") {
+        assert(losses[0].reason instanceof ClaimProposalAlreadyReviewedError, "reject-vs-use-existing race: the losing attempt fails with ClaimProposalAlreadyReviewedError");
+      }
+      const finalReviewRows = await db.select().from(claimProposalReviews).where(and(eq(claimProposalReviews.aiResultId, aiResultId), eq(claimProposalReviews.candidateIndex, 0)));
+      assert(finalReviewRows.length === 1, "reject-vs-use-existing race: exactly one terminal review row exists for this candidate");
+    }
+
+    // --- forced failure after a newly-created source link rolls back everything ---
+    {
+      const existingClaimId = await createFixtureClaim("A claim targeted by a deliberately-forced resolution failure.");
+      const { aiResultId, sourceItemId } = await createCandidateWithDuplicateMatch("A forced-failure fixture candidate statement.", existingClaimId);
+
+      const linksBefore = await db.select({ count: sql<number>`count(*)::int` }).from(claimSources).where(and(eq(claimSources.claimId, existingClaimId), eq(claimSources.sourceItemId, sourceItemId)));
+      assert(linksBefore[0]?.count === 0, "forced failure setup: no source link exists yet");
+
+      // Force the failure the same way the real transaction would
+      // naturally fail: pre-insert the terminal claim_proposal_reviews
+      // row for this exact candidate BEFORE calling
+      // resolveProposalAsExistingClaim, using an admin_decisions row of
+      // our own -- so resolveProposalAsExistingClaim's own
+      // claim_proposal_reviews insert (which happens AFTER the source
+      // link insert inside its transaction) is guaranteed to violate
+      // claim_proposal_reviews_candidate_unique, exercising a genuine
+      // late-transaction failure after the source link write already
+      // happened in the SAME transaction attempt.
+      const [forcedDecision] = await db.insert(adminDecisions).values({ aiResultId, adminUserId: 1, action: "reject", notes: "forced pre-existing decision to trigger a late rollback" }).returning();
+      await db.insert(claimProposalReviews).values({ aiResultId, candidateIndex: 0, adminDecisionId: forcedDecision.id });
+
+      let forcedFailureThrew = false;
+      try {
+        await resolveProposalAsExistingClaim({ aiResultId, candidateIndex: 0, existingClaimId, reason: "should roll back entirely" });
+      } catch (err) {
+        forcedFailureThrew = err instanceof ClaimProposalAlreadyReviewedError;
+      }
+      assert(forcedFailureThrew, "forced failure: resolveProposalAsExistingClaim throws (via the pre-existing review row's unique-constraint collision)");
+
+      const linksAfter = await db.select({ count: sql<number>`count(*)::int` }).from(claimSources).where(and(eq(claimSources.claimId, existingClaimId), eq(claimSources.sourceItemId, sourceItemId)));
+      assert(linksAfter[0]?.count === 0, "forced failure: the whole transaction rolled back -- the source link created earlier in the SAME failed attempt was NOT left committed");
+
+      const reviewRowsAfter = await db.select().from(claimProposalReviews).where(and(eq(claimProposalReviews.aiResultId, aiResultId), eq(claimProposalReviews.candidateIndex, 0)));
+      assert(reviewRowsAfter.length === 1, "forced failure: only the ORIGINAL forced review row exists -- resolveProposalAsExistingClaim's own attempted review row was rolled back, not left as a second row");
+    }
   } finally {
     await pool.end();
   }

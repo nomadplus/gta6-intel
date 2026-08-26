@@ -12,6 +12,7 @@ import {
   uniqueIndex,
   index,
   check,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
@@ -82,6 +83,14 @@ export const adminDecisionActionEnum = pgEnum("admin_decision_action", [
   "edit",
   "request_reanalysis",
   "direct_change",
+  // Added in migration 0019 (Phase 5 PR 6) -- a candidate resolved by
+  // attaching its source to a pre-existing claim rather than creating a
+  // new one. claim_proposal_reviews.materialized_claim_id (migration
+  // 0016) already accepts any claims.id with no CHECK tying it to a
+  // specific action -- this value just makes that resolution kind
+  // distinguishable in the audit trail, same as 'approve' vs 'reject'
+  // already are.
+  "link_existing_claim",
 ]);
 
 export const aiOperationEnum = pgEnum("ai_operation", [
@@ -670,6 +679,16 @@ export const aiJobs = pgTable(
     // operation -- classify_relevance today, potentially others later --
     // this file has no operation-specific business logic.
     sourceItemId: integer("source_item_id").references(() => sourceItems.id),
+    // Added in migration 0018 (Phase 5 PR 6) -- candidate-scoped identity
+    // for detect_duplicates, one level narrower than sourceItemId above.
+    // Multiple extract_claims candidates share one source_item_id, but
+    // each candidate needs its own independent duplicate check, so
+    // detect_duplicates cannot reuse the source-item-scoped guard above.
+    // Both columns are populated ONLY for operation = 'detect_duplicates'
+    // -- enforced by the detectDuplicatesOperationConsistency CHECK
+    // below, not merely by convention.
+    extractionAiResultId: integer("extraction_ai_result_id").references((): AnyPgColumn => aiResults.id, { onDelete: "restrict" }),
+    extractionCandidateIndex: integer("extraction_candidate_index"),
     tokensIn: integer("tokens_in"),
     tokensOut: integer("tokens_out"),
     costEstimateUsd: numeric("cost_estimate_usd", { precision: 10, scale: 6 }),
@@ -696,6 +715,23 @@ export const aiJobs = pgTable(
     classifyRelevanceInflightUnique: uniqueIndex("ai_jobs_classify_relevance_inflight_unique")
       .on(t.sourceItemId)
       .where(sql`${t.operation} = 'classify_relevance' AND ${t.status} IN ('pending', 'running') AND ${t.sourceItemId} IS NOT NULL`),
+    // Migration 0018 (Phase 5 PR 6):
+    extractionCandidateIdx: index("ai_jobs_extraction_candidate_idx").on(t.extractionAiResultId, t.extractionCandidateIndex),
+    extractionCandidateIndexNonnegative: check(
+      "ai_jobs_extraction_candidate_index_nonnegative",
+      sql`${t.extractionCandidateIndex} IS NULL OR ${t.extractionCandidateIndex} >= 0`
+    ),
+    detectDuplicatesOperationConsistency: check(
+      "ai_jobs_detect_duplicates_operation_consistency",
+      sql`(${t.operation} = 'detect_duplicates' AND ${t.extractionAiResultId} IS NOT NULL AND ${t.extractionCandidateIndex} IS NOT NULL)
+          OR (${t.operation} <> 'detect_duplicates' AND ${t.extractionAiResultId} IS NULL AND ${t.extractionCandidateIndex} IS NULL)`
+    ),
+    // detect_duplicates in-flight guard -- own migration, own operation,
+    // same "each operation decides its own concurrency semantics"
+    // precedent as classifyRelevanceInflightUnique above.
+    detectDuplicatesInflightUnique: uniqueIndex("ai_jobs_detect_duplicates_inflight_unique")
+      .on(t.extractionAiResultId, t.extractionCandidateIndex)
+      .where(sql`${t.operation} = 'detect_duplicates' AND ${t.status} IN ('pending', 'running')`),
   })
 );
 

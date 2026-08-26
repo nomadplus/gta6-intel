@@ -49,6 +49,17 @@ export interface RunAiOperationInput<T> {
    */
   sourceItemId?: number | null;
   /**
+   * Phase 5 PR 6: opaque passthrough to ai_jobs.extraction_ai_result_id /
+   * .extraction_candidate_index, mirroring sourceItemId immediately
+   * above -- same "written at pending-job-creation time, since the
+   * in-flight uniqueness guard (migration 0018) checks against it"
+   * reasoning, just one level narrower (one extract_claims candidate,
+   * not one whole source item). This function has no idea only
+   * detect_duplicates populates these.
+   */
+  extractionAiResultId?: number | null;
+  extractionCandidateIndex?: number | null;
+  /**
    * Explicit metadata passthrough to ai_results.confidence /
    * ai_results.reasoning -- the SAME mechanism as claimId above, not a
    * new one. This function never inspects `outputSchema`'s validated
@@ -126,6 +137,8 @@ export async function runAiOperation<T>(input: RunAiOperationInput<T>): Promise<
     model,
     inputRef: input.inputRef ?? null,
     sourceItemId: input.sourceItemId ?? null,
+    extractionAiResultId: input.extractionAiResultId ?? null,
+    extractionCandidateIndex: input.extractionCandidateIndex ?? null,
   });
 
   // Phase 5 PR 3: the pending-job INSERT itself can be rejected by

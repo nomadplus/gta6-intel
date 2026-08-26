@@ -1,6 +1,7 @@
 import "server-only";
-import { desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { adminDb } from "@/db/adminClient";
+import type { DbExecutor } from "@/db/mutations/shared";
 import {
   claims,
   sources,
@@ -545,7 +546,7 @@ export interface ExtractedClaimCandidate {
   confidence: number;
   reasoning: string;
   review: {
-    action: "approve" | "reject";
+    action: "approve" | "reject" | "link_existing_claim";
     notes: string | null;
     materializedClaimId: number | null;
   } | null;
@@ -685,7 +686,7 @@ export async function listSourceItemExtractionStatus(limit = 50) {
             supportingExcerpt: (c as { supportingExcerpt: string }).supportingExcerpt,
             confidence: (c as { confidence: number }).confidence,
             reasoning: (c as { reasoning: string }).reasoning,
-            review: review && (review.action === "approve" || review.action === "reject")
+            review: review && (review.action === "approve" || review.action === "reject" || review.action === "link_existing_claim")
               ? { action: review.action, notes: review.notes, materializedClaimId: review.materializedClaimId }
               : null,
           }];
@@ -711,4 +712,194 @@ export async function listSourceItemExtractionStatus(limit = 50) {
       noExtractableClaimsNote,
     };
   });
+}
+
+/* =========================================================================
+ * PHASE 5 PR 6 -- duplicate-detection query helpers.
+ *
+ * Deliberately neutral: every function below returns plain data, null, or
+ * a boolean -- never a domain/user-facing error. Orchestration
+ * (src/lib/ai/operations/detectDuplicatesTrigger.ts) and mutation
+ * (src/db/mutations/claimProposalReviews.ts,
+ * src/db/mutations/detectDuplicatesRecovery.ts) layers translate a null/
+ * false/empty result into whichever error class is actually theirs to
+ * own. This module also does not import anything from src/lib/ai --
+ * getExtractionCandidate (the one helper that DOES need extract_claims'
+ * own Zod schema to parse a candidate out of stored JSON) therefore stays
+ * exported from src/db/mutations/claimProposalReviews.ts instead of living
+ * here, rather than pulling an AI-operation-specific schema into the
+ * generic query layer.
+ * ========================================================================= */
+
+/**
+ * Whether ANY human decision -- approve, reject, or link_existing_claim --
+ * has already been recorded for this exact extract_claims candidate. Pure
+ * fact, no error thrown here; every caller (assertProposalIsUnreviewed in
+ * claimProposalReviews.ts, the eligibility gate in
+ * detectDuplicatesTrigger.ts/detectDuplicatesRecovery.ts) decides its own
+ * error for a true result.
+ */
+export async function isProposalReviewed(db: DbExecutor, aiResultId: number, candidateIndex: number): Promise<boolean> {
+  const rows = await db
+    .select({ id: claimProposalReviews.id })
+    .from(claimProposalReviews)
+    .where(and(eq(claimProposalReviews.aiResultId, aiResultId), eq(claimProposalReviews.candidateIndex, candidateIndex)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+export interface PersistedDuplicateMatch {
+  existingClaimId: number;
+  confidence: number;
+  reasoning: string;
+}
+
+/**
+ * The LATEST SUCCEEDED detect_duplicates job's persisted matches for one
+ * exact extract_claims candidate -- same "succeeded-only, ORDER BY
+ * completed_at DESC, id DESC" semantics as
+ * getLatestSuccessfulClassifyRelevanceResult above, just keyed by
+ * (extraction_ai_result_id, extraction_candidate_index) instead of
+ * source_item_id (see migration 0018). Returns null when no succeeded
+ * check has ever completed for this candidate -- distinct from an empty
+ * array, which is itself a valid "checked, no likely duplicate" result.
+ * Shape-checked defensively (mirroring the candidate-shape guard in
+ * listSourceItemExtractionStatus above) rather than re-run through
+ * detect_duplicates' own Zod schema, since that schema is parameterized
+ * by the exact candidate-claim-id set a given call was offered, which
+ * this read has no reason to reconstruct.
+ */
+export async function getLatestDetectDuplicatesMatches(
+  db: DbExecutor,
+  aiResultId: number,
+  candidateIndex: number
+): Promise<PersistedDuplicateMatch[] | null> {
+  const result = await db.execute<{ structured_output: unknown }>(sql`
+    SELECT r.structured_output
+    FROM ai_jobs j
+    JOIN ai_results r ON r.ai_job_id = j.id
+    WHERE j.operation = 'detect_duplicates'
+      AND j.extraction_ai_result_id = ${aiResultId}
+      AND j.extraction_candidate_index = ${candidateIndex}
+      AND j.status = 'succeeded'
+    ORDER BY j.completed_at DESC, j.id DESC
+    LIMIT 1
+  `);
+
+  const structured = result.rows[0]?.structured_output;
+  if (!structured || typeof structured !== "object") return null;
+  const matchesField = (structured as { matches?: unknown }).matches;
+  if (!Array.isArray(matchesField)) return null;
+
+  return matchesField.flatMap((m): PersistedDuplicateMatch[] => {
+    if (
+      !m ||
+      typeof m !== "object" ||
+      typeof (m as { existingClaimId?: unknown }).existingClaimId !== "number" ||
+      typeof (m as { confidence?: unknown }).confidence !== "number" ||
+      typeof (m as { reasoning?: unknown }).reasoning !== "string"
+    ) {
+      return [];
+    }
+    return [
+      {
+        existingClaimId: (m as { existingClaimId: number }).existingClaimId,
+        confidence: (m as { confidence: number }).confidence,
+        reasoning: (m as { reasoning: string }).reasoning,
+      },
+    ];
+  });
+}
+
+/**
+ * The most recent detect_duplicates ai_jobs row for one exact candidate
+ * (any status) -- for admin display and for the recovery mutation's
+ * staleness check. Distinct from getLatestDetectDuplicatesMatches above,
+ * which is succeeded-only and returns parsed matches, not the raw job
+ * row.
+ */
+export interface DetectDuplicatesJobForDisplay {
+  id: number;
+  status: "pending" | "running" | "succeeded" | "failed";
+  error: string | null;
+  createdAt: Date;
+  startedAt: Date | null;
+  completedAt: Date | null;
+}
+
+export async function getLatestDetectDuplicatesJob(
+  db: DbExecutor,
+  aiResultId: number,
+  candidateIndex: number
+): Promise<DetectDuplicatesJobForDisplay | null> {
+  const rows = await db
+    .select({
+      id: aiJobs.id,
+      status: aiJobs.status,
+      error: aiJobs.error,
+      createdAt: aiJobs.createdAt,
+      startedAt: aiJobs.startedAt,
+      completedAt: aiJobs.completedAt,
+    })
+    .from(aiJobs)
+    .where(
+      and(
+        eq(aiJobs.operation, "detect_duplicates"),
+        eq(aiJobs.extractionAiResultId, aiResultId),
+        eq(aiJobs.extractionCandidateIndex, candidateIndex)
+      )
+    )
+    .orderBy(desc(aiJobs.createdAt))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/** Plain existence/id check -- claims are never hard-deleted in this codebase, so this is defensive, not load-bearing. */
+export async function getClaimByIdForResolution(db: DbExecutor, claimId: number): Promise<{ id: number } | null> {
+  const rows = await db.select({ id: claims.id }).from(claims).where(eq(claims.id, claimId)).limit(1);
+  return rows[0] ?? null;
+}
+
+/** How many claims exist for a project -- the deterministic "is there anything to compare against" fact behind the no_existing_claims display state. */
+export async function countClaimsForProject(db: DbExecutor, projectId: number): Promise<number> {
+  const rows = await db.select({ count: sql<number>`count(*)::int` }).from(claims).where(eq(claims.projectId, projectId));
+  return rows[0]?.count ?? 0;
+}
+
+export interface DuplicateCandidateClaim {
+  id: number;
+  statement: string;
+}
+
+/** Every claim for a project -- the small-dataset branch of PR6's tiered retrieval (see detectDuplicatesTrigger.ts for the threshold decision). */
+export async function listClaimsForProject(db: DbExecutor, projectId: number): Promise<DuplicateCandidateClaim[]> {
+  return db.select({ id: claims.id, statement: claims.statement }).from(claims).where(eq(claims.projectId, projectId));
+}
+
+/**
+ * Deterministic lexical pre-filter for the large-dataset branch of PR6's
+ * tiered retrieval -- ranks existing claims within one project by
+ * pg_trgm similarity to the candidate's statement and returns at most
+ * `limit` rows. Uses the fully qualified extensions.similarity(...)
+ * (migration 0017) rather than relying on search_path. No trigram index
+ * backs this query in PR6 (deliberately -- see migration 0017's own
+ * header): a sequential scan computing similarity per row is fast at
+ * this project's current scale, and this function's job is only to
+ * bound the AI call's input size, not to be the fastest possible
+ * ranking.
+ */
+export async function listClaimsByTrigramSimilarity(
+  db: DbExecutor,
+  projectId: number,
+  candidateStatement: string,
+  limit: number
+): Promise<DuplicateCandidateClaim[]> {
+  const result = await db.execute<{ id: number; statement: string }>(sql`
+    SELECT id, statement
+    FROM claims
+    WHERE project_id = ${projectId}
+    ORDER BY extensions.similarity(statement, ${candidateStatement}) DESC
+    LIMIT ${limit}
+  `);
+  return result.rows;
 }

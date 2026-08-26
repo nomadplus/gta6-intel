@@ -38,6 +38,17 @@ export interface PendingAiJobInput {
    * idea this is used by classify_relevance specifically.
    */
   sourceItemId?: number | null;
+  /**
+   * Phase 5 PR 6: opaque passthrough, one level narrower than
+   * sourceItemId above -- mirrors the same "populated at PENDING-job-
+   * creation time, since the in-flight partial unique index (migration
+   * 0018) needs it present from the moment the row is inserted" reasoning,
+   * just scoped to one extract_claims candidate instead of one source
+   * item. This file remains entirely operation-agnostic: it has no idea
+   * this pair is used by detect_duplicates specifically.
+   */
+  extractionAiResultId?: number | null;
+  extractionCandidateIndex?: number | null;
 }
 
 export interface PendingAiJobValues {
@@ -47,6 +58,8 @@ export interface PendingAiJobValues {
   status: "pending";
   inputRef: string | null;
   sourceItemId: number | null;
+  extractionAiResultId: number | null;
+  extractionCandidateIndex: number | null;
 }
 
 /** Section 19 (observability): every field here is exactly what gets persisted -- no defaults are silently applied beyond status itself. */
@@ -58,6 +71,8 @@ export function buildPendingAiJobValues(input: PendingAiJobInput): PendingAiJobV
     status: "pending",
     inputRef: input.inputRef ?? null,
     sourceItemId: input.sourceItemId ?? null,
+    extractionAiResultId: input.extractionAiResultId ?? null,
+    extractionCandidateIndex: input.extractionCandidateIndex ?? null,
   };
 }
 

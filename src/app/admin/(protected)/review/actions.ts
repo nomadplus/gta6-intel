@@ -5,7 +5,9 @@ import { reclaimStaleInFlightClassificationJob } from "@/db/mutations/classifica
 import { triggerClassifyRelevance } from "@/lib/ai/operations/classificationTrigger";
 import { reclaimStaleInFlightExtractClaimsJob } from "@/db/mutations/extractClaimsRecovery";
 import { triggerExtractClaims } from "@/lib/ai/operations/extractClaimsTrigger";
-import { approveClaimProposal, rejectClaimProposal } from "@/db/mutations/claimProposalReviews";
+import { approveClaimProposal, rejectClaimProposal, resolveProposalAsExistingClaim } from "@/db/mutations/claimProposalReviews";
+import { reclaimStaleInFlightDetectDuplicatesJob } from "@/db/mutations/detectDuplicatesRecovery";
+import { triggerDetectDuplicates } from "@/lib/ai/operations/detectDuplicatesTrigger";
 import { formDataToObject, safeAction } from "@/lib/actionResult";
 
 /**
@@ -132,4 +134,67 @@ export async function rejectClaimProposalAction(formData: FormData) {
   }
   revalidatePath("/admin/review");
   redirect("/admin/review?proposalStatus=rejected");
+}
+
+/**
+ * Phase 5 PR 6: the "Use existing claim" human resolution action.
+ * existingClaimId is only ever used by resolveProposalAsExistingClaim as a
+ * lookup key -- that mutation re-verifies it against this exact
+ * candidate's own latest persisted detect_duplicates result, inside its
+ * own transaction, before writing anything. A tampered or stale form
+ * value fails there, not here.
+ */
+export async function resolveAsExistingClaimAction(formData: FormData) {
+  const input = formDataToObject(formData);
+  const outcome = await safeAction(() => resolveProposalAsExistingClaim(input));
+  if (!outcome.ok) {
+    redirect(`/admin/review?proposalError=${encodeURIComponent(outcome.error)}`);
+  }
+  revalidatePath("/admin/review");
+  revalidatePath("/admin/claims");
+  redirect(`/admin/review?proposalStatus=linked_existing_claim&claimId=${outcome.data.existingClaim.id}`);
+}
+
+/**
+ * Phase 5 PR 6: same two-step shape as runClassificationRecoveryAction/
+ * runExtractClaimsAction above, operation swapped and identity narrowed
+ * to one extraction candidate (aiResultId, candidateIndex) instead of one
+ * source item:
+ *   1. reclaimStaleInFlightDetectDuplicatesJob (DB-only) -- reclaims a
+ *      genuinely stale in-flight job first; a FRESH in-flight job stops
+ *      here entirely. Also enforces the reviewed-proposal eligibility
+ *      gate BEFORE attempting any reclaim.
+ *   2. triggerDetectDuplicates (orchestration boundary) -- re-enforces
+ *      the same eligibility gate, decides the tiered retrieval strategy,
+ *      and short-circuits to a zero-provider-call "no_existing_claims"
+ *      outcome when there is nothing yet to compare against.
+ *
+ * Uses its own `duplicateStatus`/`duplicateError` query params, distinct
+ * from classification's/extraction's own, so all three sections' banners
+ * can be shown independently on the same page load.
+ */
+export async function runDetectDuplicatesAction(formData: FormData) {
+  const input = formDataToObject(formData);
+  const aiResultId = Number(input.aiResultId);
+  const candidateIndex = Number(input.candidateIndex);
+
+  const reclaimOutcome = await safeAction(() => reclaimStaleInFlightDetectDuplicatesJob(aiResultId, candidateIndex));
+  if (!reclaimOutcome.ok) {
+    redirect(`/admin/review?duplicateError=${encodeURIComponent(reclaimOutcome.error)}`);
+  }
+
+  revalidatePath("/admin/review");
+
+  if (reclaimOutcome.data.outcome === "fresh_in_flight") {
+    redirect(`/admin/review?duplicateStatus=fresh_in_flight&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}`);
+  }
+
+  const detectOutcome = await safeAction(() => triggerDetectDuplicates(aiResultId, candidateIndex));
+  if (!detectOutcome.ok) {
+    redirect(`/admin/review?duplicateError=${encodeURIComponent(detectOutcome.error)}`);
+  }
+
+  const outcome = detectOutcome.data;
+  const status = outcome.kind === "no_existing_claims" ? "no_existing_claims" : outcome.result.ok ? "succeeded" : outcome.result.reason;
+  redirect(`/admin/review?duplicateStatus=${status}&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}`);
 }

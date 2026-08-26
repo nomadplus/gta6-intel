@@ -1,0 +1,23 @@
+-- =============================================================================
+-- Migration 0019: Phase 5 PR 6 -- 'link_existing_claim' admin_decision_action
+-- value.
+--
+-- ALTER TYPE ... ADD VALUE cannot share a transaction with a statement
+-- that uses the new value (PostgreSQL restriction on enum value
+-- visibility mid-transaction), so -- consistent with every other
+-- enum-value addition in this project (migrations 0008, 0010, 0013) --
+-- this migration contains ONLY this one statement.
+--
+-- This is the audit-trail distinction for PR6's "use existing claim"
+-- human resolution path: a candidate resolved by attaching its source to
+-- a pre-existing claim, rather than by creating a new one. Confirmed by
+-- direct inspection of migration 0016 that no CHECK constraint anywhere
+-- ties admin_decisions.action or claim_proposal_reviews.materialized_
+-- claim_id to any specific action value -- materialized_claim_id is a
+-- plain nullable FK to claims.id, equally valid whether it points at a
+-- claim created by this same decision (the 'approve' path) or an
+-- unrelated, pre-existing claim (this new 'link_existing_claim' path).
+-- No other schema change is required for this migration to work.
+-- =============================================================================
+
+ALTER TYPE "admin_decision_action" ADD VALUE 'link_existing_claim';

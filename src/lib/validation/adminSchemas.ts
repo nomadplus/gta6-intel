@@ -84,6 +84,26 @@ export const rejectClaimProposalSchema = z.object({
   notes: z.string().trim().min(5, "A rejection reason is required").max(1000),
 });
 
+/**
+ * Phase 5 PR 6: "Use existing claim" resolution. existingClaimId here is
+ * ONLY a lookup key -- resolveProposalAsExistingClaim (claimProposalReviews.ts)
+ * re-verifies it against this exact candidate's own latest persisted
+ * detect_duplicates result inside its own transaction before writing
+ * anything; this schema does not and cannot authorize the value on its own.
+ */
+export const resolveAsExistingClaimSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  candidateIndex: z.coerce.number().int().min(0),
+  existingClaimId: z.coerce.number().int().positive(),
+  reason: z.string().trim().min(5, "A resolution reason is required").max(1000),
+});
+
+/** Phase 5 PR 6: trigger a fresh detect_duplicates check for one persisted extraction candidate. */
+export const triggerDetectDuplicatesSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  candidateIndex: z.coerce.number().int().min(0),
+});
+
 export const updateClaimMetadataSchema = z.object({
   claimId: z.coerce.number().int().positive(),
   statement: z.string().trim().min(10).max(2000),

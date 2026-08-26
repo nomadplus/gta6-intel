@@ -268,19 +268,33 @@ async function main() {
     }
 
     // --- Provider interchangeability -----------------------------------------
+    // NOTE (Phase 5 PR 6): this block originally used "detect_duplicates"
+    // as its example operation, purely as an arbitrary still-valid enum
+    // value (it was the newest one when this check was written for PR1)
+    // -- it was never testing detect_duplicates' own business logic.
+    // Migration 0018 added ai_jobs_detect_duplicates_operation_consistency,
+    // a CHECK requiring extraction_ai_result_id/extraction_candidate_index
+    // whenever operation = 'detect_duplicates' -- a real, intentional PR6
+    // constraint for that operation's own candidate-scoped identity, not
+    // something this generic, operation-agnostic provider-interchangeability
+    // check should have to satisfy. Swapped to "compare_claims" -- the one
+    // remaining enum value with no operation-specific constraints and not
+    // already used by another block in this same file -- to preserve this
+    // test's actual, unrelated intent (provider-agnostic behavior) without
+    // fighting a constraint that has nothing to do with what it verifies.
     {
       const providerA = new FakeAiProvider([{ kind: "success", rawOutput: { summary: "a" }, tokensIn: 1, tokensOut: 1 }], "provider-a");
       const providerB = new FakeAiProvider([{ kind: "success", rawOutput: { summary: "b" }, tokensIn: 1, tokensOut: 1 }], "provider-b");
 
       const resultA = await runAiOperation({
-        operation: "detect_duplicates",
+        operation: "compare_claims",
         provider: providerA,
         systemPrompt: "sys",
         userPrompt: "user",
         outputSchema: exampleOutputSchema,
       });
       const resultB = await runAiOperation({
-        operation: "detect_duplicates",
+        operation: "compare_claims",
         provider: providerB,
         systemPrompt: "sys",
         userPrompt: "user",
@@ -294,7 +308,7 @@ async function main() {
         const jobB = await loadJob(resultB.jobId);
         assert(jobA.provider === "provider-a", `runAiOperation persists whichever provider.name it was given, not a hardcoded value (got ${jobA.provider})`);
         assert(jobB.provider === "provider-b", `a second, differently-named provider persists its own name too (got ${jobB.provider})`);
-        assert(jobA.operation === "detect_duplicates" && jobB.operation === "detect_duplicates", "the newly-added detect_duplicates enum value (migration 0013) is accepted by ai_jobs.operation");
+        assert(jobA.operation === "compare_claims" && jobB.operation === "compare_claims", "the compare_claims enum value is accepted by ai_jobs.operation");
       }
     }
 
