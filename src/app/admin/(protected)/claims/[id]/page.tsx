@@ -11,7 +11,14 @@ import {
   getLatestSuccessfulCompareClaimsResult,
   listComparisonReviewsForResult,
   listClaimsByIds,
+  getProvenanceClusterForClaim,
+  getLatestProvenanceAnalysisJob,
+  getLatestSuccessfulProvenanceAnalysisResult,
+  listSourceRelationshipReviewsForResult,
+  listSourceItemsByIds,
 } from "@/db/queries/admin";
+import { PROVENANCE_CLUSTER_HARD_CAP } from "@/lib/ai/operations/analyseProvenance";
+import { computeClusterFingerprint, type ClusterItemPayload } from "@/lib/ai/provenanceClusterFingerprint";
 import { getClaimTimeline, getClaimSources, getClaimEvidence, getRelatedClaims } from "@/db/queries/claimDetail";
 import { StatusPair } from "@/components/status/StatusPair";
 import { investigationStatusDisplay, developmentOutcomeDisplay, informationTypeLabel } from "@/lib/statusDisplay";
@@ -22,6 +29,13 @@ import {
   relationshipAnalysisButtonLabel,
   type RelationshipAnalysisDisplayState,
 } from "@/lib/ai/relationshipAnalysisActionability";
+import {
+  computeProvenanceAnalysisDisplayState,
+  canTriggerProvenanceAnalysis,
+  provenanceAnalysisButtonLabel,
+  type ProvenanceAnalysisDisplayState,
+} from "@/lib/ai/provenanceAnalysisActionability";
+import { provenanceSubjectVerb } from "@/lib/provenanceDirection";
 import {
   updateClaimMetadataAction,
   transitionInvestigationStatusAction,
@@ -36,6 +50,10 @@ import {
   approveClaimComparisonAction,
   approveClaimComparisonWithChangesAction,
   rejectClaimComparisonAction,
+  runAnalyseProvenanceAction,
+  approveSourceRelationshipReviewAction,
+  approveSourceRelationshipReviewWithChangesAction,
+  rejectSourceRelationshipReviewAction,
 } from "../actions";
 
 const inputClass = "w-full border border-hairline bg-bg-void px-3 py-2 text-sm text-ink-100 focus-visible:border-accent-brass";
@@ -58,6 +76,19 @@ const RELATIONSHIP_ANALYSIS_STATUS_LABEL: Record<RelationshipAnalysisDisplayStat
   succeeded: "Analysed",
 };
 
+// Phase 5 PR 8b: six-state provenance-analysis display model (see
+// provenanceAnalysisActionability.ts). no_analysable_cluster means the
+// claim's linked source-item cluster has 0 or 1 items -- there is nothing
+// to relate.
+const PROVENANCE_ANALYSIS_STATUS_LABEL: Record<ProvenanceAnalysisDisplayState, string> = {
+  no_analysable_cluster: "Fewer than two linked sources -- nothing to analyse yet",
+  not_analysed: "Not yet analysed",
+  in_progress: "Analysis in progress",
+  stale: "Stale — recovery available",
+  failed: "Analysis failed",
+  succeeded: "Analysed",
+};
+
 type Props = {
   params: Promise<{ id: string }>;
   searchParams: Promise<{
@@ -67,30 +98,59 @@ type Props = {
     comparisonError?: string;
     comparisonReviewStatus?: string;
     comparisonReviewError?: string;
+    provenanceStatus?: string;
+    provenanceError?: string;
+    provenanceReviewStatus?: string;
+    provenanceReviewError?: string;
   }>;
 };
 
 export default async function AdminClaimDetailPage({ params, searchParams }: Props) {
   const { id } = await params;
   const claimId = Number(id);
-  const { error, saved, comparisonStatus, comparisonError, comparisonReviewStatus, comparisonReviewError } = await searchParams;
+  const {
+    error,
+    saved,
+    comparisonStatus,
+    comparisonError,
+    comparisonReviewStatus,
+    comparisonReviewError,
+    provenanceStatus,
+    provenanceError,
+    provenanceReviewStatus,
+    provenanceReviewError,
+  } = await searchParams;
 
   const claim = await getClaimForAdmin(claimId);
   if (!claim) notFound();
 
-  const [timeline, claimSources, claimEvidenceRows, related, topics, sourceItems, allEvidence, allClaims, comparableClaimsCount, latestCompareClaimsJob] =
-    await Promise.all([
-      getClaimTimeline(claimId),
-      getClaimSources(claimId),
-      getClaimEvidence(claimId),
-      getRelatedClaims(claimId),
-      listTopicsForAdmin(),
-      listSourceItemsForAdmin(),
-      listEvidenceForAdmin(),
-      listClaimsForAdmin(),
-      countComparableClaimsForClaim(adminDb, claimId, claim.projectId),
-      getLatestCompareClaimsJob(adminDb, claimId),
-    ]);
+  const [
+    timeline,
+    claimSources,
+    claimEvidenceRows,
+    related,
+    topics,
+    sourceItems,
+    allEvidence,
+    allClaims,
+    comparableClaimsCount,
+    latestCompareClaimsJob,
+    provenanceCluster,
+    latestProvenanceAnalysisJob,
+  ] = await Promise.all([
+    getClaimTimeline(claimId),
+    getClaimSources(claimId),
+    getClaimEvidence(claimId),
+    getRelatedClaims(claimId),
+    listTopicsForAdmin(),
+    listSourceItemsForAdmin(),
+    listEvidenceForAdmin(),
+    listClaimsForAdmin(),
+    countComparableClaimsForClaim(adminDb, claimId, claim.projectId),
+    getLatestCompareClaimsJob(adminDb, claimId),
+    getProvenanceClusterForClaim(adminDb, claimId, PROVENANCE_CLUSTER_HARD_CAP),
+    getLatestProvenanceAnalysisJob(adminDb, claimId),
+  ]);
 
   const relationshipAnalysisState: RelationshipAnalysisDisplayState = computeRelationshipAnalysisDisplayState(
     comparableClaimsCount > 0,
@@ -108,6 +168,34 @@ export default async function AdminClaimDetailPage({ params, searchParams }: Pro
     : [];
   const otherClaimById = new Map(otherClaimsForComparison.map((c) => [c.id, c]));
   const comparisonReviewByIndex = new Map(comparisonReviews.map((r) => [r.assessmentIndex, r]));
+
+  // Phase 5 PR 8b: the current cluster fingerprint, recomputed fresh on
+  // every render from the SAME canonical shape analyseProvenanceTrigger.ts
+  // sends to the model -- never cached, never derived from a stale job
+  // row. Used both for the no_analysable_cluster gate and for the
+  // fingerprint-gated reanalyse action below.
+  const currentClusterItems: ClusterItemPayload[] = provenanceCluster.map((item) => ({
+    id: item.id,
+    title: item.title,
+    url: item.url,
+    publishedAt: item.publishedAt ? item.publishedAt.toISOString() : null,
+    excerpt: item.excerpt,
+  }));
+  const currentClusterFingerprint = currentClusterItems.length > 0 ? computeClusterFingerprint(currentClusterItems) : null;
+
+  const provenanceAnalysisState: ProvenanceAnalysisDisplayState = computeProvenanceAnalysisDisplayState(
+    provenanceCluster.length > 1,
+    latestProvenanceAnalysisJob,
+    new Date()
+  );
+
+  const latestProvenanceResult =
+    provenanceAnalysisState === "succeeded" ? await getLatestSuccessfulProvenanceAnalysisResult(adminDb, claimId) : null;
+  const provenanceReviews = latestProvenanceResult ? await listSourceRelationshipReviewsForResult(adminDb, latestProvenanceResult.aiResultId) : [];
+  const provenanceReviewByIndex = new Map(provenanceReviews.map((r) => [r.edgeIndex, r]));
+  const provenanceClusterItemIds = latestProvenanceResult ? latestProvenanceResult.edges.flatMap((e) => [e.fromSourceItemId, e.toSourceItemId]) : [];
+  const provenanceClusterItems = provenanceClusterItemIds.length > 0 ? await listSourceItemsByIds(adminDb, provenanceClusterItemIds) : [];
+  const provenanceItemById = new Map(provenanceClusterItems.map((si) => [si.id, si]));
 
   return (
     <div className="max-w-4xl space-y-12">
@@ -254,6 +342,124 @@ export default async function AdminClaimDetailPage({ params, searchParams }: Pro
             Link Source
           </button>
         </form>
+      </Section>
+
+      <Section
+        title="Provenance analysis"
+        note="AI-recommended relationships between this claim's linked source items (citation, repetition, derivative, aggregation, independent corroboration) -- advisory only. Nothing here changes the source-item graph until an admin explicitly approves it. Direction reads subject → object (e.g. 'cites', 'derives from')."
+      >
+        {provenanceError && <p className="mb-3 text-sm text-signal-disproven">{provenanceError}</p>}
+        {provenanceStatus && <p className="mb-3 text-sm text-ink-600">Analysis status: {provenanceStatus}</p>}
+        {provenanceReviewError && <p className="mb-3 text-sm text-signal-disproven">{provenanceReviewError}</p>}
+        {provenanceReviewStatus && <p className="mb-3 text-sm text-ink-600">Review status: {provenanceReviewStatus}</p>}
+
+        <div className="mb-4 flex items-center justify-between">
+          <span className="font-mono text-xs uppercase tracking-wide text-ink-600">
+            {PROVENANCE_ANALYSIS_STATUS_LABEL[provenanceAnalysisState]}
+          </span>
+          {canTriggerProvenanceAnalysis(provenanceAnalysisState, latestProvenanceResult?.clusterFingerprint ?? null, currentClusterFingerprint) && (
+            <form action={runAnalyseProvenanceAction}>
+              <input type="hidden" name="claimId" value={claim.id} />
+              <button type="submit" className={submitClass}>
+                {provenanceAnalysisButtonLabel(provenanceAnalysisState, latestProvenanceResult?.clusterFingerprint ?? null, currentClusterFingerprint)}
+              </button>
+            </form>
+          )}
+        </div>
+
+        {provenanceAnalysisState === "succeeded" && latestProvenanceResult && (
+          <ul className="space-y-3">
+            {latestProvenanceResult.edges.length === 0 && (
+              <li className="border border-hairline p-3 text-sm text-ink-600">
+                No analysable provenance relationship found in the latest analysis.
+              </li>
+            )}
+            {latestProvenanceResult.edges.map((edge, index) => {
+              const fromItem = provenanceItemById.get(edge.fromSourceItemId);
+              const toItem = provenanceItemById.get(edge.toSourceItemId);
+              const review = provenanceReviewByIndex.get(index);
+              return (
+                <li key={`${latestProvenanceResult.aiResultId}-${index}`} className="border border-hairline p-3 text-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-xs uppercase tracking-wide text-accent-brass">{edge.relationshipType}</span>
+                    <span className="font-mono text-[10px] text-ink-600">confidence {edge.confidence.toFixed(2)}</span>
+                  </div>
+                  <p className="mt-1 text-ink-100">
+                    #{edge.fromSourceItemId} ({fromItem?.title ?? fromItem?.url ?? "not found"}) {provenanceSubjectVerb(edge.relationshipType)} #
+                    {edge.toSourceItemId} ({toItem?.title ?? toItem?.url ?? "not found"})
+                  </p>
+                  <p className="mt-1 text-xs text-ink-400">Basis: {edge.basis}</p>
+                  <p className="mt-1 text-xs italic text-ink-600">{edge.reasoning}</p>
+                  {edge.distinctEvidenceSummary && (
+                    <p className="mt-1 text-xs text-ink-400">Distinct evidence: {edge.distinctEvidenceSummary}</p>
+                  )}
+
+                  {review ? (
+                    <p className="mt-2 font-mono text-[10px] uppercase tracking-wide text-ink-600">
+                      {review.action === "reject"
+                        ? "Rejected"
+                        : review.relationshipWasNewlyCreated
+                          ? `${review.action === "edit" ? "Approved with changes" : "Approved"} — relationship #${review.materializedRelationshipId} created`
+                          : `${review.action === "edit" ? "Approved with changes" : "Approved"} — relationship #${review.materializedRelationshipId} already existed`}
+                    </p>
+                  ) : (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <form action={approveSourceRelationshipReviewAction}>
+                        <input type="hidden" name="claimId" value={claim.id} />
+                        <input type="hidden" name="aiResultId" value={latestProvenanceResult.aiResultId} />
+                        <input type="hidden" name="edgeIndex" value={index} />
+                        <input type="hidden" name="fromSourceItemId" value={edge.fromSourceItemId} />
+                        <input type="hidden" name="toSourceItemId" value={edge.toSourceItemId} />
+                        <button type="submit" className={submitClass}>
+                          Approve
+                        </button>
+                      </form>
+                      <form action={rejectSourceRelationshipReviewAction}>
+                        <input type="hidden" name="claimId" value={claim.id} />
+                        <input type="hidden" name="aiResultId" value={latestProvenanceResult.aiResultId} />
+                        <input type="hidden" name="edgeIndex" value={index} />
+                        <button type="submit" className={submitClass}>
+                          Reject
+                        </button>
+                      </form>
+                      <details className="w-full">
+                        <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wide text-ink-600">
+                          Approve with changes
+                        </summary>
+                        <form action={approveSourceRelationshipReviewWithChangesAction} className="mt-2 flex flex-wrap items-end gap-2">
+                          <input type="hidden" name="claimId" value={claim.id} />
+                          <input type="hidden" name="aiResultId" value={latestProvenanceResult.aiResultId} />
+                          <input type="hidden" name="edgeIndex" value={index} />
+                          <input type="hidden" name="fromSourceItemId" value={edge.fromSourceItemId} />
+                          <input type="hidden" name="toSourceItemId" value={edge.toSourceItemId} />
+                          <Field label="Relationship type">
+                            <select name="relationshipType" defaultValue={edge.relationshipType} className={inputClass}>
+                              <option value="citation">Citation</option>
+                              <option value="repetition">Repetition</option>
+                              <option value="derivative">Derivative</option>
+                              <option value="aggregation">Aggregation</option>
+                              <option value="independent_corroboration">Independent corroboration</option>
+                              <option value="unknown">Unknown</option>
+                            </select>
+                          </Field>
+                          <Field label="Direction">
+                            <select name="swapDirection" defaultValue="false" className={inputClass}>
+                              <option value="false">#{edge.fromSourceItemId} → #{edge.toSourceItemId} (as proposed)</option>
+                              <option value="true">#{edge.toSourceItemId} → #{edge.fromSourceItemId} (swapped)</option>
+                            </select>
+                          </Field>
+                          <button type="submit" className={submitClass}>
+                            Save
+                          </button>
+                        </form>
+                      </details>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </Section>
 
       <Section title="Evidence" note="Many-to-many — the same evidence can support or contradict multiple claims.">

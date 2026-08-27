@@ -250,6 +250,12 @@ export const adminAuditEntityTypeEnum = pgEnum("admin_audit_entity_type", [
   // relationship assessments, and admin_decisions.ai_result_id alone
   // cannot identify which one.
   "claim_comparison_review",
+  // Added in migration 0023 (Phase 5 PR 8b) -- a human decision on one
+  // proposed edge within an analyse_provenance result. Same precision
+  // reasoning as claim_comparison_review immediately above: one
+  // analyse_provenance result can propose several independently
+  // reviewed directed source-item edges.
+  "source_relationship_review",
 ]);
 
 export const adminAuditLog = pgTable("admin_audit_log", {
@@ -707,6 +713,24 @@ export const aiJobs = pgTable(
     // compareClaimsOperationConsistency below, not merely by
     // convention.
     comparisonClaimId: integer("comparison_claim_id").references(() => claims.id, { onDelete: "restrict" }),
+    // Added in migration 0024 (Phase 5 PR 8b) -- analyse_provenance's own
+    // scoped identity: one CLAIM whose linked source-item cluster is
+    // being analysed for provenance/origin relationships. Cannot reuse
+    // comparisonClaimId (a distinct operation with its own concurrency
+    // semantics, per the standing "each operation decides its own
+    // concurrency semantics" precedent) even though both happen to be a
+    // single claims.id. Populated ONLY for operation = 'analyse_provenance',
+    // enforced by aiJobsProvenanceOperationConsistency below.
+    provenanceClaimId: integer("provenance_claim_id").references(() => claims.id, { onDelete: "restrict" }),
+    // Added in migration 0024 (Phase 5 PR 8b) -- a hash of the exact
+    // canonical cluster-item payload sent to the model for THIS job,
+    // computed by computeClusterFingerprint (src/lib/ai/provenanceClusterFingerprint.ts).
+    // Deliberately unconstrained by any CHECK (unlike provenanceClaimId
+    // above): it exists purely so a later re-analysis can tell whether
+    // the underlying cluster has changed since the latest succeeded
+    // analysis, not to enforce any invariant of its own. Null for every
+    // other operation, by convention only.
+    provenanceClusterFingerprint: varchar("provenance_cluster_fingerprint", { length: 64 }),
     tokensIn: integer("tokens_in"),
     tokensOut: integer("tokens_out"),
     costEstimateUsd: numeric("cost_estimate_usd", { precision: 10, scale: 6 }),
@@ -773,6 +797,23 @@ export const aiJobs = pgTable(
     compareClaimsInflightUnique: uniqueIndex("ai_jobs_compare_claims_inflight_unique")
       .on(t.comparisonClaimId)
       .where(sql`${t.operation} = 'compare_claims' AND ${t.status} IN ('pending', 'running')`),
+    // Migration 0024 (Phase 5 PR 8b): admin/observability join direction
+    // ("which analyses targeted this claim") -- distinct from the
+    // in-flight index below, which is keyed on provenanceClaimId alone
+    // but scoped to pending/running only.
+    provenanceClaimIdx: index("ai_jobs_provenance_claim_idx").on(t.provenanceClaimId),
+    provenanceOperationConsistency: check(
+      "ai_jobs_provenance_operation_consistency",
+      sql`(${t.operation} = 'analyse_provenance' AND ${t.provenanceClaimId} IS NOT NULL)
+          OR (${t.operation} <> 'analyse_provenance' AND ${t.provenanceClaimId} IS NULL)`
+    ),
+    // analyse_provenance in-flight guard -- own migration, own operation,
+    // same "each operation decides its own concurrency semantics"
+    // precedent as classifyRelevanceInflightUnique/detectDuplicatesInflightUnique/
+    // compareClaimsInflightUnique above.
+    provenanceInflightUnique: uniqueIndex("ai_jobs_provenance_inflight_unique")
+      .on(t.provenanceClaimId)
+      .where(sql`${t.operation} = 'analyse_provenance' AND ${t.status} IN ('pending', 'running')`),
   })
 );
 
@@ -929,6 +970,83 @@ export const claimComparisonReviews = pgTable(
           OR ${t.approvedRelationshipType} NOT IN ('equivalent', 'related', 'contradicts')
           OR ${t.approvedClaimIdA} < ${t.approvedClaimIdB}`
     ),
+  })
+);
+
+/* =========================================================================
+ * SOURCE-RELATIONSHIP REVIEW (Phase 5 PR 8b)
+ *
+ * One analyse_provenance ai_result can propose several directed edges over
+ * a claim-anchored source-item cluster. admin_decisions.ai_result_id alone
+ * cannot identify which proposed edge a given human decision applies to --
+ * the identical gap claim_comparison_reviews (0022) closed for PR7's
+ * compare_claims assessments, now for analyse_provenance's proposed edges.
+ *
+ * DURABLE ROW POLICY DIVERGENCE FROM PR7 (documented further in
+ * docs/architecture.md): on approval, source_relationships stores ONLY the
+ * human-approved relationship fact. evidence_note and confidence on that
+ * row are left NULL unless explicitly admin-authored -- the AI's own
+ * confidence/reasoning/distinctEvidenceSummary are never copied onto the
+ * durable source_relationships row, only preserved here and in ai_results.
+ * This differs deliberately from claim_comparison_reviews, where AI
+ * confidence MAY be materialized onto claim_relationships.
+ *
+ * materializedRelationshipId is a plain integer snapshot, NOT a foreign
+ * key -- source_relationships rows are genuinely hard-deletable (see
+ * deleteSourceRelationship in src/db/mutations/provenance.ts), the same
+ * "any FK action that mutates the referencing row is incompatible with a
+ * row-level immutability trigger" reasoning that made
+ * claim_comparison_reviews.materialized_relationship_id a plain integer.
+ * ========================================================================= */
+export const sourceRelationshipReviews = pgTable(
+  "source_relationship_reviews",
+  {
+    id: serial("id").primaryKey(),
+    aiResultId: integer("ai_result_id").notNull().references(() => aiResults.id),
+    edgeIndex: integer("edge_index").notNull(),
+    adminDecisionId: integer("admin_decision_id").notNull().references(() => adminDecisions.id),
+    // Approval-only immutable snapshot -- see header. All four columns
+    // below are NULL together for a rejection.
+    approvedSourceItemIdA: integer("approved_source_item_id_a").references(() => sourceItems.id),
+    approvedSourceItemIdB: integer("approved_source_item_id_b").references(() => sourceItems.id),
+    approvedRelationshipType: sourceRelationshipTypeEnum("approved_relationship_type"),
+    // Deliberately NOT a foreign key -- see header comment.
+    materializedRelationshipId: integer("materialized_relationship_id"),
+    relationshipWasNewlyCreated: boolean("relationship_was_newly_created"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    oneReviewPerEdge: uniqueIndex("source_relationship_reviews_edge_unique").on(t.aiResultId, t.edgeIndex),
+    oneReviewPerDecision: uniqueIndex("source_relationship_reviews_decision_unique").on(t.adminDecisionId),
+    materializedRelationshipIdx: index("source_relationship_reviews_materialized_relationship_idx").on(
+      t.materializedRelationshipId
+    ),
+    edgeIndexNonnegative: check("source_relationship_reviews_edge_index_nonnegative", sql`${t.edgeIndex} >= 0`),
+    approvalSnapshotComplete: check(
+      "source_relationship_reviews_approval_snapshot_complete",
+      sql`(
+            ${t.approvedSourceItemIdA} IS NULL AND ${t.approvedSourceItemIdB} IS NULL
+            AND ${t.approvedRelationshipType} IS NULL
+            AND ${t.materializedRelationshipId} IS NULL
+            AND ${t.relationshipWasNewlyCreated} IS NULL
+          )
+          OR
+          (
+            ${t.approvedSourceItemIdA} IS NOT NULL AND ${t.approvedSourceItemIdB} IS NOT NULL
+            AND ${t.approvedRelationshipType} IS NOT NULL
+            AND ${t.materializedRelationshipId} IS NOT NULL
+            AND ${t.relationshipWasNewlyCreated} IS NOT NULL
+          )`
+    ),
+    snapshotNoSelfLink: check(
+      "source_relationship_reviews_snapshot_no_self_link",
+      sql`${t.approvedSourceItemIdA} IS NULL OR ${t.approvedSourceItemIdA} <> ${t.approvedSourceItemIdB}`
+    ),
+    // Deliberately NO canonicalization check here -- unlike
+    // claim_comparison_reviews_symmetric_snapshot_canonical, provenance
+    // relationships are never canonicalized (A=subject/B=object always,
+    // see src/lib/provenanceDirection.ts); (A,B) and (B,A) are different
+    // facts and may both legitimately exist as separate approved rows.
   })
 );
 

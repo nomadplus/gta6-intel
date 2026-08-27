@@ -9,6 +9,13 @@ import { createClaimRelationship, deleteClaimRelationship } from "@/db/mutations
 import { reclaimStaleInFlightCompareClaimsJob } from "@/db/mutations/compareClaimsRecovery";
 import { triggerCompareClaims } from "@/lib/ai/operations/compareClaimsTrigger";
 import { approveClaimComparison, approveClaimComparisonWithChanges, rejectClaimComparison } from "@/db/mutations/claimComparisonReviews";
+import { reclaimStaleInFlightProvenanceAnalysisJob } from "@/db/mutations/provenanceAnalysisRecovery";
+import { triggerAnalyseProvenance } from "@/lib/ai/operations/analyseProvenanceTrigger";
+import {
+  approveSourceRelationshipReview,
+  approveSourceRelationshipReviewWithChanges,
+  rejectSourceRelationshipReview,
+} from "@/db/mutations/sourceRelationshipReviews";
 import { formDataToObject, safeAction } from "@/lib/actionResult";
 
 function errorRedirect(basePath: string, error: string): never {
@@ -180,4 +187,85 @@ export async function rejectClaimComparisonAction(formData: FormData) {
   if (!outcome.ok) redirect(`/admin/claims/${claimId}?comparisonReviewError=${encodeURIComponent(outcome.error)}`);
   revalidatePath(`/admin/claims/${claimId}`);
   redirect(`/admin/claims/${claimId}?comparisonReviewStatus=rejected`);
+}
+
+/**
+ * Phase 5 PR 8b: same two-step shape as runCompareClaimsAction, operation
+ * swapped and identity narrowed to one claim's linked source-item cluster
+ * instead of one focus-claim comparison shortlist:
+ *   1. reclaimStaleInFlightProvenanceAnalysisJob (DB-only) -- reclaims a
+ *      genuinely stale in-flight job first; a FRESH in-flight job stops
+ *      here entirely.
+ *   2. triggerAnalyseProvenance (orchestration boundary) -- loads the
+ *      anchor claim, loads its cluster, and short-circuits to a
+ *      zero-provider-call "no_analysable_cluster" outcome when the
+ *      cluster has 0 or 1 items.
+ *
+ * Redirects back to the claim's own detail page with its own
+ * `provenanceStatus`/`provenanceError` query params, mirroring PR7's
+ * `comparisonStatus`/`comparisonError` exactly. This one action serves
+ * ALL FOUR triggerable states (analyse/recover/retry/reanalyse) -- the
+ * UI only ever renders the button when
+ * canTriggerProvenanceAnalysis()/provenanceAnalysisAction() say it should,
+ * so this action needs no separate "reanalyse" entry point.
+ */
+export async function runAnalyseProvenanceAction(formData: FormData) {
+  const input = formDataToObject(formData);
+  const claimId = Number(input.claimId);
+
+  const reclaimOutcome = await safeAction(() => reclaimStaleInFlightProvenanceAnalysisJob(claimId));
+  if (!reclaimOutcome.ok) {
+    redirect(`/admin/claims/${claimId}?provenanceError=${encodeURIComponent(reclaimOutcome.error)}`);
+  }
+
+  revalidatePath(`/admin/claims/${claimId}`);
+
+  if (reclaimOutcome.data.outcome === "fresh_in_flight") {
+    redirect(`/admin/claims/${claimId}?provenanceStatus=fresh_in_flight`);
+  }
+
+  const analyseOutcome = await safeAction(() => triggerAnalyseProvenance(claimId));
+  if (!analyseOutcome.ok) {
+    redirect(`/admin/claims/${claimId}?provenanceError=${encodeURIComponent(analyseOutcome.error)}`);
+  }
+
+  const outcome = analyseOutcome.data;
+  const status = outcome.kind === "no_analysable_cluster" ? "no_analysable_cluster" : outcome.result.ok ? "succeeded" : outcome.result.reason;
+  redirect(`/admin/claims/${claimId}?provenanceStatus=${status}`);
+}
+
+/**
+ * Phase 5 PR 8b: these three actions only review an edge already
+ * persisted by a successful analyse_provenance job. They never invoke a
+ * model. The mutation itself re-reads the edge from the database
+ * (getProvenanceEdgeAssessment) and re-checks supersession
+ * server-side -- no hidden form value can substitute a relationship type,
+ * basis, confidence, or reasoning, and a stale page cannot approve an
+ * edge that a newer analysis has since superseded.
+ */
+export async function approveSourceRelationshipReviewAction(formData: FormData) {
+  const input = formDataToObject(formData);
+  const claimId = String(formData.get("claimId"));
+  const outcome = await safeAction(() => approveSourceRelationshipReview(input));
+  if (!outcome.ok) redirect(`/admin/claims/${claimId}?provenanceReviewError=${encodeURIComponent(outcome.error)}`);
+  revalidatePath(`/admin/claims/${claimId}`);
+  redirect(`/admin/claims/${claimId}?provenanceReviewStatus=approved`);
+}
+
+export async function approveSourceRelationshipReviewWithChangesAction(formData: FormData) {
+  const input = formDataToObject(formData);
+  const claimId = String(formData.get("claimId"));
+  const outcome = await safeAction(() => approveSourceRelationshipReviewWithChanges(input));
+  if (!outcome.ok) redirect(`/admin/claims/${claimId}?provenanceReviewError=${encodeURIComponent(outcome.error)}`);
+  revalidatePath(`/admin/claims/${claimId}`);
+  redirect(`/admin/claims/${claimId}?provenanceReviewStatus=edited`);
+}
+
+export async function rejectSourceRelationshipReviewAction(formData: FormData) {
+  const input = formDataToObject(formData);
+  const claimId = String(formData.get("claimId"));
+  const outcome = await safeAction(() => rejectSourceRelationshipReview(input));
+  if (!outcome.ok) redirect(`/admin/claims/${claimId}?provenanceReviewError=${encodeURIComponent(outcome.error)}`);
+  revalidatePath(`/admin/claims/${claimId}`);
+  redirect(`/admin/claims/${claimId}?provenanceReviewStatus=rejected`);
 }

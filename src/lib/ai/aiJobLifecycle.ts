@@ -60,6 +60,26 @@ export interface PendingAiJobInput {
    * is used by compare_claims specifically.
    */
   comparisonClaimId?: number | null;
+  /**
+   * Phase 5 PR 8b: opaque passthrough, one more sibling of
+   * comparisonClaimId immediately above -- same "populated at
+   * PENDING-job-creation time, since the in-flight partial unique index
+   * (migration 0024) needs it present from the moment the row is
+   * inserted" reasoning, just scoped to one claim's linked source-item
+   * cluster instead of one focus-claim comparison. This file remains
+   * entirely operation-agnostic: it has no idea this is used by
+   * analyse_provenance specifically.
+   */
+  provenanceClaimId?: number | null;
+  /**
+   * Phase 5 PR 8b: opaque passthrough to
+   * ai_jobs.provenance_cluster_fingerprint -- unlike every other
+   * identity column above, this is NOT enforced by any CHECK; it exists
+   * purely so a later re-analysis can compare against the cluster
+   * fingerprint of the latest succeeded job. See
+   * src/lib/ai/provenanceClusterFingerprint.ts.
+   */
+  provenanceClusterFingerprint?: string | null;
 }
 
 export interface PendingAiJobValues {
@@ -72,6 +92,8 @@ export interface PendingAiJobValues {
   extractionAiResultId: number | null;
   extractionCandidateIndex: number | null;
   comparisonClaimId: number | null;
+  provenanceClaimId: number | null;
+  provenanceClusterFingerprint: string | null;
 }
 
 /** Section 19 (observability): every field here is exactly what gets persisted -- no defaults are silently applied beyond status itself. */
@@ -86,6 +108,8 @@ export function buildPendingAiJobValues(input: PendingAiJobInput): PendingAiJobV
     extractionAiResultId: input.extractionAiResultId ?? null,
     extractionCandidateIndex: input.extractionCandidateIndex ?? null,
     comparisonClaimId: input.comparisonClaimId ?? null,
+    provenanceClaimId: input.provenanceClaimId ?? null,
+    provenanceClusterFingerprint: input.provenanceClusterFingerprint ?? null,
   };
 }
 

@@ -19,6 +19,8 @@ import {
   claimProposalReviews,
   claimRelationships,
   claimComparisonReviews,
+  claimSources,
+  sourceRelationshipReviews,
   aiJobs,
   ingestionJobs,
   discoveryProviders,
@@ -1156,4 +1158,236 @@ export async function listComparisonReviewsForResult(db: DbExecutor, aiResultId:
 export async function listClaimsByIds(db: DbExecutor, ids: number[]): Promise<{ id: number; statement: string; slug: string }[]> {
   if (ids.length === 0) return [];
   return db.select({ id: claims.id, statement: claims.statement, slug: claims.slug }).from(claims).where(inArray(claims.id, ids));
+}
+
+/* =========================================================================
+ * Phase 5 PR 8b: analyse_provenance query helpers.
+ * ========================================================================= */
+
+/** The anchor claim's own identity for the analyse_provenance trigger and approval-time checks -- id, statement (for the AI call), and projectId (display only -- the cluster itself is never project-filtered, see analyseProvenanceTrigger.ts's header). */
+export async function getClaimForProvenanceAnalysis(
+  db: DbExecutor,
+  claimId: number
+): Promise<{ id: number; statement: string; projectId: number } | null> {
+  const rows = await db
+    .select({ id: claims.id, statement: claims.statement, projectId: claims.projectId })
+    .from(claims)
+    .where(eq(claims.id, claimId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export interface ProvenanceClusterItem {
+  id: number;
+  title: string | null;
+  url: string;
+  publishedAt: Date | null;
+  excerpt: string | null;
+}
+
+/**
+ * The claim-anchored source-item cluster: every DISTINCT source item
+ * linked to this claim via claim_sources, ordered deterministically by
+ * source_item id and capped at `limit` (PROVENANCE_CLUSTER_HARD_CAP) --
+ * the SQL LIMIT is the actual truncation boundary, not application-level
+ * slicing (see analyseProvenanceTrigger.ts). A claim can link the same
+ * source item only once (claim_sources_unique), so no DISTINCT is needed
+ * at the SQL level beyond the join itself.
+ */
+export async function getProvenanceClusterForClaim(
+  db: DbExecutor,
+  claimId: number,
+  limit: number
+): Promise<ProvenanceClusterItem[]> {
+  return db
+    .select({
+      id: sourceItems.id,
+      title: sourceItems.title,
+      url: sourceItems.url,
+      publishedAt: sourceItems.publishedAt,
+      excerpt: sourceItems.excerpt,
+    })
+    .from(claimSources)
+    .innerJoin(sourceItems, eq(sourceItems.id, claimSources.sourceItemId))
+    .where(eq(claimSources.claimId, claimId))
+    .orderBy(sourceItems.id)
+    .limit(limit);
+}
+
+export interface ProvenanceAnalysisJobForDisplayRow {
+  id: number;
+  status: "pending" | "running" | "succeeded" | "failed";
+  error: string | null;
+  createdAt: Date;
+  startedAt: Date | null;
+  completedAt: Date | null;
+}
+
+/** The most recent analyse_provenance ai_jobs row for one anchor claim (any status) -- for admin display and for the recovery mutation's staleness check. Distinct from getLatestSuccessfulProvenanceAnalysisResult below, which is succeeded-only and returns parsed edges, not the raw job row. */
+export async function getLatestProvenanceAnalysisJob(db: DbExecutor, claimId: number): Promise<ProvenanceAnalysisJobForDisplayRow | null> {
+  const rows = await db
+    .select({
+      id: aiJobs.id,
+      status: aiJobs.status,
+      error: aiJobs.error,
+      createdAt: aiJobs.createdAt,
+      startedAt: aiJobs.startedAt,
+      completedAt: aiJobs.completedAt,
+    })
+    .from(aiJobs)
+    .where(and(eq(aiJobs.operation, "analyse_provenance"), eq(aiJobs.provenanceClaimId, claimId)))
+    .orderBy(desc(aiJobs.createdAt))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export interface PersistedProvenanceEdge {
+  fromSourceItemId: number;
+  toSourceItemId: number;
+  relationshipType: string;
+  basis: string;
+  confidence: number;
+  reasoning: string;
+  distinctEvidenceSummary: string | null;
+}
+
+export interface LatestProvenanceAnalysisResult {
+  aiJobId: number;
+  aiResultId: number;
+  clusterFingerprint: string | null;
+  edges: PersistedProvenanceEdge[];
+}
+
+/**
+ * The LATEST SUCCEEDED analyse_provenance job's persisted edges for one
+ * anchor claim -- same "succeeded-only, ORDER BY completed_at DESC, id
+ * DESC" semantics as getLatestSuccessfulCompareClaimsResult, just keyed by
+ * provenance_claim_id instead of comparison_claim_id, and additionally
+ * returning the job's own provenance_cluster_fingerprint (needed for the
+ * fingerprint-gated reanalyse action -- see
+ * provenanceAnalysisActionability.ts). Returns null when no succeeded
+ * analysis has ever completed for this claim -- distinct from an empty
+ * edges array, which is itself a valid "analysed, no meaningful
+ * relationship found" result.
+ *
+ * Shape-checked defensively (mirroring getLatestSuccessfulCompareClaimsResult)
+ * rather than re-run through analyse_provenance's own Zod schema
+ * (buildAnalyseProvenanceOutputSchema), since that schema is parameterized
+ * by the exact cluster-item-id set a given call was offered -- an
+ * ephemeral input to that one call, never persisted in its own right --
+ * which this read has no reason (or ability) to reconstruct.
+ */
+export async function getLatestSuccessfulProvenanceAnalysisResult(
+  db: DbExecutor,
+  claimId: number
+): Promise<LatestProvenanceAnalysisResult | null> {
+  const result = await db.execute<{ ai_job_id: number; id: number; structured_output: unknown; provenance_cluster_fingerprint: string | null }>(sql`
+    SELECT j.id AS ai_job_id, r.id, r.structured_output, j.provenance_cluster_fingerprint
+    FROM ai_jobs j
+    JOIN ai_results r ON r.ai_job_id = j.id
+    WHERE j.operation = 'analyse_provenance'
+      AND j.provenance_claim_id = ${claimId}
+      AND j.status = 'succeeded'
+    ORDER BY j.completed_at DESC, j.id DESC
+    LIMIT 1
+  `);
+
+  const row = result.rows[0];
+  if (!row) return null;
+  const structured = row.structured_output;
+  if (!structured || typeof structured !== "object") return null;
+  const edgesField = (structured as { edges?: unknown }).edges;
+  if (!Array.isArray(edgesField)) return null;
+
+  const edges = edgesField.flatMap((e): PersistedProvenanceEdge[] => {
+    if (
+      !e ||
+      typeof e !== "object" ||
+      typeof (e as { fromSourceItemId?: unknown }).fromSourceItemId !== "number" ||
+      typeof (e as { toSourceItemId?: unknown }).toSourceItemId !== "number" ||
+      typeof (e as { relationshipType?: unknown }).relationshipType !== "string" ||
+      typeof (e as { basis?: unknown }).basis !== "string" ||
+      typeof (e as { confidence?: unknown }).confidence !== "number" ||
+      typeof (e as { reasoning?: unknown }).reasoning !== "string"
+    ) {
+      return [];
+    }
+    const rawSummary = (e as { distinctEvidenceSummary?: unknown }).distinctEvidenceSummary;
+    return [
+      {
+        fromSourceItemId: (e as { fromSourceItemId: number }).fromSourceItemId,
+        toSourceItemId: (e as { toSourceItemId: number }).toSourceItemId,
+        relationshipType: (e as { relationshipType: string }).relationshipType,
+        basis: (e as { basis: string }).basis,
+        confidence: (e as { confidence: number }).confidence,
+        reasoning: (e as { reasoning: string }).reasoning,
+        distinctEvidenceSummary: typeof rawSummary === "string" ? rawSummary : null,
+      },
+    ];
+  });
+
+  return { aiJobId: row.ai_job_id, aiResultId: row.id, clusterFingerprint: row.provenance_cluster_fingerprint, edges };
+}
+
+/**
+ * Whether the given ai_result_id is the ai_results row belonging to the
+ * LATEST SUCCEEDED analyse_provenance job for the given anchor claim --
+ * the PR8b-specific server-side supersession check. Unlike PR7's
+ * compare_claims review mutations (which check only that the named
+ * ai_result_id's own job succeeded, not whether it is still the LATEST
+ * succeeded one -- confirmed by direct inspection, not changed here per
+ * explicit instruction), PR8b requires this enforced on approve/edit/reject,
+ * not merely in the UI. Older results remain preserved for audit but their
+ * unreviewed edges become non-actionable once a newer succeeded result
+ * exists for the same claim.
+ */
+export async function isLatestSucceededProvenanceAnalysisResult(db: DbExecutor, claimId: number, aiResultId: number): Promise<boolean> {
+  const latest = await getLatestSuccessfulProvenanceAnalysisResult(db, claimId);
+  return latest !== null && latest.aiResultId === aiResultId;
+}
+
+/** Whether ANY human decision -- approve, edit, or reject -- has already been recorded for this exact analyse_provenance proposed edge. Pure fact, no error thrown here; every caller decides its own error for a true result -- same shape as isComparisonReviewed above. */
+export async function isSourceRelationshipReviewed(db: DbExecutor, aiResultId: number, edgeIndex: number): Promise<boolean> {
+  const rows = await db
+    .select({ id: sourceRelationshipReviews.id })
+    .from(sourceRelationshipReviews)
+    .where(and(eq(sourceRelationshipReviews.aiResultId, aiResultId), eq(sourceRelationshipReviews.edgeIndex, edgeIndex)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+export interface SourceRelationshipReviewOutcome {
+  edgeIndex: number;
+  action: string;
+  notes: string | null;
+  approvedSourceItemIdA: number | null;
+  approvedSourceItemIdB: number | null;
+  approvedRelationshipType: string | null;
+  materializedRelationshipId: number | null;
+  relationshipWasNewlyCreated: boolean | null;
+}
+
+/** Every recorded review decision for one analyse_provenance ai_result, keyed for display by edgeIndex -- mirrors listComparisonReviewsForResult's shape exactly. */
+export async function listSourceRelationshipReviewsForResult(db: DbExecutor, aiResultId: number): Promise<SourceRelationshipReviewOutcome[]> {
+  const rows = await db
+    .select({
+      edgeIndex: sourceRelationshipReviews.edgeIndex,
+      action: adminDecisions.action,
+      notes: adminDecisions.notes,
+      approvedSourceItemIdA: sourceRelationshipReviews.approvedSourceItemIdA,
+      approvedSourceItemIdB: sourceRelationshipReviews.approvedSourceItemIdB,
+      approvedRelationshipType: sourceRelationshipReviews.approvedRelationshipType,
+      materializedRelationshipId: sourceRelationshipReviews.materializedRelationshipId,
+      relationshipWasNewlyCreated: sourceRelationshipReviews.relationshipWasNewlyCreated,
+    })
+    .from(sourceRelationshipReviews)
+    .innerJoin(adminDecisions, eq(adminDecisions.id, sourceRelationshipReviews.adminDecisionId))
+    .where(eq(sourceRelationshipReviews.aiResultId, aiResultId));
+  return rows;
+}
+
+/** Plain existence/title/url lookup for resolving fromSourceItemId/toSourceItemId -> display fields across a small batch of ids (at most one cluster's worth) for display. */
+export async function listSourceItemsByIds(db: DbExecutor, ids: number[]): Promise<{ id: number; title: string | null; url: string }[]> {
+  if (ids.length === 0) return [];
+  return db.select({ id: sourceItems.id, title: sourceItems.title, url: sourceItems.url }).from(sourceItems).where(inArray(sourceItems.id, ids));
 }

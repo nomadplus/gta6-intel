@@ -977,6 +977,67 @@ the same pair is analysed again months later, each recommendation stays
 independently identifiable and independently auditable rather than
 collapsing into one pair-keyed history.
 
+### Provenance analysis (Phase 5 PR 8b)
+
+`analyse_provenance` operates on one claim-anchored source-item cluster
+(the source items linked to a claim via `claim_sources`, capped at 15) and
+proposes directed edges over `source_relationships` distinguishing
+citation, repetition, derivative, aggregation, independent corroboration,
+and unknown provenance. Structurally this PR mirrors PR7's compare_claims
+exactly (trigger + operation + recovery lifecycle + actionability + a
+review bridge table), but with three deliberate divergences worth stating
+explicitly.
+
+**Divergence 1 — durable-row confidence/evidence policy.** PR7's
+`insertClaimRelationshipTx` accepts and persists the human-approved
+`confidence` value onto `claim_relationships` at approval time. PR8b's
+`insertSourceRelationshipTx` does the opposite: `source_relationships.confidence`
+and `.evidence_note` are **always** written as `NULL` from the review
+path, regardless of what the AI proposed. The AI's own confidence,
+reasoning, and (for `independent_corroboration`) `distinctEvidenceSummary`
+remain fully readable via `ai_results.structured_output` and this PR's own
+`source_relationship_reviews` bridge — nothing is lost — but none of it is
+copied onto the durable graph row itself. This is a locked product
+decision, not an oversight: provenance edges are treated as a stronger,
+more consequential claim about the world (independent corroboration in
+particular) than a claim-to-claim relationship, so the durable row
+deliberately carries only what a human explicitly authored, never an
+AI-originated number presented as if a human vouched for it. **PR7 itself
+is unchanged by this PR** — its own confidence-materialization behavior on
+`claim_relationships` remains exactly as PR7 shipped it.
+
+**Divergence 2 — server-side supersession enforcement.** PR7's
+`claimComparisonReviews.ts` mutations check only that the *named*
+`ai_result_id`'s own job succeeded — not whether it is still the *latest*
+succeeded `compare_claims` result for that focus claim (confirmed by
+direct inspection during PR8b's implementation; **left unchanged in PR7**,
+per explicit instruction — past behavior is not a defect this PR is
+scoped to fix). PR8b's own locked requirement is stricter:
+`sourceRelationshipReviews.ts` re-checks, from *within* each mutation's own
+transaction, that the target `ai_result_id` is still the latest succeeded
+`analyse_provenance` result for its anchor claim (`ORDER BY completed_at
+DESC, id DESC`, matching every other "latest succeeded" query in this
+codebase) before allowing an approve/edit/reject to proceed, throwing
+`ProvenanceResultSupersededError` otherwise. Older results remain
+preserved for audit; only their *unreviewed* edges become non-actionable
+once a newer succeeded analysis exists.
+
+**Divergence 3 — no canonicalization, ever.** `source_relationships` was
+never canonicalized to begin with (see PR8a / `provenanceDirection.ts`),
+so unlike `claim_comparison_reviews_symmetric_snapshot_canonical`, PR8b's
+`source_relationship_reviews` bridge has no equivalent CHECK at all: `(A,
+B, citation)` and `(B, A, citation)` are different facts and both may
+coexist as independently approved rows, proven directly in
+`sourceRelationshipReview.check.ts`.
+
+Re-analysis is cluster-change-gated, not time- or claim-statement-gated: a
+`provenance_cluster_fingerprint` (SHA-256 of the exact canonical
+cluster-item payload sent to the model, deliberately excluding
+`claims.statement` and any volatile metadata) is stored on `ai_jobs` at
+call time, and the admin UI only offers "reanalyse" from a `succeeded`
+state when the claim's *current* cluster fingerprint no longer matches
+it.
+
 ### Status history (the two append-only ledgers)
 
 `claim_investigation_status_history` and

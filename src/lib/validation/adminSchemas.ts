@@ -159,6 +159,68 @@ export const rejectClaimComparisonSchema = z.object({
   notes: z.string().trim().max(1000).optional(),
 });
 
+/** Phase 5 PR 8b: trigger a fresh analyse_provenance run for one claim's linked source-item cluster. */
+export const triggerAnalyseProvenanceSchema = z.object({
+  claimId: z.coerce.number().int().positive(),
+});
+
+// AI-proposable relationship types only -- "original" is deliberately
+// excluded, mirroring analyseProvenance.ts's own AI_PROPOSABLE_RELATIONSHIP_TYPES
+// (a human's own direct judgment via the existing manual provenance form
+// may still assert "original"; this review path never does).
+const aiProposableSourceRelationshipTypes = [
+  "citation",
+  "repetition",
+  "derivative",
+  "aggregation",
+  "independent_corroboration",
+  "unknown",
+] as const;
+
+/**
+ * Phase 5 PR 8b: approves one persisted analyse_provenance proposed edge
+ * exactly as the AI proposed it. fromSourceItemId/toSourceItemId here are
+ * ONLY a lookup/tamper-check key pair -- approveSourceRelationshipReview
+ * (sourceRelationshipReviews.ts) re-verifies them, and the
+ * relationshipType it approves, against this exact edge's own latest
+ * persisted analyse_provenance result inside its own transaction before
+ * writing anything; this schema does not and cannot authorize any of
+ * these values on its own.
+ */
+export const approveSourceRelationshipReviewSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  edgeIndex: z.coerce.number().int().min(0),
+  fromSourceItemId: z.coerce.number().int().positive(),
+  toSourceItemId: z.coerce.number().int().positive(),
+  reason: z.string().trim().max(1000).optional(),
+});
+
+/**
+ * Phase 5 PR 8b: approves one persisted analyse_provenance proposed edge
+ * with an admin override of relationshipType and/or a swapped direction.
+ * fromSourceItemId/toSourceItemId remain pure tamper-check lookup keys
+ * identifying WHICH proposed edge is being reviewed -- the admin may
+ * override the relationship TYPE and/or SWAP which of the two named
+ * items is the subject vs the object, but may not substitute a different
+ * pair of source items entirely (enforced server-side, not just by this
+ * schema -- see approveSourceRelationshipReviewWithChanges).
+ */
+export const approveSourceRelationshipReviewWithChangesSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  edgeIndex: z.coerce.number().int().min(0),
+  fromSourceItemId: z.coerce.number().int().positive(),
+  toSourceItemId: z.coerce.number().int().positive(),
+  relationshipType: z.enum(aiProposableSourceRelationshipTypes),
+  swapDirection: z.coerce.boolean().default(false),
+  reason: z.string().trim().max(1000).optional(),
+});
+
+export const rejectSourceRelationshipReviewSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  edgeIndex: z.coerce.number().int().min(0),
+  notes: z.string().trim().max(1000).optional(),
+});
+
 export const updateClaimMetadataSchema = z.object({
   claimId: z.coerce.number().int().positive(),
   statement: z.string().trim().min(10).max(2000),

@@ -45,7 +45,26 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { aiJobs, aiResults } from "../db/schema";
 import { runAiOperation } from "../lib/ai/runAiOperation";
+import type { AiOperation } from "../lib/ai/types";
 import { FakeAiProvider } from "./helpers/fakeAiProvider";
+
+/**
+ * Phase 5 PR 8b: the single named constant for every block in this file
+ * that needs an arbitrary, still-unconstrained ai_operation enum value --
+ * NOT testing that operation's own business logic, just exercising
+ * runAiOperation's generic, operation-agnostic behavior. Every operation
+ * with real business logic accumulates its own CHECK constraint over
+ * time (extract_claims/detect_duplicates/compare_claims/analyse_provenance
+ * all now have one), which breaks a generic fixture that populates none
+ * of that operation's required identity columns. 'embed' is, as of this
+ * PR, confirmed by direct inspection of schema.ts and every migration
+ * file to appear ONLY in the ai_operation enum definition itself, with no
+ * CHECK, unique index, or FK column anywhere conditioned on it. If
+ * 'embed' ever gains an operation-specific constraint, update ONLY this
+ * constant -- every block below already reads from it rather than
+ * repeating the literal.
+ */
+const GENERIC_FIXTURE_OPERATION: AiOperation = "embed";
 
 let failures = 0;
 
@@ -248,7 +267,7 @@ async function main() {
     {
       const provider = new FakeAiProvider([{ kind: "throw", error: new Error("network socket reset") }]);
       const result = await runAiOperation({
-        operation: "analyse_provenance",
+        operation: GENERIC_FIXTURE_OPERATION,
         provider,
         systemPrompt: "sys",
         userPrompt: "user",
@@ -290,41 +309,51 @@ async function main() {
     // comparison_claim_id whenever operation = 'compare_claims' -- a
     // real PR7 constraint for THAT operation's own focus-claim-scoped
     // identity, and (per the identical reasoning immediately above)
-    // nothing this generic block should have to satisfy either. The
-    // original "the one remaining enum value with no operation-specific
-    // constraints AND not already used by another block in this same
-    // file" selection criterion is no longer satisfiable: every one of
-    // the eight ai_operation enum values now appears somewhere else in
-    // this file (recommend_status, embed, classify_relevance,
-    // evaluate_evidence, analyse_provenance are each used by their own
-    // dedicated blocks elsewhere here; extract_claims/detect_duplicates/
-    // compare_claims all carry operation-specific constraints).
-    // Verified directly against schema.ts and every migration file
-    // before choosing "embed": it appears ONLY in the ai_operation enum
-    // definition itself (migration 0000), with no CHECK, unique index,
-    // or FK column anywhere conditioned on it -- unlike
-    // analyse_provenance/evaluate_evidence/recommend_status, which are
-    // exactly Phase 5 PR8's upcoming operations and would risk forcing
-    // this same swap again within a single following PR. Reuse of the
-    // same enum value across two independent blocks within this one file
-    // is harmless -- each block creates its own independent job rows,
-    // and this generic assertion has never been about any one
-    // operation's own business logic. If "embed" ever gains an
-    // operation-specific constraint, this fixture must move again -- and
-    // the pool of truly unconstrained values is shrinking.
+    // nothing this generic block should have to satisfy either.
+    //
+    // NOTE (Phase 5 PR 8b): migration 0024 added
+    // ai_jobs_provenance_operation_consistency, requiring
+    // provenance_claim_id whenever operation = 'analyse_provenance' --
+    // the same real, operation-specific constraint story as PR6/PR7
+    // before it, now for analyse_provenance. Rather than swap this
+    // fixture's literal a third time, this PR introduces
+    // GENERIC_FIXTURE_OPERATION (top of file) as the one place that
+    // decision is made, and both this block and the "unexpected throw"
+    // block above now read from it. The original "the one remaining enum
+    // value with no operation-specific constraints AND not already used
+    // by another block in this same file" selection criterion is no
+    // longer satisfiable: every one of the eight ai_operation enum
+    // values now appears somewhere else in this file
+    // (recommend_status, embed, classify_relevance, evaluate_evidence
+    // are each used by their own dedicated blocks elsewhere here;
+    // extract_claims/detect_duplicates/compare_claims/analyse_provenance
+    // all carry operation-specific constraints). Verified directly
+    // against schema.ts and every migration file before choosing
+    // "embed": it appears ONLY in the ai_operation enum definition
+    // itself (migration 0000), with no CHECK, unique index, or FK column
+    // anywhere conditioned on it -- unlike evaluate_evidence/
+    // recommend_status, which are exactly Phase 5 PR8's remaining
+    // upcoming operations and would risk forcing this same swap again
+    // within a following PR. Reuse of the same enum value across
+    // multiple independent blocks within this one file is harmless --
+    // each block creates its own independent job rows, and this generic
+    // assertion has never been about any one operation's own business
+    // logic. If "embed" ever gains an operation-specific constraint,
+    // update GENERIC_FIXTURE_OPERATION in one place -- the pool of truly
+    // unconstrained values is shrinking.
     {
       const providerA = new FakeAiProvider([{ kind: "success", rawOutput: { summary: "a" }, tokensIn: 1, tokensOut: 1 }], "provider-a");
       const providerB = new FakeAiProvider([{ kind: "success", rawOutput: { summary: "b" }, tokensIn: 1, tokensOut: 1 }], "provider-b");
 
       const resultA = await runAiOperation({
-        operation: "embed",
+        operation: GENERIC_FIXTURE_OPERATION,
         provider: providerA,
         systemPrompt: "sys",
         userPrompt: "user",
         outputSchema: exampleOutputSchema,
       });
       const resultB = await runAiOperation({
-        operation: "embed",
+        operation: GENERIC_FIXTURE_OPERATION,
         provider: providerB,
         systemPrompt: "sys",
         userPrompt: "user",

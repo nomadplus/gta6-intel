@@ -70,6 +70,17 @@ export interface RunAiOperationInput<T> {
    */
   comparisonClaimId?: number | null;
   /**
+   * Phase 5 PR 8b: opaque passthrough to ai_jobs.provenance_claim_id /
+   * .provenance_cluster_fingerprint, mirroring comparisonClaimId
+   * immediately above -- same "written at pending-job-creation time,
+   * since the in-flight uniqueness guard (migration 0024) checks
+   * against it" reasoning, just scoped to one claim's linked
+   * source-item cluster rather than one focus-claim comparison. This
+   * function has no idea only analyse_provenance populates these.
+   */
+  provenanceClaimId?: number | null;
+  provenanceClusterFingerprint?: string | null;
+  /**
    * Explicit metadata passthrough to ai_results.confidence /
    * ai_results.reasoning -- the SAME mechanism as claimId above, not a
    * new one. This function never inspects `outputSchema`'s validated
@@ -150,6 +161,8 @@ export async function runAiOperation<T>(input: RunAiOperationInput<T>): Promise<
     extractionAiResultId: input.extractionAiResultId ?? null,
     extractionCandidateIndex: input.extractionCandidateIndex ?? null,
     comparisonClaimId: input.comparisonClaimId ?? null,
+    provenanceClaimId: input.provenanceClaimId ?? null,
+    provenanceClusterFingerprint: input.provenanceClusterFingerprint ?? null,
   });
 
   // Phase 5 PR 3: the pending-job INSERT itself can be rejected by
