@@ -1,14 +1,13 @@
 import type { ProvenanceLink } from "@/db/queries/claimDetail";
+import { provenanceSubjectVerb } from "@/lib/provenanceDirection";
 
-const relationshipVerb: Record<string, string> = {
-  original: "is the original source for",
-  independent_corroboration: "independently corroborates",
-  citation: "cites",
-  repetition: "repeats",
-  aggregation: "aggregates",
-  derivative: "derives from",
-  unknown: "has an unknown relationship to",
-};
+// Phase 5 PR 8a: this file previously owned a local `relationshipVerb` map.
+// Its entries were character-for-character what provenanceSubjectVerb now
+// returns, so this is a pure lift with no rendered change -- the point is
+// that exactly ONE provenance verb map exists in the codebase, so this
+// component and the admin audit summary cannot drift apart. `link.fromTitle`
+// is source_item_id_a (the SUBJECT) and `link.toTitle` is source_item_id_b
+// (the OBJECT); see src/lib/provenanceDirection.ts.
 
 export function ProvenanceChain({ links }: { links: ProvenanceLink[] }) {
   if (links.length === 0) {
@@ -34,7 +33,7 @@ export function ProvenanceChain({ links }: { links: ProvenanceLink[] }) {
           >
             <span className="font-medium text-ink-100">{link.fromTitle ?? link.fromUrl}</span>
             <span className="font-mono text-[10px] uppercase tracking-wide text-accent-brass">
-              {relationshipVerb[link.relationshipType] ?? link.relationshipType}
+              {provenanceSubjectVerb(link.relationshipType)}
             </span>
             <span className="font-medium text-ink-100">{link.toTitle ?? link.toUrl}</span>
             {link.confidence && (

@@ -4,6 +4,7 @@ import { sourceRelationships } from "@/db/schema";
 import { withAuditedTransaction, logAdminAction, isUniqueViolation } from "./shared";
 import { createSourceRelationshipSchema } from "@/lib/validation/adminSchemas";
 import { requireAdmin } from "@/lib/auth/requireAdmin";
+import { describeProvenanceLink } from "@/lib/provenanceDirection";
 import { z } from "zod";
 
 export class DuplicateProvenanceLinkError extends Error {
@@ -19,6 +20,10 @@ export class DuplicateProvenanceLinkError extends Error {
  * independent_corroboration, aggregation, unknown) are NEVER
  * canonicalized -- "B cites A" and "A cites B" are different, and
  * frequently only one of them is even true. Stored exactly as submitted.
+ *
+ * Phase 5 PR 8a: direction is `sourceItemIdA` = SUBJECT, `sourceItemIdB` =
+ * OBJECT. See src/lib/provenanceDirection.ts for the canonical statement of
+ * that invariant and for the write-direction defect this convention closed.
  */
 export async function createSourceRelationship(input: unknown) {
   const admin = await requireAdmin("editor");
@@ -41,7 +46,18 @@ export async function createSourceRelationship(input: unknown) {
         action: "create",
         entityType: "source_relationship",
         entityId: row.id,
-        summary: `Source item #${data.sourceItemIdB} ${data.relationshipType} source item #${data.sourceItemIdA}`,
+        // Phase 5 PR 8a: SUBJECT FIRST. This previously read
+        // "#{sourceItemIdB} {type} #{sourceItemIdA}", which was self-consistent
+        // with the old (inverted) form binding but described the OPPOSITE of
+        // the row actually stored. Composed via describeProvenanceLink so this
+        // sentence and the public provenance chain's sentence are produced by
+        // the same vocabulary for the same row.
+        summary: describeProvenanceLink(
+          data.relationshipType,
+          `Source item #${data.sourceItemIdA}`,
+          // Lowercase mid-sentence, preserving the original summary's casing.
+          `source item #${data.sourceItemIdB}`
+        ),
       });
 
       return row;

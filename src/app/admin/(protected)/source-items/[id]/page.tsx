@@ -7,6 +7,7 @@ import {
   getSourceItemRelationships,
 } from "@/db/queries/admin";
 import { updateSourceItemAction, createSourceRelationshipAction, deleteSourceRelationshipAction } from "../../sources/actions";
+import { PROVENANCE_SUBJECT_FIELD, PROVENANCE_OBJECT_FIELD } from "@/lib/provenanceDirection";
 
 const inputClass = "w-full border border-hairline bg-bg-void px-3 py-2 text-sm text-ink-100 focus-visible:border-accent-brass";
 const submitClass = "border border-accent-brass px-3 py-1.5 font-mono text-xs uppercase tracking-wide text-accent-brass hover:bg-accent-brass hover:text-bg-void";
@@ -115,13 +116,17 @@ export default async function AdminSourceItemDetailPage({ params, searchParams }
           </div>
           <div className="min-w-[220px] flex-1">
             <label className="mb-1 block font-mono text-[10px] uppercase tracking-wide text-ink-600">...this other item</label>
-            <select name="sourceItemIdA" required className={inputClass}>
+            {/* The OBJECT of the relationship -> source_item_id_b. See
+                src/lib/provenanceDirection.ts for the A=subject/B=object
+                invariant and the write-direction defect this binding fixes. */}
+            <select name={PROVENANCE_OBJECT_FIELD} required className={inputClass}>
               {allItems.filter((i) => i.id !== item.id).map((i) => (
                 <option key={i.id} value={i.id}>{i.title ?? i.url}</option>
               ))}
             </select>
           </div>
-          <input type="hidden" name="sourceItemIdB" value={item.id} />
+          {/* "This item" is the SUBJECT -> source_item_id_a. */}
+          <input type="hidden" name={PROVENANCE_SUBJECT_FIELD} value={item.id} />
           <button type="submit" className={submitClass}>Add Relationship</button>
         </form>
       </section>

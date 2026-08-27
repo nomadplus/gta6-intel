@@ -42,6 +42,46 @@ canonicalization here (unlike `claim_relationships` below) because
 provenance is inherently directional — a `citation` always has a
 from/to.
 
+**Direction convention (Phase 5 PR 8a):** `source_item_id_a` is the
+**subject**; `source_item_id_b` is the **object**. A row
+`(a = 7, b = 9, 'citation')` asserts *"source item 7 cites source item
+9"*. Because the table is deliberately not canonicalized, both
+`(7, 9, 'citation')` and `(9, 7, 'citation')` may legitimately exist as
+two different facts, and this orientation must never be normalized away.
+
+This paragraph previously said only that direction was meaningful,
+without saying which column carried it — and that omission was the root
+cause of a real defect. The admin creation form bound "this item" to
+`sourceItemIdB` and the other item to `sourceItemIdA`, so every
+relationship created through the UI was *stored as the inverse of what
+the admin entered*. All three readers (`getSourceItemRelationships`,
+`getClaimProvenanceChain`, `ProvenanceChain`) were individually correct
+and faithfully displayed the inverted row, and the audit summary was
+self-consistent with the *form* rather than with storage — so the audit
+trail described the admin's intent while the database held its opposite,
+which is why it never surfaced on inspection. `src/db/seed/seed.ts`
+writes `a` = subject directly, bypassing the form, so all seeded data was
+always correct.
+
+PR 8a fixed the form binding and the audit summary, and consolidated the
+one verb vocabulary into `src/lib/provenanceDirection.ts` so the audit
+sentence and the public provenance chain cannot drift apart again.
+`src/checks/provenanceDirectionRoundTrip.check.ts` locks write-path /
+read-path agreement against a real database — a pure check cannot catch a
+disagreement in which every component is individually self-consistent.
+No migration and no data correction were required: only two
+`source_relationships` rows existed, both written by the seed path and
+both correct, and `admin_audit_log` held no
+`entity_type = 'source_relationship'` entries at all, proving no row had
+ever been created through the defective form.
+
+One asymmetry worth noting for future graph code: for the four
+dependence types (`citation`, `repetition`, `derivative`, `aggregation`)
+the subject is the *later, dependent* item, whereas for `original` the
+subject is the *earlier, origin* item. The `a` = subject invariant holds
+for all seven types; only the temporal meaning of the subject position
+differs.
+
 ### Discovery / ingestion (Phase 4 PR 1 — schema only)
 
 Three concepts that sound related but answer different questions, kept

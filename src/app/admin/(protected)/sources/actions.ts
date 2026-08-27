@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { createSource, updateSource, createSourceItem, updateSourceItem } from "@/db/mutations/sources";
 import { createSourceRelationship, deleteSourceRelationship } from "@/db/mutations/provenance";
 import { formDataToObject, safeAction } from "@/lib/actionResult";
+import { PROVENANCE_SUBJECT_FIELD } from "@/lib/provenanceDirection";
 
 function errorRedirect(basePath: string, error: string): never {
   redirect(`${basePath}?error=${encodeURIComponent(error)}`);
@@ -45,7 +46,10 @@ export async function updateSourceItemAction(formData: FormData) {
 
 export async function createSourceRelationshipAction(formData: FormData) {
   const input = formDataToObject(formData);
-  const sourceItemId = input.sourceItemIdB as string;
+  // Phase 5 PR 8a: "this item" -- the page we redirect back to -- is now the
+  // SUBJECT field. This previously read `input.sourceItemIdB`, matching the
+  // old inverted form binding.
+  const sourceItemId = input[PROVENANCE_SUBJECT_FIELD] as string;
   const result = await safeAction(() => createSourceRelationship(input));
   if (!result.ok) errorRedirect(`/admin/source-items/${sourceItemId}`, result.error);
   revalidatePath(`/admin/source-items/${sourceItemId}`);
