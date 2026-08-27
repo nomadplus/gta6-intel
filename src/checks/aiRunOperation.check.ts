@@ -277,24 +277,54 @@ async function main() {
     // whenever operation = 'detect_duplicates' -- a real, intentional PR6
     // constraint for that operation's own candidate-scoped identity, not
     // something this generic, operation-agnostic provider-interchangeability
-    // check should have to satisfy. Swapped to "compare_claims" -- the one
-    // remaining enum value with no operation-specific constraints and not
-    // already used by another block in this same file -- to preserve this
-    // test's actual, unrelated intent (provider-agnostic behavior) without
-    // fighting a constraint that has nothing to do with what it verifies.
+    // check should have to satisfy. Swapped to "compare_claims" -- at the
+    // time, the one remaining enum value with no operation-specific
+    // constraints and not already used by another block in this same
+    // file -- to preserve this test's actual, unrelated intent
+    // (provider-agnostic behavior) without fighting a constraint that has
+    // nothing to do with what it verifies.
+    //
+    // NOTE (Phase 5 PR 7): swapped AGAIN, from "compare_claims" to
+    // "embed". Migration 0021 added
+    // ai_jobs_compare_claims_operation_consistency, requiring
+    // comparison_claim_id whenever operation = 'compare_claims' -- a
+    // real PR7 constraint for THAT operation's own focus-claim-scoped
+    // identity, and (per the identical reasoning immediately above)
+    // nothing this generic block should have to satisfy either. The
+    // original "the one remaining enum value with no operation-specific
+    // constraints AND not already used by another block in this same
+    // file" selection criterion is no longer satisfiable: every one of
+    // the eight ai_operation enum values now appears somewhere else in
+    // this file (recommend_status, embed, classify_relevance,
+    // evaluate_evidence, analyse_provenance are each used by their own
+    // dedicated blocks elsewhere here; extract_claims/detect_duplicates/
+    // compare_claims all carry operation-specific constraints).
+    // Verified directly against schema.ts and every migration file
+    // before choosing "embed": it appears ONLY in the ai_operation enum
+    // definition itself (migration 0000), with no CHECK, unique index,
+    // or FK column anywhere conditioned on it -- unlike
+    // analyse_provenance/evaluate_evidence/recommend_status, which are
+    // exactly Phase 5 PR8's upcoming operations and would risk forcing
+    // this same swap again within a single following PR. Reuse of the
+    // same enum value across two independent blocks within this one file
+    // is harmless -- each block creates its own independent job rows,
+    // and this generic assertion has never been about any one
+    // operation's own business logic. If "embed" ever gains an
+    // operation-specific constraint, this fixture must move again -- and
+    // the pool of truly unconstrained values is shrinking.
     {
       const providerA = new FakeAiProvider([{ kind: "success", rawOutput: { summary: "a" }, tokensIn: 1, tokensOut: 1 }], "provider-a");
       const providerB = new FakeAiProvider([{ kind: "success", rawOutput: { summary: "b" }, tokensIn: 1, tokensOut: 1 }], "provider-b");
 
       const resultA = await runAiOperation({
-        operation: "compare_claims",
+        operation: "embed",
         provider: providerA,
         systemPrompt: "sys",
         userPrompt: "user",
         outputSchema: exampleOutputSchema,
       });
       const resultB = await runAiOperation({
-        operation: "compare_claims",
+        operation: "embed",
         provider: providerB,
         systemPrompt: "sys",
         userPrompt: "user",
@@ -308,7 +338,7 @@ async function main() {
         const jobB = await loadJob(resultB.jobId);
         assert(jobA.provider === "provider-a", `runAiOperation persists whichever provider.name it was given, not a hardcoded value (got ${jobA.provider})`);
         assert(jobB.provider === "provider-b", `a second, differently-named provider persists its own name too (got ${jobB.provider})`);
-        assert(jobA.operation === "compare_claims" && jobB.operation === "compare_claims", "the compare_claims enum value is accepted by ai_jobs.operation");
+        assert(jobA.operation === "embed" && jobB.operation === "embed", "the embed enum value is accepted by ai_jobs.operation");
       }
     }
 

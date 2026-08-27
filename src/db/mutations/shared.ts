@@ -72,7 +72,9 @@ export type AdminAuditEntityType =
   // Added in migration 0010 (Phase 4 PR 8).
   | "discovery_feed"
   // Added in migration 0016 (Phase 5 PR 5).
-  | "claim_proposal_review";
+  | "claim_proposal_review"
+  // Added in migration 0020 (Phase 5 PR 7).
+  | "claim_comparison_review";
 
 /**
  * Writes one admin_audit_log row. Metadata must be structured context

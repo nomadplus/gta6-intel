@@ -1,8 +1,27 @@
 import { notFound } from "next/navigation";
-import { getClaimForAdmin, listTopicsForAdmin, listSourceItemsForAdmin, listEvidenceForAdmin, listClaimsForAdmin } from "@/db/queries/admin";
+import { adminDb } from "@/db/adminClient";
+import {
+  getClaimForAdmin,
+  listTopicsForAdmin,
+  listSourceItemsForAdmin,
+  listEvidenceForAdmin,
+  listClaimsForAdmin,
+  countComparableClaimsForClaim,
+  getLatestCompareClaimsJob,
+  getLatestSuccessfulCompareClaimsResult,
+  listComparisonReviewsForResult,
+  listClaimsByIds,
+} from "@/db/queries/admin";
 import { getClaimTimeline, getClaimSources, getClaimEvidence, getRelatedClaims } from "@/db/queries/claimDetail";
 import { StatusPair } from "@/components/status/StatusPair";
 import { investigationStatusDisplay, developmentOutcomeDisplay, informationTypeLabel } from "@/lib/statusDisplay";
+import { relatedClaimLabel } from "@/lib/relationshipDisplay";
+import {
+  computeRelationshipAnalysisDisplayState,
+  canTriggerRelationshipAnalysis,
+  relationshipAnalysisButtonLabel,
+  type RelationshipAnalysisDisplayState,
+} from "@/lib/ai/relationshipAnalysisActionability";
 import {
   updateClaimMetadataAction,
   transitionInvestigationStatusAction,
@@ -13,26 +32,53 @@ import {
   unlinkEvidenceFromClaimAction,
   createClaimRelationshipAction,
   deleteClaimRelationshipAction,
+  runCompareClaimsAction,
+  approveClaimComparisonAction,
+  approveClaimComparisonWithChangesAction,
+  rejectClaimComparisonAction,
 } from "../actions";
 
 const inputClass = "w-full border border-hairline bg-bg-void px-3 py-2 text-sm text-ink-100 focus-visible:border-accent-brass";
 const submitClass =
   "border border-accent-brass px-3 py-1.5 font-mono text-xs uppercase tracking-wide text-accent-brass hover:bg-accent-brass hover:text-bg-void";
 
+// Phase 5 PR 7: six-state relationship-analysis display model (see
+// relationshipAnalysisActionability.ts). no_comparable_claims is
+// distinct from not_analysed -- an analysis has genuinely never run in
+// either case, but no_comparable_claims means running one would be
+// pointless (and free, since compareClaimsTrigger.ts never creates a job
+// in that case), while not_analysed means one is available and would
+// cost something.
+const RELATIONSHIP_ANALYSIS_STATUS_LABEL: Record<RelationshipAnalysisDisplayState, string> = {
+  no_comparable_claims: "No other claims to compare against yet",
+  not_analysed: "Not yet analysed",
+  in_progress: "Analysis in progress",
+  stale: "Stale — recovery available",
+  failed: "Analysis failed",
+  succeeded: "Analysed",
+};
+
 type Props = {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ error?: string; saved?: string }>;
+  searchParams: Promise<{
+    error?: string;
+    saved?: string;
+    comparisonStatus?: string;
+    comparisonError?: string;
+    comparisonReviewStatus?: string;
+    comparisonReviewError?: string;
+  }>;
 };
 
 export default async function AdminClaimDetailPage({ params, searchParams }: Props) {
   const { id } = await params;
   const claimId = Number(id);
-  const { error, saved } = await searchParams;
+  const { error, saved, comparisonStatus, comparisonError, comparisonReviewStatus, comparisonReviewError } = await searchParams;
 
   const claim = await getClaimForAdmin(claimId);
   if (!claim) notFound();
 
-  const [timeline, claimSources, claimEvidenceRows, related, topics, sourceItems, allEvidence, allClaims] =
+  const [timeline, claimSources, claimEvidenceRows, related, topics, sourceItems, allEvidence, allClaims, comparableClaimsCount, latestCompareClaimsJob] =
     await Promise.all([
       getClaimTimeline(claimId),
       getClaimSources(claimId),
@@ -42,7 +88,26 @@ export default async function AdminClaimDetailPage({ params, searchParams }: Pro
       listSourceItemsForAdmin(),
       listEvidenceForAdmin(),
       listClaimsForAdmin(),
+      countComparableClaimsForClaim(adminDb, claimId, claim.projectId),
+      getLatestCompareClaimsJob(adminDb, claimId),
     ]);
+
+  const relationshipAnalysisState: RelationshipAnalysisDisplayState = computeRelationshipAnalysisDisplayState(
+    comparableClaimsCount > 0,
+    latestCompareClaimsJob,
+    new Date()
+  );
+
+  // Only fetched when there IS a succeeded result to show -- avoids a
+  // wasted query for the other five display states.
+  const latestComparisonResult =
+    relationshipAnalysisState === "succeeded" ? await getLatestSuccessfulCompareClaimsResult(adminDb, claimId) : null;
+  const comparisonReviews = latestComparisonResult ? await listComparisonReviewsForResult(adminDb, latestComparisonResult.aiResultId) : [];
+  const otherClaimsForComparison = latestComparisonResult
+    ? await listClaimsByIds(adminDb, latestComparisonResult.assessments.map((a) => a.otherClaimId))
+    : [];
+  const otherClaimById = new Map(otherClaimsForComparison.map((c) => [c.id, c]));
+  const comparisonReviewByIndex = new Map(comparisonReviews.map((r) => [r.assessmentIndex, r]));
 
   return (
     <div className="max-w-4xl space-y-12">
@@ -226,12 +291,122 @@ export default async function AdminClaimDetailPage({ params, searchParams }: Pro
         </form>
       </Section>
 
+      <Section
+        title="Relationship analysis"
+        note="AI-recommended relationships to other existing claims -- advisory only. Nothing here changes the claim graph until an admin explicitly approves it."
+      >
+        {comparisonError && <p className="mb-3 text-sm text-signal-disproven">{comparisonError}</p>}
+        {comparisonStatus && <p className="mb-3 text-sm text-ink-600">Analysis status: {comparisonStatus}</p>}
+        {comparisonReviewError && <p className="mb-3 text-sm text-signal-disproven">{comparisonReviewError}</p>}
+        {comparisonReviewStatus && <p className="mb-3 text-sm text-ink-600">Review status: {comparisonReviewStatus}</p>}
+
+        <div className="mb-4 flex items-center justify-between">
+          <span className="font-mono text-xs uppercase tracking-wide text-ink-600">
+            {RELATIONSHIP_ANALYSIS_STATUS_LABEL[relationshipAnalysisState]}
+          </span>
+          {canTriggerRelationshipAnalysis(relationshipAnalysisState) && (
+            <form action={runCompareClaimsAction}>
+              <input type="hidden" name="claimId" value={claim.id} />
+              <button type="submit" className={submitClass}>
+                {relationshipAnalysisButtonLabel(relationshipAnalysisState)}
+              </button>
+            </form>
+          )}
+        </div>
+
+        {relationshipAnalysisState === "succeeded" && latestComparisonResult && (
+          <ul className="space-y-3">
+            {latestComparisonResult.assessments.length === 0 && (
+              <li className="border border-hairline p-3 text-sm text-ink-600">
+                No meaningful relationship found in the latest analysis.
+              </li>
+            )}
+            {latestComparisonResult.assessments.map((assessment, index) => {
+              const otherClaim = otherClaimById.get(assessment.otherClaimId);
+              const review = comparisonReviewByIndex.get(index);
+              return (
+                <li key={`${latestComparisonResult.aiResultId}-${index}`} className="border border-hairline p-3 text-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-xs uppercase tracking-wide text-accent-brass">
+                      {relatedClaimLabel(assessment.relationshipType, assessment.direction !== "other_to_focus")}
+                    </span>
+                    <span className="font-mono text-[10px] text-ink-600">confidence {assessment.confidence.toFixed(2)}</span>
+                  </div>
+                  <p className="mt-1 text-ink-100">#{assessment.otherClaimId} — {otherClaim?.statement ?? "(claim not found)"}</p>
+                  <p className="mt-1 text-xs italic text-ink-600">{assessment.reasoning}</p>
+
+                  {review ? (
+                    <p className="mt-2 font-mono text-[10px] uppercase tracking-wide text-ink-600">
+                      {review.action === "reject"
+                        ? "Rejected"
+                        : review.relationshipWasNewlyCreated
+                          ? `${review.action === "edit" ? "Approved with changes" : "Approved"} — relationship #${review.materializedRelationshipId} created`
+                          : `${review.action === "edit" ? "Approved with changes" : "Approved"} — relationship #${review.materializedRelationshipId} already existed`}
+                    </p>
+                  ) : (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <form action={approveClaimComparisonAction}>
+                        <input type="hidden" name="claimId" value={claim.id} />
+                        <input type="hidden" name="aiResultId" value={latestComparisonResult.aiResultId} />
+                        <input type="hidden" name="assessmentIndex" value={index} />
+                        <input type="hidden" name="otherClaimId" value={assessment.otherClaimId} />
+                        <button type="submit" className={submitClass}>
+                          Approve
+                        </button>
+                      </form>
+                      <form action={rejectClaimComparisonAction}>
+                        <input type="hidden" name="claimId" value={claim.id} />
+                        <input type="hidden" name="aiResultId" value={latestComparisonResult.aiResultId} />
+                        <input type="hidden" name="assessmentIndex" value={index} />
+                        <button type="submit" className={submitClass}>
+                          Reject
+                        </button>
+                      </form>
+                      <details className="w-full">
+                        <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wide text-ink-600">
+                          Approve with changes
+                        </summary>
+                        <form action={approveClaimComparisonWithChangesAction} className="mt-2 flex flex-wrap items-end gap-2">
+                          <input type="hidden" name="claimId" value={claim.id} />
+                          <input type="hidden" name="aiResultId" value={latestComparisonResult.aiResultId} />
+                          <input type="hidden" name="assessmentIndex" value={index} />
+                          <input type="hidden" name="otherClaimId" value={assessment.otherClaimId} />
+                          <Field label="Relationship type">
+                            <select name="relationshipType" defaultValue={assessment.relationshipType} className={inputClass}>
+                              <option value="equivalent">Equivalent</option>
+                              <option value="related">Related</option>
+                              <option value="contradicts">Contradicts</option>
+                              <option value="subsumes">Subsumes (this claim subsumes the other)</option>
+                              <option value="refines">Refines (this claim refines the other)</option>
+                            </select>
+                          </Field>
+                          <Field label="Direction (subsumes/refines only)">
+                            <select name="direction" defaultValue={assessment.direction ?? ""} className={inputClass}>
+                              <option value="">N/A (symmetric type)</option>
+                              <option value="focus_to_other">This claim → other claim</option>
+                              <option value="other_to_focus">Other claim → this claim</option>
+                            </select>
+                          </Field>
+                          <button type="submit" className={submitClass}>
+                            Save
+                          </button>
+                        </form>
+                      </details>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </Section>
+
       <Section title="Related Claims" note="Equivalent, related, and contradicts are canonicalized automatically — direction doesn't matter for those. Subsumes and refines stay directional.">
         <ul className="divide-y divide-hairline border border-hairline text-sm">
           {related.map((r) => (
             <li key={`${r.id}-${r.relationshipType}`} className="flex items-center justify-between p-2">
               <span>
-                <span className="font-mono text-xs uppercase text-accent-brass">{r.relationshipType}</span> {r.statement}
+                <span className="font-mono text-xs uppercase text-accent-brass">{relatedClaimLabel(r.relationshipType, r.viewedClaimIsA)}</span> {r.statement}
               </span>
             </li>
           ))}

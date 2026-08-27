@@ -230,6 +230,16 @@ export type RelatedClaim = {
   statement: string;
   relationshipType: string;
   confidence: string | null;
+  /**
+   * Phase 5 PR 7: whether the VIEWED claim (claimId, the argument to
+   * getRelatedClaims) is stored as claim_relationships.claim_id_a for
+   * this row. Required to render subsumes/refines correctly -- without
+   * it, a directional relationship's meaning is ambiguous depending on
+   * which side of the stored row the viewed claim happens to occupy.
+   * See src/lib/relationshipDisplay.ts's relatedClaimLabel(), the single
+   * place this flag is consumed.
+   */
+  viewedClaimIsA: boolean;
 };
 
 export async function getRelatedClaims(claimId: number): Promise<RelatedClaim[]> {
@@ -239,8 +249,10 @@ export async function getRelatedClaims(claimId: number): Promise<RelatedClaim[]>
     statement: string;
     relationship_type: string;
     confidence: string | null;
+    viewed_claim_is_a: boolean;
   }>(sql`
-    SELECT c.id, c.slug, c.statement, cr.relationship_type, cr.confidence
+    SELECT c.id, c.slug, c.statement, cr.relationship_type, cr.confidence,
+           (cr.claim_id_a = ${claimId}) AS viewed_claim_is_a
     FROM claim_relationships cr
     JOIN claims c ON c.id = CASE WHEN cr.claim_id_a = ${claimId} THEN cr.claim_id_b ELSE cr.claim_id_a END
     WHERE cr.claim_id_a = ${claimId} OR cr.claim_id_b = ${claimId}
@@ -253,5 +265,6 @@ export async function getRelatedClaims(claimId: number): Promise<RelatedClaim[]>
     statement: r.statement,
     relationshipType: r.relationship_type,
     confidence: r.confidence,
+    viewedClaimIsA: r.viewed_claim_is_a,
   }));
 }

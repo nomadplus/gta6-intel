@@ -104,6 +104,61 @@ export const triggerDetectDuplicatesSchema = z.object({
   candidateIndex: z.coerce.number().int().min(0),
 });
 
+/** Phase 5 PR 7: trigger a fresh compare_claims relationship analysis for one existing focus claim. */
+export const triggerCompareClaimsSchema = z.object({
+  claimId: z.coerce.number().int().positive(),
+});
+
+const directions = ["focus_to_other", "other_to_focus"] as const;
+
+/**
+ * Phase 5 PR 7: approves one persisted compare_claims assessment exactly
+ * as the AI proposed it. otherClaimId here is ONLY a lookup/tamper-check
+ * key -- approveClaimComparison (claimComparisonReviews.ts) re-verifies
+ * it, and the relationshipType/direction it approves, against this exact
+ * assessment's own latest persisted compare_claims result inside its own
+ * transaction before writing anything; this schema does not and cannot
+ * authorize any of these values on its own.
+ */
+export const approveClaimComparisonSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  assessmentIndex: z.coerce.number().int().min(0),
+  otherClaimId: z.coerce.number().int().positive(),
+  reason: z.string().trim().max(1000).optional(),
+});
+
+/**
+ * Phase 5 PR 7: approves one persisted compare_claims assessment with an
+ * admin override of relationshipType/direction. otherClaimId remains a
+ * pure tamper-check lookup key -- the admin may override the TYPE of
+ * relationship, never WHICH claim it targets; retargeting a
+ * recommendation at a different claim is a new relationship, and belongs
+ * in the existing manual "Related Claims" form (createClaimRelationship),
+ * not here.
+ */
+export const approveClaimComparisonWithChangesSchema = z
+  .object({
+    aiResultId: z.coerce.number().int().positive(),
+    assessmentIndex: z.coerce.number().int().min(0),
+    otherClaimId: z.coerce.number().int().positive(),
+    relationshipType: z.enum(claimRelationshipTypes),
+    direction: z.enum(directions).optional(),
+    reason: z.string().trim().max(1000).optional(),
+  })
+  .refine(
+    (v) => (["subsumes", "refines"] as const).includes(v.relationshipType as "subsumes" | "refines") === (v.direction !== undefined),
+    {
+      message: "direction is required for 'subsumes'/'refines' and must be absent for the three symmetric relationship types.",
+      path: ["direction"],
+    }
+  );
+
+export const rejectClaimComparisonSchema = z.object({
+  aiResultId: z.coerce.number().int().positive(),
+  assessmentIndex: z.coerce.number().int().min(0),
+  notes: z.string().trim().max(1000).optional(),
+});
+
 export const updateClaimMetadataSchema = z.object({
   claimId: z.coerce.number().int().positive(),
   statement: z.string().trim().min(10).max(2000),

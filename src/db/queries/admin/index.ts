@@ -17,6 +17,8 @@ import {
   aiResults,
   adminDecisions,
   claimProposalReviews,
+  claimRelationships,
+  claimComparisonReviews,
   aiJobs,
   ingestionJobs,
   discoveryProviders,
@@ -902,4 +904,256 @@ export async function listClaimsByTrigramSimilarity(
     LIMIT ${limit}
   `);
   return result.rows;
+}
+
+/* =========================================================================
+ * Phase 5 PR 7: compare_claims relationship-analysis query helpers.
+ * ========================================================================= */
+
+/** The focus claim's own identity for the compare_claims shortlist and approval-time checks -- id, statement (for the AI call/ranking), and projectId (for shortlist scoping and the same-project assertion at approval time). */
+export async function getClaimForComparison(
+  db: DbExecutor,
+  claimId: number
+): Promise<{ id: number; statement: string; projectId: number } | null> {
+  const rows = await db
+    .select({ id: claims.id, statement: claims.statement, projectId: claims.projectId })
+    .from(claims)
+    .where(eq(claims.id, claimId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export interface ComparableClaim {
+  id: number;
+  statement: string;
+}
+
+/**
+ * Shared exclusion rule for all three PR7 shortlist queries below: same
+ * project, not the focus claim itself, and NOT already linked to the
+ * focus claim by any existing claim_relationships row in EITHER
+ * direction (locked decision -- re-analysis/multi-type semantics for an
+ * already-related pair are deferred to a later PR). Expressed once as a
+ * SQL fragment reused by all three queries rather than three
+ * independently-maintained copies of the same predicate.
+ */
+function comparableClaimsPredicate(claimId: number, projectId: number) {
+  return sql`c.project_id = ${projectId}
+    AND c.id <> ${claimId}
+    AND NOT EXISTS (
+      SELECT 1 FROM claim_relationships cr
+      WHERE (cr.claim_id_a = ${claimId} AND cr.claim_id_b = c.id)
+         OR (cr.claim_id_a = c.id AND cr.claim_id_b = ${claimId})
+    )`;
+}
+
+/** How many claims exist that compare_claims could still meaningfully analyse against this focus claim -- the deterministic "is there anything to compare against" fact behind the no_comparable_claims display state. Recomputed fresh on every render; NOT monotonic (see relationshipAnalysisActionability.ts's header). */
+export async function countComparableClaimsForClaim(db: DbExecutor, claimId: number, projectId: number): Promise<number> {
+  const result = await db.execute<{ count: number }>(sql`
+    SELECT count(*)::int AS count
+    FROM claims c
+    WHERE ${comparableClaimsPredicate(claimId, projectId)}
+  `);
+  return result.rows[0]?.count ?? 0;
+}
+
+/** Every comparable claim for a project -- the small-dataset branch of PR7's tiered retrieval (see compareClaimsTrigger.ts for the threshold decision). */
+export async function listComparableClaimsForClaim(db: DbExecutor, claimId: number, projectId: number): Promise<ComparableClaim[]> {
+  const result = await db.execute<{ id: number; statement: string }>(sql`
+    SELECT c.id, c.statement
+    FROM claims c
+    WHERE ${comparableClaimsPredicate(claimId, projectId)}
+    ORDER BY c.id
+  `);
+  return result.rows;
+}
+
+/**
+ * Deterministic lexical pre-filter for the large-dataset branch of PR7's
+ * tiered retrieval -- ranks comparable claims within one project by
+ * pg_trgm similarity to the focus claim's statement and returns at most
+ * `limit` rows. Same extensions.similarity(...) usage and same "no
+ * trigram index backing this in PR7 -- a sequential scan is fast at this
+ * project's current scale" reasoning as listClaimsByTrigramSimilarity
+ * above (PR6). KNOWN, DOCUMENTED LIMITATION (see compareClaimsTrigger.ts
+ * and docs/architecture.md): lexical similarity is a poor proxy for
+ * "contradicts" or abstraction-level "subsumes"/"refines" pairs, which
+ * need not share vocabulary at all. This produces false negatives
+ * (relationships that exist but are never surfaced), never false
+ * positives -- every surfaced recommendation still requires human
+ * approval. Solving this properly needs semantic (embedding-based)
+ * retrieval, which is deliberately out of scope for PR7 and belongs in
+ * the future Autonomous Web Discovery phase, when claim volume makes it
+ * necessary and provides real data to tune it against.
+ */
+export async function listComparableClaimsByTrigramSimilarity(
+  db: DbExecutor,
+  claimId: number,
+  projectId: number,
+  focusStatement: string,
+  limit: number
+): Promise<ComparableClaim[]> {
+  const result = await db.execute<{ id: number; statement: string }>(sql`
+    SELECT c.id, c.statement
+    FROM claims c
+    WHERE ${comparableClaimsPredicate(claimId, projectId)}
+    ORDER BY extensions.similarity(c.statement, ${focusStatement}) DESC
+    LIMIT ${limit}
+  `);
+  return result.rows;
+}
+
+export interface CompareClaimsJobForDisplayRow {
+  id: number;
+  status: "pending" | "running" | "succeeded" | "failed";
+  error: string | null;
+  createdAt: Date;
+  startedAt: Date | null;
+  completedAt: Date | null;
+}
+
+/** The most recent compare_claims ai_jobs row for one focus claim (any status) -- for admin display and for the recovery mutation's staleness check. Distinct from getLatestSuccessfulCompareClaimsResult below, which is succeeded-only and returns parsed assessments, not the raw job row. */
+export async function getLatestCompareClaimsJob(db: DbExecutor, claimId: number): Promise<CompareClaimsJobForDisplayRow | null> {
+  const rows = await db
+    .select({
+      id: aiJobs.id,
+      status: aiJobs.status,
+      error: aiJobs.error,
+      createdAt: aiJobs.createdAt,
+      startedAt: aiJobs.startedAt,
+      completedAt: aiJobs.completedAt,
+    })
+    .from(aiJobs)
+    .where(and(eq(aiJobs.operation, "compare_claims"), eq(aiJobs.comparisonClaimId, claimId)))
+    .orderBy(desc(aiJobs.createdAt))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export interface PersistedComparisonAssessment {
+  otherClaimId: number;
+  relationshipType: string;
+  direction: "focus_to_other" | "other_to_focus" | null;
+  confidence: number;
+  reasoning: string;
+}
+
+export interface LatestCompareClaimsResult {
+  aiResultId: number;
+  assessments: PersistedComparisonAssessment[];
+}
+
+/**
+ * The LATEST SUCCEEDED compare_claims job's persisted assessments for one
+ * focus claim -- same "succeeded-only, ORDER BY completed_at DESC, id
+ * DESC" semantics as getLatestSuccessfulClassifyRelevanceResult /
+ * getLatestDetectDuplicatesMatches, just keyed by comparison_claim_id
+ * instead of source_item_id / the extraction pair. Returns null when no
+ * succeeded analysis has ever completed for this claim -- distinct from
+ * an empty assessments array, which is itself a valid "analysed, no
+ * meaningful relationship found" result.
+ *
+ * Shape-checked defensively (mirroring getLatestDetectDuplicatesMatches)
+ * rather than re-run through compare_claims' own Zod schema
+ * (buildCompareClaimsOutputSchema), since that schema is parameterized
+ * by the exact focus claim + candidate-claim-id set a given call was
+ * offered -- an ephemeral input to that one call, never persisted in its
+ * own right -- which this read has no reason (or ability) to
+ * reconstruct. Approval-time re-verification of one specific assessment
+ * against a tampered/stale form value happens in
+ * claimComparisonReviews.ts's getComparisonAssessment, using this exact
+ * same defensive-parse approach, not a full schema reconstruction.
+ */
+export async function getLatestSuccessfulCompareClaimsResult(
+  db: DbExecutor,
+  claimId: number
+): Promise<LatestCompareClaimsResult | null> {
+  const result = await db.execute<{ id: number; structured_output: unknown }>(sql`
+    SELECT r.id, r.structured_output
+    FROM ai_jobs j
+    JOIN ai_results r ON r.ai_job_id = j.id
+    WHERE j.operation = 'compare_claims'
+      AND j.comparison_claim_id = ${claimId}
+      AND j.status = 'succeeded'
+    ORDER BY j.completed_at DESC, j.id DESC
+    LIMIT 1
+  `);
+
+  const row = result.rows[0];
+  if (!row) return null;
+  const structured = row.structured_output;
+  if (!structured || typeof structured !== "object") return null;
+  const assessmentsField = (structured as { assessments?: unknown }).assessments;
+  if (!Array.isArray(assessmentsField)) return null;
+
+  const assessments = assessmentsField.flatMap((a): PersistedComparisonAssessment[] => {
+    if (
+      !a ||
+      typeof a !== "object" ||
+      typeof (a as { otherClaimId?: unknown }).otherClaimId !== "number" ||
+      typeof (a as { relationshipType?: unknown }).relationshipType !== "string" ||
+      typeof (a as { confidence?: unknown }).confidence !== "number" ||
+      typeof (a as { reasoning?: unknown }).reasoning !== "string"
+    ) {
+      return [];
+    }
+    const rawDirection = (a as { direction?: unknown }).direction;
+    const direction = rawDirection === "focus_to_other" || rawDirection === "other_to_focus" ? rawDirection : null;
+    return [
+      {
+        otherClaimId: (a as { otherClaimId: number }).otherClaimId,
+        relationshipType: (a as { relationshipType: string }).relationshipType,
+        direction,
+        confidence: (a as { confidence: number }).confidence,
+        reasoning: (a as { reasoning: string }).reasoning,
+      },
+    ];
+  });
+
+  return { aiResultId: row.id, assessments };
+}
+
+/** Whether ANY human decision -- approve, edit, or reject -- has already been recorded for this exact compare_claims assessment. Pure fact, no error thrown here; every caller decides its own error for a true result -- same shape as isProposalReviewed above. */
+export async function isComparisonReviewed(db: DbExecutor, aiResultId: number, assessmentIndex: number): Promise<boolean> {
+  const rows = await db
+    .select({ id: claimComparisonReviews.id })
+    .from(claimComparisonReviews)
+    .where(and(eq(claimComparisonReviews.aiResultId, aiResultId), eq(claimComparisonReviews.assessmentIndex, assessmentIndex)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+export interface ComparisonReviewOutcome {
+  assessmentIndex: number;
+  action: string;
+  notes: string | null;
+  approvedClaimIdA: number | null;
+  approvedClaimIdB: number | null;
+  approvedRelationshipType: string | null;
+  materializedRelationshipId: number | null;
+  relationshipWasNewlyCreated: boolean | null;
+}
+
+/** Every recorded review decision for one compare_claims ai_result, for rendering each assessment's outcome (or lack thereof) on the claim detail page. One query per page render, not one per assessment. */
+export async function listComparisonReviewsForResult(db: DbExecutor, aiResultId: number): Promise<ComparisonReviewOutcome[]> {
+  return db
+    .select({
+      assessmentIndex: claimComparisonReviews.assessmentIndex,
+      action: adminDecisions.action,
+      notes: adminDecisions.notes,
+      approvedClaimIdA: claimComparisonReviews.approvedClaimIdA,
+      approvedClaimIdB: claimComparisonReviews.approvedClaimIdB,
+      approvedRelationshipType: claimComparisonReviews.approvedRelationshipType,
+      materializedRelationshipId: claimComparisonReviews.materializedRelationshipId,
+      relationshipWasNewlyCreated: claimComparisonReviews.relationshipWasNewlyCreated,
+    })
+    .from(claimComparisonReviews)
+    .innerJoin(adminDecisions, eq(adminDecisions.id, claimComparisonReviews.adminDecisionId))
+    .where(eq(claimComparisonReviews.aiResultId, aiResultId));
+}
+
+/** Plain existence/statement lookup for resolving otherClaimId -> statement across a small batch of ids (at most COMPARE_CLAIMS_MAX_CANDIDATES) for display -- claims are never hard-deleted in this codebase, so a miss here is defensive, not load-bearing. */
+export async function listClaimsByIds(db: DbExecutor, ids: number[]): Promise<{ id: number; statement: string; slug: string }[]> {
+  if (ids.length === 0) return [];
+  return db.select({ id: claims.id, statement: claims.statement, slug: claims.slug }).from(claims).where(inArray(claims.id, ids));
 }

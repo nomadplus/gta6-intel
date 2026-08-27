@@ -60,6 +60,16 @@ export interface RunAiOperationInput<T> {
   extractionAiResultId?: number | null;
   extractionCandidateIndex?: number | null;
   /**
+   * Phase 5 PR 7: opaque passthrough to ai_jobs.comparison_claim_id,
+   * mirroring extractionAiResultId/extractionCandidateIndex immediately
+   * above -- same "written at pending-job-creation time, since the
+   * in-flight uniqueness guard (migration 0021) checks against it"
+   * reasoning, just scoped to one EXISTING focus claim rather than one
+   * extract_claims candidate. This function has no idea only
+   * compare_claims populates this.
+   */
+  comparisonClaimId?: number | null;
+  /**
    * Explicit metadata passthrough to ai_results.confidence /
    * ai_results.reasoning -- the SAME mechanism as claimId above, not a
    * new one. This function never inspects `outputSchema`'s validated
@@ -139,6 +149,7 @@ export async function runAiOperation<T>(input: RunAiOperationInput<T>): Promise<
     sourceItemId: input.sourceItemId ?? null,
     extractionAiResultId: input.extractionAiResultId ?? null,
     extractionCandidateIndex: input.extractionCandidateIndex ?? null,
+    comparisonClaimId: input.comparisonClaimId ?? null,
   });
 
   // Phase 5 PR 3: the pending-job INSERT itself can be rejected by

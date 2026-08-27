@@ -49,6 +49,17 @@ export interface PendingAiJobInput {
    */
   extractionAiResultId?: number | null;
   extractionCandidateIndex?: number | null;
+  /**
+   * Phase 5 PR 7: opaque passthrough, one level narrower than
+   * sourceItemId -- mirrors the same "populated at PENDING-job-creation
+   * time, since the in-flight partial unique index (migration 0021)
+   * needs it present from the moment the row is inserted" reasoning as
+   * extractionAiResultId/extractionCandidateIndex above, just scoped to
+   * one EXISTING focus claim instead of one extract_claims candidate.
+   * This file remains entirely operation-agnostic: it has no idea this
+   * is used by compare_claims specifically.
+   */
+  comparisonClaimId?: number | null;
 }
 
 export interface PendingAiJobValues {
@@ -60,6 +71,7 @@ export interface PendingAiJobValues {
   sourceItemId: number | null;
   extractionAiResultId: number | null;
   extractionCandidateIndex: number | null;
+  comparisonClaimId: number | null;
 }
 
 /** Section 19 (observability): every field here is exactly what gets persisted -- no defaults are silently applied beyond status itself. */
@@ -73,6 +85,7 @@ export function buildPendingAiJobValues(input: PendingAiJobInput): PendingAiJobV
     sourceItemId: input.sourceItemId ?? null,
     extractionAiResultId: input.extractionAiResultId ?? null,
     extractionCandidateIndex: input.extractionCandidateIndex ?? null,
+    comparisonClaimId: input.comparisonClaimId ?? null,
   };
 }
 

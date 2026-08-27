@@ -243,6 +243,13 @@ export const adminAuditEntityTypeEnum = pgEnum("admin_audit_entity_type", [
   // precise than the parent ai_result: one result can contain several
   // independently approved or rejected candidates.
   "claim_proposal_review",
+  // Added in migration 0020 (Phase 5 PR 7) -- a human decision on one
+  // assessment within a compare_claims result. Same precision reasoning
+  // as claim_proposal_review immediately above: one compare_claims
+  // result can contain several independently approved/rejected/edited
+  // relationship assessments, and admin_decisions.ai_result_id alone
+  // cannot identify which one.
+  "claim_comparison_review",
 ]);
 
 export const adminAuditLog = pgTable("admin_audit_log", {
@@ -689,6 +696,17 @@ export const aiJobs = pgTable(
     // below, not merely by convention.
     extractionAiResultId: integer("extraction_ai_result_id").references((): AnyPgColumn => aiResults.id, { onDelete: "restrict" }),
     extractionCandidateIndex: integer("extraction_candidate_index"),
+    // Added in migration 0021 (Phase 5 PR 7) -- compare_claims' own
+    // scoped identity: one EXISTING claim (the "focus" claim) a
+    // comparison run against a bounded shortlist. Cannot reuse
+    // sourceItemId (a claim comparison has no source item) or the
+    // extraction pair above (it has no extract_claims candidate) --
+    // same "each operation decides its own concurrency semantics"
+    // precedent as PR3/PR6. Populated ONLY for operation =
+    // 'compare_claims', enforced by
+    // compareClaimsOperationConsistency below, not merely by
+    // convention.
+    comparisonClaimId: integer("comparison_claim_id").references(() => claims.id, { onDelete: "restrict" }),
     tokensIn: integer("tokens_in"),
     tokensOut: integer("tokens_out"),
     costEstimateUsd: numeric("cost_estimate_usd", { precision: 10, scale: 6 }),
@@ -732,6 +750,29 @@ export const aiJobs = pgTable(
     detectDuplicatesInflightUnique: uniqueIndex("ai_jobs_detect_duplicates_inflight_unique")
       .on(t.extractionAiResultId, t.extractionCandidateIndex)
       .where(sql`${t.operation} = 'detect_duplicates' AND ${t.status} IN ('pending', 'running')`),
+    // Migration 0021 (Phase 5 PR 7): admin/observability join direction
+    // ("which comparisons targeted this claim") -- distinct from the
+    // in-flight guard below, which is keyed on comparisonClaimId alone
+    // but scoped to pending/running only.
+    comparisonClaimIdx: index("ai_jobs_comparison_claim_idx").on(t.comparisonClaimId),
+    // One combined CHECK enforcing both directions -- same form as
+    // detectDuplicatesOperationConsistency above: operation =
+    // 'compare_claims' REQUIRES comparisonClaimId populated, and every
+    // OTHER operation REQUIRES it null.
+    compareClaimsOperationConsistency: check(
+      "ai_jobs_compare_claims_operation_consistency",
+      sql`(${t.operation} = 'compare_claims' AND ${t.comparisonClaimId} IS NOT NULL)
+          OR (${t.operation} <> 'compare_claims' AND ${t.comparisonClaimId} IS NULL)`
+    ),
+    // compare_claims in-flight guard -- own migration, own operation,
+    // same "each operation decides its own concurrency semantics"
+    // precedent as classifyRelevanceInflightUnique/
+    // detectDuplicatesInflightUnique above. createPendingAiJob()'s
+    // existing generic unique-violation handling covers this
+    // automatically -- no new application code needed.
+    compareClaimsInflightUnique: uniqueIndex("ai_jobs_compare_claims_inflight_unique")
+      .on(t.comparisonClaimId)
+      .where(sql`${t.operation} = 'compare_claims' AND ${t.status} IN ('pending', 'running')`),
   })
 );
 
@@ -781,6 +822,113 @@ export const claimProposalReviews = pgTable(
     oneReviewPerCandidate: uniqueIndex("claim_proposal_reviews_candidate_unique").on(t.aiResultId, t.candidateIndex),
     oneProposalPerDecision: uniqueIndex("claim_proposal_reviews_decision_unique").on(t.adminDecisionId),
     candidateIndexNonnegative: check("claim_proposal_reviews_candidate_index_nonnegative", sql`${t.candidateIndex} >= 0`),
+  })
+);
+
+/* =========================================================================
+ * CLAIM-COMPARISON REVIEW (Phase 5 PR 7)
+ *
+ * `ai_results` stores one compare_claims response, which can contain up to
+ * six assessments against a focus claim's shortlist. An admin_decisions row
+ * alone cannot identify which assessment was approved/edited/rejected --
+ * the identical gap `claim_proposal_reviews` (above) closes for
+ * extract_claims. This append-only bridge gives each assessment a stable
+ * identity: (ai_result_id, assessment_index).
+ *
+ * For an approval or an edited approval, the five approved_* /
+ * materialized_relationship_id / relationship_was_newly_created columns are
+ * an IMMUTABLE SNAPSHOT of the effective claim_relationships row that
+ * resulted -- populated strictly from what insertClaimRelationshipTx
+ * actually returned (i.e. AFTER direction resolution and, for symmetric
+ * types, canonicalization), never from the raw focus/other form
+ * orientation. All five are NULL together for a rejection -- see the
+ * approvalSnapshotComplete CHECK below.
+ *
+ * materializedRelationshipId is deliberately a PLAIN INTEGER, NOT a foreign
+ * key to claim_relationships.id. claim_relationships rows are genuinely
+ * hard-deletable (see deleteClaimRelationship in
+ * src/db/mutations/claimRelationships.ts), unlike claims, which no
+ * application code path ever deletes. Combined with this table's own
+ * immutability trigger below, no FK action on that column is workable:
+ * ON DELETE SET NULL would UPDATE this row, which the trigger rejects,
+ * making the referenced relationship effectively undeletable; ON DELETE
+ * RESTRICT would block a legitimate deletion outright; ON DELETE CASCADE
+ * would destroy the very historical record this table exists to keep. The
+ * general rule: any referential action that MUTATES the referencing row is
+ * incompatible with a row-level immutability trigger -- only NO ACTION /
+ * RESTRICT are compatible, and RESTRICT is unacceptable here on product
+ * grounds. The INTEGRITY TRADE-OFF this accepts: after the referenced
+ * relationship is deleted, this column becomes a dangling id with no
+ * database-enforced integrity. That is acceptable because (a) the four
+ * approved_* columns beside it are a COMPLETE, self-describing snapshot
+ * that needs no dereference to remain meaningful, (b) Postgres serial
+ * sequences never reuse a value, so a dangling id can never silently
+ * resolve to a DIFFERENT relationship, and (c) the deletion itself remains
+ * fully audited via admin_audit_log. Any reader joining on this column
+ * must tolerate a miss.
+ *
+ * approvedClaimIdA/B ARE plain FKs to claims.id -- safe, since no
+ * application code path hard-deletes a claim (confirmed by inspection),
+ * and the default NO ACTION would BLOCK such a deletion rather than
+ * mutating this row, which IS compatible with the immutability trigger.
+ * ========================================================================= */
+export const claimComparisonReviews = pgTable(
+  "claim_comparison_reviews",
+  {
+    id: serial("id").primaryKey(),
+    aiResultId: integer("ai_result_id").notNull().references(() => aiResults.id),
+    assessmentIndex: integer("assessment_index").notNull(),
+    adminDecisionId: integer("admin_decision_id").notNull().references(() => adminDecisions.id),
+    // Approval-only immutable snapshot -- see header comment. All five
+    // columns below are NULL together for a rejection.
+    approvedClaimIdA: integer("approved_claim_id_a").references(() => claims.id),
+    approvedClaimIdB: integer("approved_claim_id_b").references(() => claims.id),
+    approvedRelationshipType: claimRelationshipTypeEnum("approved_relationship_type"),
+    // Deliberately NOT a foreign key -- see header comment.
+    materializedRelationshipId: integer("materialized_relationship_id"),
+    relationshipWasNewlyCreated: boolean("relationship_was_newly_created"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    oneReviewPerAssessment: uniqueIndex("claim_comparison_reviews_assessment_unique").on(t.aiResultId, t.assessmentIndex),
+    oneComparisonPerDecision: uniqueIndex("claim_comparison_reviews_decision_unique").on(t.adminDecisionId),
+    materializedRelationshipIdx: index("claim_comparison_reviews_materialized_relationship_idx").on(t.materializedRelationshipId),
+    assessmentIndexNonnegative: check("claim_comparison_reviews_assessment_index_nonnegative", sql`${t.assessmentIndex} >= 0`),
+    // All-or-nothing: an approval carries a complete snapshot, a rejection
+    // carries none of it. No partial states.
+    approvalSnapshotComplete: check(
+      "claim_comparison_reviews_approval_snapshot_complete",
+      sql`(
+            ${t.approvedClaimIdA} IS NULL AND ${t.approvedClaimIdB} IS NULL
+            AND ${t.approvedRelationshipType} IS NULL
+            AND ${t.materializedRelationshipId} IS NULL
+            AND ${t.relationshipWasNewlyCreated} IS NULL
+          )
+          OR
+          (
+            ${t.approvedClaimIdA} IS NOT NULL AND ${t.approvedClaimIdB} IS NOT NULL
+            AND ${t.approvedRelationshipType} IS NOT NULL
+            AND ${t.materializedRelationshipId} IS NOT NULL
+            AND ${t.relationshipWasNewlyCreated} IS NOT NULL
+          )`
+    ),
+    // Mirrors claim_relationships_no_self_link.
+    snapshotNoSelfLink: check(
+      "claim_comparison_reviews_snapshot_no_self_link",
+      sql`${t.approvedClaimIdA} IS NULL OR ${t.approvedClaimIdA} <> ${t.approvedClaimIdB}`
+    ),
+    // The snapshot must be the EFFECTIVE canonical form, not raw
+    // focus/other orientation: for the three symmetric types,
+    // claim_relationships stores the lower id as claim_id_a (see
+    // src/lib/relationshipCanonicalization.ts), so this snapshot must
+    // too. Directional types (subsumes, refines) are exempt -- their
+    // ordering carries meaning and is stored exactly as resolved.
+    symmetricSnapshotCanonical: check(
+      "claim_comparison_reviews_symmetric_snapshot_canonical",
+      sql`${t.approvedRelationshipType} IS NULL
+          OR ${t.approvedRelationshipType} NOT IN ('equivalent', 'related', 'contradicts')
+          OR ${t.approvedClaimIdA} < ${t.approvedClaimIdB}`
+    ),
   })
 );
 
