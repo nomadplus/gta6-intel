@@ -674,6 +674,269 @@ concurrent use-existing attempts) always resolve to exactly one winner,
 with the loser's entire transaction — including any source link it had
 just inserted — rolled back atomically.
 
+### Claim relationship analysis (Phase 5 PR 7)
+
+`compare_claims` compares one **existing** "focus" claim against a bounded
+shortlist of other existing claims in the same project and recommends
+whether any of them stands in one of the five `claim_relationships` types
+to it — `equivalent`, `subsumes`, `refines`, `contradicts`, `related`.
+This is deliberately **not** `detect_duplicates`: PR6 answers "does this
+just-extracted, unreviewed candidate already exist as a claim"; PR7
+answers "how do these two already-tracked claims relate to each other."
+One call compares the focus claim against its whole shortlist and returns
+zero-to-several assessments — never one call per pair, which is what
+keeps the cost model flat regardless of how large the claims table grows
+(see "Retrieval" below). Assessments are **positive-only**: the model
+reports a claim only when it found a genuine relationship, with an
+optional `noRelationshipNote` when it explicitly found none; there is no
+per-candidate "none" verdict, which would roughly double worst-case
+output size for no real benefit.
+
+**Directional semantics.** `equivalent`, `contradicts`, and `related` are
+symmetric and carry no `direction` field — canonicalized at write time
+exactly like PR6's manual relationship form (lower numeric claim id
+always stored as `claim_id_a`). `subsumes` and `refines` are directional
+and **require** a `direction` field: `"focus_to_other"` means the focus
+claim does the subsuming/refining; `"other_to_focus"` means the other
+claim does. This is enforced structurally, not just by prompt wording —
+`buildCompareClaimsOutputSchema`'s `superRefine` (in `compareClaims.ts`)
+rejects a `direction` on any symmetric type and requires one on either
+directional type, importing the same `DIRECTIONAL_RELATIONSHIP_TYPES` set
+`relationshipCanonicalization.ts` already uses for the write path, so the
+schema and the eventual database write can never silently disagree about
+which types are directional.
+
+**AI never automatically mutates the claim graph.** Like every other AI
+operation in this project, `compareClaims()`/`compareClaimsTrigger.ts`
+never write to `claim_relationships`, `claims`, or either status-history
+ledger. The only path from a recommendation to an actual
+`claim_relationships` row is an admin's explicit approval — approve
+as-proposed or approve-with-changes — via
+`claimComparisonReviews.ts`; a rejected or never-reviewed assessment
+leaves the claim graph completely untouched. The audit chain is `ai_jobs`
+(the provider call and its cost/token accounting) → `ai_results` (the
+persisted structured output, all assessments for that call) →
+`admin_decisions` (the human's approve/edit/reject verdict) →
+`claim_comparison_reviews` (the append-only bridge tying one specific
+assessment within that result to that decision, plus — for an approval —
+an immutable snapshot of the relationship that resulted). This mirrors
+`claim_proposal_reviews`' role for PR5 exactly: `admin_decisions.
+ai_result_id` identifies a whole result, not one assessment within it, so
+a dedicated bridge is what makes "which of the up-to-six assessments was
+this decision about" answerable at all.
+
+**Focus-claim identity and eligibility.** Unlike PR6's candidate identity
+`(extraction_ai_result_id, extraction_candidate_index)`, PR7 is scoped to
+one **existing claim**: `ai_jobs.comparison_claim_id` (migration `0021`),
+populated only for `operation = 'compare_claims'` and enforced both
+directions by one combined `CHECK` constraint
+(`ai_jobs_compare_claims_operation_consistency`), the same "populated iff
+this operation, null otherwise" shape as PR6's own consistency check. A
+partial unique index on that column, scoped to `pending`/`running` rows,
+is the in-flight concurrency guard, requiring no new application code
+beyond `createPendingAiJob()`'s existing generic unique-violation
+handling. Because the `compare_claims` enum value had already been used
+as an arbitrary, unconstrained fixture value by
+`aiRunOperation.check.ts` prior to this PR, migration `0021` opens with an
+explicit pre-flight `DO` block that counts any pre-existing
+`ai_jobs` row with `operation = 'compare_claims'` and raises with an
+actionable message rather than failing on an opaque constraint violation
+if one is found; that check's own fixture was swapped to the operation
+`embed` for exactly this reason (see that file's own header comment).
+
+**Retrieval is project-scoped, tiered, and cost-bounded** — and, unlike
+PR6, **genuinely** project-aware rather than hardcoded: the shortlist is
+scoped by the focus claim's own `claims.projectId`, read from the
+database, with no equivalent of PR6's
+`DUPLICATE_CHECK_DEFAULT_PROJECT_ID` literal anywhere in this operation.
+The shortlist always excludes the focus claim itself and any other claim
+already linked to it by an existing `claim_relationships` row in
+**either** direction — a settled pair does not need AI re-analysis (PR7
+does not yet support multi-type relationships between the same pair or
+re-analysis semantics; that is deferred). At or below
+`COMPARE_CLAIMS_ALL_CLAIMS_THRESHOLD`/`COMPARE_CLAIMS_MAX_CANDIDATES`
+(12) comparable claims, every one of them is sent to the model; above
+that, they are ranked by `pg_trgm` lexical similarity
+(`extensions.similarity(...)`, the same `pg_trgm` extension migration
+`0017` enabled for PR6) and only the top 12 are sent. Unlike PR6, this
+single constant bounds **both** the input size and the worst-case output
+size — a `compare_claims` call's output scales with how many candidates
+it was offered, unlike `detect_duplicates`' fixed-size `matches` array, so
+one shared cap does both jobs here where PR6 used two separate constants
+(`..._ALL_CLAIMS_THRESHOLD` for input, `..._PREFILTER_LIMIT` for a
+different input concern). If the shortlist is empty, **no `ai_jobs` row
+is created and no provider is called** — `triggerCompareClaims` returns a
+distinct `no_comparable_claims` outcome, the same "ineligible, stop
+before any job row exists" shape PR6's `no_existing_claims` outcome uses.
+
+**IMPORTANT, known and accepted retrieval limitation: above the
+threshold, ranking is purely LEXICAL, not semantic.** A near-duplicate (PR6's
+concern) almost always shares vocabulary with the claim it duplicates, so
+lexical ranking is a reasonable proxy there. A genuine **contradiction**
+need not share vocabulary at all — "the protagonist duo splits partway
+through the story" and "Lucia and Jason remain playable together for the
+entire campaign" directly contradict each other with minimal trigram
+overlap, and the second would not be shortlisted for the first once a
+project exceeds 12 claims. The same applies to `subsumes`/`refines` pairs
+phrased at very different levels of abstraction, and to `related` pairs
+that describe the same underlying topic in unrelated vocabulary. The
+consequence is **false negatives only** — a real relationship that is
+never surfaced — **never false positives**, since every surfaced
+recommendation still requires human approval before it can affect the
+claim graph; a small or empty `assessments` array is therefore not proof
+that a claim has no relationships. PR7 deliberately does **not** attempt
+to solve this with embeddings: `ai_operation` already carries an unused
+`embed` value, and semantic retrieval is properly scoped to the future
+Autonomous Web Discovery phase, when claim volume actually makes it
+necessary and provides real data to tune it against — adding a `pg_trgm`
+index or an embedding-based retrieval path now, on a table with double-
+digit rows, would be premature optimization.
+
+**AI output contract.** The output schema (`buildCompareClaimsOutputSchema`
+in `compareClaims.ts`) is parameterized, per call, by the exact focus
+claim and candidate-claim-id set actually offered — mirroring PR6's own
+"schema built fresh from the real input" pattern. A returned
+`otherClaimId` outside that exact set, or equal to the focus claim's own
+id, fails Zod validation inside the provider before `runAiOperation` ever
+returns success, surfacing as a normal `invalid_structured_output`
+failure with zero `ai_results` rows. At most `MAX_COMPARE_CLAIMS_
+ASSESSMENTS` (6) assessments are returned, each with a `relationshipType`,
+an optional `direction` (required iff directional), a `confidence`
+(0–1), and bounded `reasoning`; duplicate `otherClaimId` values within one
+result are rejected. `COMPARE_CLAIMS_MAX_OUTPUT_TOKENS` (1,280) is
+derived directly from this schema's own worst-case size (six assessments
+at their maximum field lengths), the same justification style
+`EXTRACT_CLAIMS_MAX_OUTPUT_TOKENS`/`DETECT_DUPLICATES_MAX_OUTPUT_TOKENS`
+used. The prompt defines each of the five relationship types precisely
+(in particular the `subsumes`/`refines` distinction and that
+`contradicts` means the propositions cannot both be true, not merely that
+they come from rival outlets) and explicitly instructs that returning
+nothing is a normal, valid outcome — never force a weak `related` link to
+fill the array.
+
+**Display and recovery.** A focus claim's relationship-analysis status is
+one of **six** display states, not the usual five: the shared job-status
+five (`not_analysed`/`in_progress`/`stale`/`failed`/`succeeded`, this
+operation's own vocabulary for the generic `missing` state used by every
+sibling operation) plus a sixth, `no_comparable_claims`, computed
+independently of job history from whether any comparable claim currently
+exists at all (`relationshipAnalysisActionability.ts`). Exactly three
+states are actionable — `not_analysed` ("Analyse relationships"), `stale`
+("Recover"), `failed` ("Retry") — mirroring PR6's own three-of-six
+actionable pattern. **`succeeded` offers no re-analysis action in this
+PR** — a locked, deliberate restraint identical to PR6's own restraint
+for `detect_duplicates`; graph-change-aware re-analysis (re-running a
+comparison as new claims enter a project) is deferred to a later PR, once
+Autonomous Web Discovery increases claim volume enough to make it a real
+question. Recovery (`compareClaimsRecovery.ts`) mirrors
+`detectDuplicatesRecovery.ts` exactly — the same plain, blocking `FOR
+UPDATE` targeted-row lock (never `SKIP LOCKED`) — and, like every
+trigger/recovery action in this project, writes **no** `admin_audit_log`
+entries; only the eventual human review decision on a specific assessment
+is audited.
+
+**Review: approve, approve-with-changes, reject, and idempotent reuse.**
+`claimComparisonReviews.ts` re-reads and re-validates the persisted
+assessment on every review action — only the `otherClaimId` is accepted
+from the browser, and purely as a tamper-check lookup key confirmed
+against this exact assessment's own persisted output before anything is
+written. Approval resolves the raw `(claimIdA, claimIdB)` orientation
+from the focus claim, the other claim, and the assessment's direction,
+then calls `insertClaimRelationshipTx` — a transaction-scoped primitive
+extracted from `createClaimRelationship`
+(`claimRelationships.ts`, this PR's one targeted refactor of existing
+code; `createClaimRelationship`'s own public behavior, including throwing
+`DuplicateRelationshipError`, is unchanged) — which applies
+`canonicalizeClaimRelationshipPair()` and uses `INSERT ... ON CONFLICT DO
+NOTHING` rather than a caught unique-violation exception, for the same
+reason `insertClaimSourceLinkTx` does: a caught exception mid-transaction
+would poison the rest of that Postgres transaction, and this approval has
+further writes to make afterward. If the resolved relationship **already
+exists**, the existing row is reused untouched — its own `confidence` and
+`created_by` are never overwritten — and the bridge records
+`relationship_was_newly_created = false`; **no** `create`/
+`claim_relationship` audit entry is emitted for a reused relationship,
+since nothing was actually created, while the `create`/
+`claim_comparison_review` audit entry recording the human decision itself
+is still written unconditionally. A genuinely new relationship gets both
+entries. `claim_relationships.created_by` is always `'human'` for an
+approved recommendation — the AI's own provenance is fully preserved via
+`ai_jobs` → `ai_results` → `admin_decisions` → `claim_comparison_reviews`,
+but the effective graph mutation only ever happens because a human
+approved it. Approve-with-changes lets the admin override the
+`relationshipType`/`direction` (never the counterparty claim — retargeting
+at a different claim is a new relationship, and belongs in the existing
+manual "Related Claims" form) and records `admin_decisions.action =
+'edit'` instead of `'approve'`, so the audit trail distinguishes "the AI
+was right" from "the AI was close." Rejection records a decision and a
+bridge row with all five snapshot columns `NULL`, and creates zero
+`claim_relationships` rows. The bridge's own unique index on
+`(ai_result_id, assessment_index)` is the race barrier: two concurrent
+reviews of the same assessment always resolve to exactly one winner, with
+the loser's entire transaction — including any relationship row it had
+just inserted — rolled back atomically.
+
+**Immutable snapshot semantics.** `claim_comparison_reviews`
+(migration `0022`) is append-only, protected by the same `reject_
+status_history_mutation()` trigger every other immutable ledger in this
+project uses. For an approval, its `approved_claim_id_a`/
+`approved_claim_id_b`/`approved_relationship_type` columns are populated
+strictly from the row `insertClaimRelationshipTx` **actually returned** —
+after direction resolution and, for symmetric types, canonicalization —
+never from the raw pre-resolution focus/other orientation; a database
+`CHECK` (`claim_comparison_reviews_symmetric_snapshot_canonical`)
+independently enforces that the stored snapshot is canonical for the
+three symmetric types, rather than trusting application code to have done
+it correctly. `materialized_relationship_id` is deliberately a **plain
+integer, not a foreign key** to `claim_relationships.id`. Unlike claims
+(never hard-deleted anywhere in this codebase, confirmed by direct
+inspection), `claim_relationships` rows genuinely are deletable
+(`deleteClaimRelationship`), and combined with this table's own
+immutability trigger, no FK action is workable: `ON DELETE SET NULL`
+would *update* this row, which the trigger rejects, making the
+relationship effectively undeletable; `ON DELETE RESTRICT` would block a
+legitimate deletion outright; `ON DELETE CASCADE` would destroy the very
+historical record this table exists to keep. The accepted trade-off: a
+deleted relationship leaves this column as a harmless dangling id — never
+misleading, since Postgres serial sequences never reuse a value, and the
+deletion itself remains fully audited via `admin_audit_log` — while the
+four columns beside it are a complete, self-describing snapshot that
+needs no dereference to remain meaningful on its own.
+
+**Directional relationship display fix (in-scope prerequisite).** PR7
+also fixes a pre-existing defect: `getRelatedClaims`
+(`src/db/queries/claimDetail.ts`) matched a `claim_relationships` row for
+the viewed claim without indicating which side of the stored
+`(claim_id_a, claim_id_b)` pair it occupied, and neither the admin claim
+page nor the public `RelatedClaims` component accounted for that side —
+so roughly half of all directional (`subsumes`/`refines`) relationships
+displayed with their meaning **inverted**, and the two consumers
+additionally disagreed with each other (the public component always
+rendered `refines` in the passive voice; the admin page always rendered
+the raw enum value). `getRelatedClaims` now returns a `viewedClaimIsA`
+flag per row, and both consumers call one shared pure function,
+`relatedClaimLabel()` (`src/lib/relationshipDisplay.ts`), instead of
+maintaining two independent label maps that could disagree again.
+
+**Forward compatibility with Autonomous Web Discovery.** Four choices in
+this PR are deliberate preparation for that future phase: (1) no
+hardcoded project id anywhere in this operation (unlike PR6's
+`DUPLICATE_CHECK_DEFAULT_PROJECT_ID`), so higher claim volume across a
+genuinely multi-project future needs no rework here; (2)
+`triggerCompareClaims`'s provider and shortlist bounds are injectable
+parameters with server-side defaults, exactly like PR6's own trigger, so
+a future batch worker can call the same trigger with its own values
+without a rewrite; (3) the in-flight guard is scoped to one focus claim,
+not a session or admin, so a future batch worker can hold `FOR UPDATE
+SKIP LOCKED` over many focus claims concurrently without touching this
+PR's own per-claim blocking recovery mutation, preserving the "`SKIP
+LOCKED` is for batch workers only" convention rather than pre-empting it;
+(4) the bridge's identity is `(ai_result_id, assessment_index)`, not
+`(claim_a, claim_b)`, so when discovery repeatedly resurfaces a topic and
+the same pair is analysed again months later, each recommendation stays
+independently identifiable and independently auditable rather than
+collapsing into one pair-keyed history.
+
 ### Status history (the two append-only ledgers)
 
 `claim_investigation_status_history` and
