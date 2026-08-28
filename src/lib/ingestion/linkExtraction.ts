@@ -60,6 +60,9 @@ const MAX_PLACEMENT_ANCESTOR_DEPTH = 25;
 /** How many levels the context-snippet walk will climb looking for non-trivial sibling text, if the anchor's immediate parent has none. */
 const MAX_CONTEXT_ANCESTOR_DEPTH = 3;
 
+/** How many ancestor levels ABOVE the anchor the narrow skip-link class/id signal (see hasSkipLinkClassIdSignal) will also check, in addition to the anchor itself. Deliberately small and separate from MAX_PLACEMENT_ANCESTOR_DEPTH -- this is a dedicated, narrowly-scoped pre-check, not a broadening of the generic ancestor-based placement walk. */
+const MAX_SKIP_LINK_ANCESTOR_DEPTH = 3;
+
 export type LinkPlacement = "content" | "chrome" | "ambiguous";
 
 export interface ExtractedLink {
@@ -160,6 +163,235 @@ function hasAny(tokens: Set<string>, candidates: ReadonlySet<string>): boolean {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Structural non-visible exclusion (production defect fix, ef905bb030fec6b
+// follow-up). node-html-parser's own text getters (.text/.rawText) do NOT
+// distinguish rendered visible text from the raw contents of <script>/
+// <style> -- both are walked and concatenated identically to ordinary
+// prose. This is the confirmed root cause of CSS/JS leaking into
+// anchorText/contextSnippet. This exclusion set is deliberately narrow and
+// purely structural -- no computed CSS visibility, no stylesheet parsing,
+// no display:none/visibility:hidden inference, per the locked scope for
+// this fix. <template> is included because its contents were never parsed
+// as live/rendered DOM by a real browser at all (node-html-parser's DOM
+// model does not honor <template>'s inert-content semantics -- a nested
+// <a> inside a <template> is otherwise indistinguishable from a real,
+// encountered link). `hidden` (any value, including "until-found") is a
+// structurally obvious boolean attribute requiring no CSS interpretation.
+//
+// aria-hidden="true" is DELIBERATELY NOT part of this exclusion set:
+// aria-hidden removes content from the ACCESSIBILITY TREE (screen readers),
+// it does not mean the content is visually/rendered-page hidden. This
+// extractor records rendered/page-visible provenance evidence, not
+// accessibility-tree membership -- a link or text that is fully visible on
+// the rendered page but merely marked aria-hidden="true" (e.g. a
+// decorative icon-duplicate pattern) must not be excluded or discarded on
+// that basis alone.
+// ---------------------------------------------------------------------------
+
+const NON_VISIBLE_TAGS = new Set(["script", "style", "noscript", "template"]);
+
+function isNonVisibleElement(el: HTMLElement): boolean {
+  const tag = el.tagName ? el.tagName.toLowerCase() : "";
+  if (NON_VISIBLE_TAGS.has(tag)) return true;
+  if (el.getAttribute("hidden") !== undefined) return true;
+  return false;
+}
+
+/**
+ * Concatenates only text that would actually be visible on the rendered
+ * page -- skips (does not descend into) any subtree rooted at a
+ * non-visible element per isNonVisibleElement(). Used for BOTH anchorText
+ * (called on the anchor itself) and contextSnippet's sibling walk (called
+ * on each sibling node) -- one shared helper, one shared rule, no
+ * divergence between the two call sites that let the original defect slip
+ * through only one of them.
+ *
+ * ITERATIVE, not recursive -- an explicit heap-allocated stack, not the
+ * JavaScript call stack, so arbitrarily deep/pathological nesting cannot
+ * overflow the call stack. There is deliberately NO depth cutoff: legitimate
+ * visible text nested at any depth is still collected in full -- silently
+ * dropping deeply-nested real text would itself be a form of the same
+ * "visible content missing from evidence" defect this fix exists to close.
+ * Only structurally EXCLUDED subtrees (script/style/noscript/template/
+ * hidden) are ever skipped; ordinary depth is never a reason to stop
+ * collecting.
+ *
+ * Children are pushed onto the stack in reverse order so that popping
+ * yields them in true document order -- this preserves both text-node
+ * ordering and (via the caller's existing collapseWhitespace()) whitespace
+ * normalization exactly as before; this function still returns raw,
+ * unnormalized text, same contract as the nodeText() it replaces.
+ *
+ * Deliberately manual traversal rather than relying on node-html-parser's
+ * own .text/.rawText getters, which do not perform this exclusion (see the
+ * section header above) -- this function IS the fix.
+ */
+function visibleText(root: Node): string {
+  let out = "";
+  const stack: Node[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (node.nodeType === NodeType.TEXT_NODE) {
+      // .text on a TextNode is its own decoded/unescaped value (e.g. "&amp;"
+      // -> "&") -- this is a LEAF node with no descendants, so this is not
+      // the same unsafe operation as calling .text on an ELEMENT (which
+      // would recursively pull in descendant script/style content, the
+      // root cause this fix closes). .rawText here would leave HTML
+      // entities encoded, a behavior regression vs. the original
+      // anchor.text call this replaces.
+      out += (node as unknown as { text?: string }).text ?? "";
+      continue;
+    }
+    if (node.nodeType !== NodeType.ELEMENT_NODE) continue;
+    const el = node as HTMLElement;
+    if (isNonVisibleElement(el)) continue; // skip the ENTIRE excluded subtree -- its children are never pushed
+    const children = el.childNodes as Node[];
+    for (let i = children.length - 1; i >= 0; i--) {
+      stack.push(children[i]);
+    }
+  }
+  return out;
+}
+
+/**
+ * True if the anchor ITSELF (not merely some unrelated descendant) sits
+ * inside a non-visible subtree -- i.e. the <a> or one of its ancestors is a
+ * <script>/<style>/<noscript>/<template>, or carries `hidden`. Per the
+ * locked decision: such a link is discarded as an OBSERVATION entirely
+ * (never staged, regardless of its target URL), not merely stripped of
+ * text -- a link no reader ever actually encountered must not be allowed
+ * to influence provenance evidence just because its target URL happens to
+ * survive. <template> content in particular was never live DOM in any
+ * real browser; `hidden` content IS live DOM but was never shown/exposed,
+ * which is exactly the same "never assume untrusted external content is
+ * what it claims" caution this project already applies elsewhere (Section
+ * 13). If the SAME target URL also appears via a genuinely visible
+ * occurrence elsewhere on the page, that occurrence is captured
+ * independently as its own row (duplicate targets are already supported)
+ * -- discarding the hidden occurrence does not erase real evidence that
+ * exists elsewhere.
+ *
+ * aria-hidden="true" is deliberately NOT part of this check -- see
+ * isNonVisibleElement's header for why (accessibility-tree membership,
+ * not rendered/page visibility).
+ *
+ * UNBOUNDED by design -- this is a correctness boundary, not a heuristic,
+ * and deliberately does NOT reuse MAX_PLACEMENT_ANCESTOR_DEPTH (or any
+ * other artificial depth cap): an anchor must not escape discard merely
+ * because its hidden/template ancestor happens to sit more than N levels
+ * above it. A plain parent-pointer walk to the document root is used --
+ * not recursive, so it carries no call-stack-overflow risk regardless of
+ * nesting depth. (The generic placement heuristic's own
+ * MAX_PLACEMENT_ANCESTOR_DEPTH bound is a separate, unrelated concept --
+ * a tuned content-classification heuristic that may legitimately give up
+ * and return "ambiguous" past a certain depth -- and is untouched by this
+ * fix.)
+ */
+function isWithinNonVisibleSubtree(anchor: HTMLElement): boolean {
+  let current: HTMLElement | null = anchor;
+  while (current) {
+    if (isNonVisibleElement(current)) return true;
+    current = current.parentNode as HTMLElement | null;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Skip-link chrome signal (production defect fix). Two INDEPENDENT, narrow
+// signals -- neither broadens the generic ancestor-based placement walk
+// below, which remains byte-for-byte unchanged. Either signal firing
+// resolves directly to "chrome", bypassing the generic walk entirely for
+// that anchor.
+// ---------------------------------------------------------------------------
+
+/**
+ * Class/id co-occurrence signal: fires only when an element's tokens
+ * contain BOTH "skip" AND at least one qualifier from this small,
+ * deliberately non-broad set. A bare "skip" token alone (e.g. a video
+ * player's "skip-intro"/"skip-ad" button) never matches -- co-occurrence
+ * with a nav/link/content/main-adjacent qualifier is required. This is
+ * NOT folded into CHROME_CLASS_ID_TOKENS/CONTENT_CLASS_ID_TOKENS: doing so
+ * would have been actively wrong, since tokenizeClassOrId() always
+ * fragments a hyphenated class like "skip-to-content" into ["skip","to",
+ * "content"] -- the "content" fragment would then ALSO match
+ * CONTENT_CLASS_ID_TOKENS, and the existing (deliberate) "both chrome and
+ * content matched -> ambiguous" collision rule would produce "ambiguous",
+ * not "chrome", for exactly the case this fix targets. This dedicated
+ * check is evaluated BEFORE classifyPlacementGeneric specifically so it is
+ * never subject to that collision rule.
+ */
+function hasSkipLinkClassIdSignal(el: HTMLElement): boolean {
+  const tokens = ancestorTokens(el);
+  return tokens.has("skip") && hasAny(tokens, SKIP_LINK_QUALIFIER_TOKENS);
+}
+
+const SKIP_LINK_QUALIFIER_TOKENS = new Set(["link", "nav", "content", "main"]);
+
+/**
+ * Checks the above class/id signal on the anchor itself, then a few
+ * ancestor levels above it (real-world skip-link markup places the class
+ * on either the <a> or a small wrapper around it) -- but ONLY for this
+ * same narrow signal, never the generic CHROME_CLASS_ID_TOKENS/
+ * CONTENT_CLASS_ID_TOKENS sets. This does NOT make ordinary anchor class/id
+ * attributes participate in generic placement classification: an anchor
+ * whose own class is, say, "content-box" or "site-nav" (no "skip" token)
+ * is invisible to this function and falls through to the unchanged
+ * classifyPlacementGeneric ancestor walk exactly as before.
+ */
+function hasSkipLinkClassIdSignalOnAnchorOrNearAncestors(anchor: HTMLElement): boolean {
+  if (hasSkipLinkClassIdSignal(anchor)) return true;
+  let current: HTMLElement | null = anchor.parentNode as HTMLElement | null;
+  let depth = 0;
+  while (current && depth < MAX_SKIP_LINK_ANCESTOR_DEPTH) {
+    if (hasSkipLinkClassIdSignal(current)) return true;
+    current = current.parentNode as HTMLElement | null;
+    depth++;
+  }
+  return false;
+}
+
+/**
+ * Closed, exact-match (never substring/fuzzy) set of near-universal
+ * accessibility skip-link phrases. Deliberately small; do not broaden
+ * without an actually-observed, approved case -- same "extend only when
+ * genuinely needed" philosophy already locked for CHROME_CLASS_ID_TOKENS.
+ */
+const SKIP_LINK_PHRASES = new Set(["skip to content", "skip to main content", "skip navigation", "skip to main"]);
+
+/**
+ * Semantic skip-link signal: fires only when BOTH (a) the raw href is a
+ * bare same-document fragment reference (begins with "#") and (b) the
+ * CLEANED, visibleText()-derived, whitespace-normalized anchor text is an
+ * EXACT (not substring) match against SKIP_LINK_PHRASES. This is the
+ * signal that actually classifies the production Take-Two row: that site's
+ * CSS-in-JS generated class names ("css-1xjj904" etc.) carry no semantic
+ * tokens at all, so hasSkipLinkClassIdSignal never fires for it -- but its
+ * href/text are untouched by class-name churn.
+ *
+ * Requiring BOTH conditions (not either alone) is deliberately
+ * conservative: an ordinary in-article anchor whose text happens to equal
+ * one of these phrases but points to a real, different target (fragment
+ * NOT matching "#...") does not fire; an ordinary same-page fragment link
+ * whose href matches but whose text is unrelated (e.g. href="#specifications"
+ * text="Specifications") does not fire either.
+ *
+ * `rawHref` is used only transiently for this boolean check -- never
+ * persisted, per the existing (unchanged) rule against a durable raw_href
+ * column/field.
+ *
+ * The anchor text passed in MUST be the already-visibleText()-cleaned
+ * value (never anchor.text / raw DOM text) -- the production bug is CSS
+ * leaking INTO the anchor's own text, so matching against contaminated raw
+ * text would have prevented "Skip to Content" from ever matching.
+ */
+function isSemanticSkipLinkSignal(rawHref: string, cleanedAnchorText: string | null): boolean {
+  if (!cleanedAnchorText) return false;
+  if (!/^#/.test(rawHref.trim())) return false;
+  const normalized = collapseWhitespace(cleanedAnchorText).toLowerCase();
+  return SKIP_LINK_PHRASES.has(normalized);
+}
+
 /**
  * Walks ancestors nearest-first, looking for the first one that gives a
  * confident structural signal. A single ancestor matching BOTH chrome and
@@ -170,8 +402,15 @@ function hasAny(tokens: Set<string>, candidates: ReadonlySet<string>): boolean {
  * either, falls back to: is the nearest containing block a <p> that never
  * passed through a chrome ancestor on the way here? -> "content". Anything
  * else -> "ambiguous".
+ *
+ * UNCHANGED by the skip-link production fix below -- still ancestor-only
+ * (starts at anchor.parentNode, never the anchor's own class/id), still the
+ * same tag sets/token sets/ambiguous-collision rule. classifyPlacement()
+ * (the public entry point, defined below) checks the two narrow skip-link
+ * signals first and only falls through to this function when neither
+ * fires.
  */
-function classifyPlacement(anchor: HTMLElement): LinkPlacement {
+function classifyPlacementGeneric(anchor: HTMLElement): LinkPlacement {
   let current: HTMLElement | null = anchor.parentNode as HTMLElement | null;
   let depth = 0;
   let sawParagraph = false;
@@ -204,6 +443,25 @@ function classifyPlacement(anchor: HTMLElement): LinkPlacement {
   return sawParagraph ? "content" : "ambiguous";
 }
 
+/**
+ * Public placement entry point. Checks the two narrow, independent
+ * skip-link signals first (class/id co-occurrence on the anchor or a few
+ * near ancestors; semantic href-fragment + exact accessibility phrase) --
+ * if either fires, returns "chrome" immediately, WITHOUT running
+ * classifyPlacementGeneric at all. This ordering is what keeps the
+ * skip-link fix from ever being defeated by the generic ambiguous
+ * chrome+content collision rule (see hasSkipLinkClassIdSignal's header for
+ * why that collision would otherwise misfire on classes like
+ * "skip-to-content"). Otherwise, delegates entirely to the unmodified
+ * generic ancestor walk.
+ */
+function classifyPlacement(anchor: HTMLElement, rawHref: string, cleanedAnchorText: string | null): LinkPlacement {
+  if (hasSkipLinkClassIdSignalOnAnchorOrNearAncestors(anchor) || isSemanticSkipLinkSignal(rawHref, cleanedAnchorText)) {
+    return "chrome";
+  }
+  return classifyPlacementGeneric(anchor);
+}
+
 // ---------------------------------------------------------------------------
 // Context snippet -- built from DOM SIBLING structure, not text-substring
 // search. This is deliberate: a substring search for the anchor's own text
@@ -231,13 +489,6 @@ function truncateWordBoundary(value: string, maxLength: number): string {
 
   return safeCut.trimEnd() + ellipsis;
 }
-function nodeText(node: Node): string {
-  const el = node as HTMLElement;
-  if (typeof el.text === "string") return el.text;
-  const asAny = node as unknown as { rawText?: string };
-  return asAny.rawText ?? "";
-}
-
 /**
  * Gathers up to `maxChars` of normalized text from `siblings[fromIndex..]`
  * (searchDirection 1) or `siblings[..fromIndex]` reversed (searchDirection
@@ -250,7 +501,7 @@ function gatherSiblingText(siblings: Node[], startExclusive: number, direction: 
   let collectedLength = 0;
   let i = startExclusive + direction;
   while (i >= 0 && i < siblings.length && collectedLength < maxChars) {
-    const text = collapseWhitespace(nodeText(siblings[i]));
+    const text = collapseWhitespace(visibleText(siblings[i]));
     if (text.length > 0) {
       collected.push(text);
       collectedLength += text.length + 1;
@@ -375,12 +626,22 @@ export function extractLinks(html: string, pageUrl: string): LinkExtractionResul
     linkPosition++;
 
     if (!href) continue;
+
+    // Discard the observation entirely (position already assigned/consumed
+    // above, totalAnchorsEncountered already reflects it via anchors.length
+    // -- no gap-filling, no renumbering) if the anchor itself sits inside a
+    // template/hidden subtree. See isWithinNonVisibleSubtree's
+    // header for why this is a discard-the-whole-observation decision, not
+    // merely a text-blanking one.
+    if (isWithinNonVisibleSubtree(anchor)) continue;
+
     const resolved = resolveLinkUrl(href, pageUrl);
     if (!resolved) continue;
 
-    const rawAnchorText = collapseWhitespace(anchor.text ?? "");
-    const anchorText = rawAnchorText.length > 0 ? truncateWordBoundary(rawAnchorText, ANCHOR_TEXT_MAX_LENGTH) : null;
-    const contextSnippet = buildContextSnippet(anchor, rawAnchorText.length > 0 ? rawAnchorText : null);
+    const rawAnchorText = collapseWhitespace(visibleText(anchor));
+    const cleanedAnchorText = rawAnchorText.length > 0 ? rawAnchorText : null;
+    const anchorText = cleanedAnchorText ? truncateWordBoundary(cleanedAnchorText, ANCHOR_TEXT_MAX_LENGTH) : null;
+    const contextSnippet = buildContextSnippet(anchor, cleanedAnchorText);
 
     const rawRel = anchor.getAttribute("rel");
     const relAttribute = rawRel ? truncateWordBoundary(rawRel.trim(), REL_ATTRIBUTE_MAX_LENGTH) || null : null;
@@ -395,7 +656,7 @@ export function extractLinks(html: string, pageUrl: string): LinkExtractionResul
       anchorText,
       contextSnippet,
       relAttribute,
-      placement: classifyPlacement(anchor),
+      placement: classifyPlacement(anchor, href, cleanedAnchorText),
       isSameSite,
     });
   }
