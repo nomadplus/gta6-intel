@@ -74,8 +74,8 @@ through `src/db/queries/*`, which use `src/db/client.ts` — a connection
 authenticated as `app_role`, a Postgres role with **read-only** access
 (see "Database role separation" below). The public site never has a
 code path capable of writing to the database, and never invokes AI on a
-page view — AI processing (once built, in a later phase) will happen
-during ingestion and its results will be stored, not computed on request.
+page view — AI processing happens during ingestion/analysis (Phase 5)
+and its results are stored, never computed on request.
 
 Claim URLs are `/claims/{id}-{slug}` — the numeric id is the real,
 permanent identifier used in every foreign key and lookup; the slug is
@@ -204,6 +204,7 @@ production.
 | `AI_DEFAULT_MODEL` | `src/lib/ai/config.ts` | Default model id used by `runAiOperation()` when a caller doesn't supply an explicit per-call override. Read lazily, same reasoning as above. |
 | `AI_KILL_SWITCH_ENGAGED` | `src/lib/ai/safety/killSwitch.ts` | Emergency stop for all real AI provider execution, enforced centrally inside `runAiOperation()`. **Unset, or exactly `"false"`, means disengaged (normal operation)** — this is an override switch, not a mandatory credential, so absence is a normal state. Any other value engages it, including a typo (`"ture"`) — for an emergency stop, ambiguity favors stopping, not proceeding. Applies uniformly to every provider, including the test-only fake provider used in checks. |
 | `AI_MONTHLY_BUDGET_USD` | `src/lib/ai/safety/budget.ts` | **Mandatory** — a soft, preflight monthly spend threshold (e.g. `"50.00"`), NOT a hard or concurrency-safe ceiling — see that file's header comment for the two distinct overrun mechanisms this does not close (a single admitted call's own cost is unknown in advance; concurrent calls compound it). There is deliberately **no "unset means unlimited spend" fallback**: an absent value throws `MissingAiBudgetConfigError`, and an empty, negative, or otherwise unparseable value throws `MalformedAiBudgetConfigError` — both before any `ai_jobs` row is created, so nothing is stranded. `"0"` is a valid, accepted value that blocks every AI call once evaluated (effectively "no AI spend allowed yet"). |
+| `CRON_SECRET` | `src/lib/auth/requireCronSecret.ts` | Shared secret validated against the `Authorization: Bearer <secret>` header on the ingestion processor and discovery poll routes. Fails closed — a missing/unset value means the route cannot authenticate any request, not that authentication is skipped. |
 
 ---
 
@@ -255,21 +256,30 @@ production.
 ## Test / check commands
 
 There is no compiled test framework (Jest/Vitest) yet — checks are plain
-`tsx` scripts under `src/checks/`, run directly:
+`tsx` scripts under `src/checks/`, one per unit of behavior (URL
+normalization, safe fetching, link extraction, job lifecycle/recovery,
+each AI operation's orchestration and recovery, status presentation,
+provenance direction, etc.), each with its own `check:*` npm script
+(some need `--conditions=react-server` for server-only-guarded modules;
+see individual script definitions in `package.json`). Run one directly
+either way:
 
 ```
-npx tsx src/checks/adminAuth.check.ts          # requires CHECK_DATABASE_URL
-npx tsx src/checks/statusPresentation.check.ts # no database needed
+npx tsx src/checks/statusPresentation.check.ts        # no database needed
+npx tsx --conditions=react-server src/checks/aiSafety.check.ts
 ```
 
-or via the npm script alias:
+or via its npm script alias, e.g.:
 
 ```
 npm run check:status-presentation
 npm run check:claim-proposal-review
 ```
 
-Also run before considering any change complete:
+**`npm run check` runs the full non-live suite** (every `check:*` script
+except `check:ai-anthropic-live`, which is intentionally opt-in and
+excluded from the aggregate command — see below) and is the one command
+to run before considering any change complete, alongside:
 
 ```
 npm run typecheck
@@ -317,9 +327,44 @@ the stable alias domain.
 - **Post-Phase-3 cleanup** (this document's companion,
   `docs/architecture.md`) — migration history reconciliation, this
   documentation, SEO base URL centralization, credential cleanup.
+- **Phase 4** — Ingestion pipeline: safe URL fetching, manual and
+  automated (discovery-feed/RSS-Atom) ingestion, content-hash-based
+  duplicate detection, admin ingestion/review UI, job lifecycle with
+  recovery, and audit logging. A discovery feed can create a queued
+  ingestion job, and the automated processor can fetch and process an
+  eligible job with no admin click — but any outcome the processor
+  routes to `needs_review` still requires a human decision. Phase 4
+  ingests, stores, and reviews source items; turning a source item into
+  a claim, claim relationship, or provenance relationship belongs to
+  later workflows and remains separately human-gated.
+- **Phase 5** — AI-assisted admin review workflow: a provider-neutral
+  AI abstraction (Anthropic implemented first; designed for other
+  providers to be added without touching call sites), cost/safety
+  controls (a soft, preflight monthly spend threshold — explicitly not
+  a hard or concurrency-safe ceiling — plus an emergency kill switch
+  and exact BigInt cost accounting), and five semantic AI operations —
+  relevance classification, claim extraction, duplicate detection,
+  claim-relationship comparison, and provenance/origin analysis.
+  `ai_results` rows are persisted automatically as each operation runs,
+  but AI output is never automatically materialised into a claim, a
+  claim relationship, a provenance relationship, or any other public
+  epistemic change — those require an explicit admin review and
+  decision.
+- **Phase 6 prerequisite** — Deterministic capture of outbound-link
+  observations (`source_item_links`) during ingestion: a mechanical
+  record of which pages link to which, resolved against existing
+  source items where an exact, unique source-item match exists. This
+  closes a gap in provenance analysis by giving `analyse_provenance`
+  deterministic page-to-page hyperlink observations to weigh, in an
+  advisory capacity only — a hyperlink observation is never itself a
+  provenance conclusion.
 
-No AI integration, scraping, ingestion pipeline, or embeddings exist yet
-— that is Phase 4 and later, not yet started.
+The current focus is Phase 6 proper: autonomous, bounded discovery
+providers (candidate sources may include forums, social platforms, or
+search-style discovery) that will only ever use permitted access
+methods and feed into the same bounded ingestion pipeline and
+downstream human-review gates described above. No specific provider or
+access method has been committed to yet.
 
 ---
 
@@ -338,10 +383,12 @@ These are enforced in code/schema, not just convention — see
   repetition, citation, and aggregation are never conflated with
   independent corroboration.
 - **AI recommendations are not automatic truth.** The schema
-  (`ai_jobs` → `ai_results` → `admin_decisions` → status history) is
-  built so that no AI output can become an effective status change
-  without a recorded admin decision — this structure exists already, even
-  though no AI integration has been built yet.
+  (`ai_jobs` → `ai_results` → `admin_decisions` → status history) and
+  the five implemented AI operations (relevance classification, claim
+  extraction, duplicate detection, claim comparison, provenance
+  analysis) are built so that no AI output can become an effective
+  status change, claim, or provenance edit without a recorded admin
+  decision.
 
 For the full schema-level detail behind each of these, see
 `docs/architecture.md`.

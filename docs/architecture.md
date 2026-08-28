@@ -1,9 +1,11 @@
 # Architecture notes
 
 Companion to the root `README.md`. This document covers the data model in
-more detail, and keeps a record of the post-Phase-3 cleanup work
-(migration history reconciliation, SEO base URL, credential removal) so
-future changes don't rediscover the same issues from scratch.
+more detail; the Phase 4 ingestion pipeline, Phase 5 AI operations, and
+Phase 6 prerequisite (outbound-link provenance evidence); and keeps a
+record of the post-Phase-3 cleanup work (migration history
+reconciliation, SEO base URL, credential removal) so future changes
+don't rediscover the same issues from scratch.
 
 ---
 
@@ -545,6 +547,68 @@ an optional `costEstimateUsd` — PR 1 only supported persisting cost on
 the success path, but a failure that still reached the provider (e.g.
 `invalid_structured_output`) is still billable, and omitting its cost
 would have made the monthly budget systematically undercount real spend.
+
+### Relevance classification (Phase 5 PR 3)
+
+The project's first real semantic AI operation
+(`src/lib/ai/operations/classifyRelevance.ts`), answering exactly one
+question: is a stored source item relevant to the GTA VI claim-tracking
+domain? This is advisory metadata and workflow state, never historical
+truth — an `'irrelevant'` classification never deletes, hides, or
+suppresses the underlying source item. Output is a small schema
+(`relevance: relevant | irrelevant | needs_review`, `confidence`,
+`reasoning`), with `confidence`/`reasoning` deliberately left `NULL` on
+`ai_results` (the model-produced values live inside
+`structured_output` instead, same reasoning `runAiOperation` already
+documents for any caller that doesn't have its own value to pass in
+before the call).
+
+The system prompt tells the model that the retrieved URL/title/excerpt
+are untrusted, retrieved content to be evaluated — never instructions
+to obey. This is the first concrete application of the prompt-injection
+defense Section 13 requires: source content is treated as untrusted
+data, never as instructions the model should follow.
+
+`src/lib/ai/operations/classificationTrigger.ts` is the one place that
+selects the real Anthropic provider and loads the source item's fields;
+it's called from exactly two sites — the synchronous post-ingestion-
+confirmation trigger, and the admin recovery action for a missing/
+stale/failed classification — both calling the same `classifyRelevance`
+function so both paths share the same operation logic. `provider` is
+injectable (defaults to the real provider) so checks can exercise this
+exact orchestration path with `FakeAiProvider`.
+
+### Claim extraction (Phase 5 PR 4)
+
+`src/lib/ai/operations/extractClaims.ts` mirrors PR 3's execution/
+orchestration pattern and shared AI safety controls, answering: what
+standalone, atomic claim propositions are actually grounded in this
+stored title/excerpt? This is a **proposal only** — nothing in this file or its callers writes to
+`claims`/`evidence`/`claim_sources`; materializing an accepted candidate
+into a real claim is PR 5's job.
+
+Output is zero-to-many candidates (capped at `MAX_EXTRACTED_CLAIMS = 8`),
+each with `statement`, `informationType`,
+`supportingExcerpt`, `confidence`, and `reasoning`. Two constraints are
+enforced programmatically, not just requested in the prompt: (1)
+`supportingExcerpt` must be an exact, case-sensitive literal substring
+of the supplied title or excerpt — a paraphrase or fabrication fails
+Zod validation and surfaces as a normal `invalid_structured_output`
+failure, not a silently-accepted row; (2) exact-duplicate candidate
+statements (after whitespace/case normalization) are rejected. An empty
+`claims` array is a normal, valid outcome — the model is explicitly told
+not to force a claim to fill the list. Semantic near-duplicate detection
+against *existing* claims is deliberately out of scope here; that's PR
+6's job. `confidence`/`reasoning` are left `NULL` on `ai_results` for the
+same reason as `classify_relevance` — each candidate carries its own,
+and no single aggregate value would honestly represent them.
+
+`src/lib/ai/operations/extractClaimsTrigger.ts` adds the one thing PR 3's
+trigger never needed: an eligibility gate. Extraction only proceeds if
+the source item's **latest successful** `classify_relevance` result is
+exactly `'relevant'` — checked before any `ai_jobs` row is created or
+provider call made, a hard backend gate, not just a UI convenience (the
+review page also hides the action, but that's belt-and-braces).
 
 ### Extracted-claim review (Phase 5 PR 5)
 
@@ -1178,6 +1242,32 @@ discovery provider (GTAForums, Reddit, X, RSS polling, search APIs, or
 general crawling/historical backfill) — it is reusable infrastructure a
 later Phase 6 provider PR is expected to feed into, each producing this
 same bounded evidence shape through its own adapter.
+
+**Corrective fix: visible-text extraction (post-merge).** The initial
+implementation's anchor-text/context extraction could be contaminated by
+genuinely non-visible DOM content. `linkExtraction.ts` now excludes
+`script`, `style`, `noscript`, and `template` subtrees, and any subtree
+carrying the HTML `hidden` attribute, from anchor text and
+`link_context_snippet` — visible text is collected via iterative
+text-node traversal that skips these subtrees outright, rather than a
+naive `textContent` read that would include them. This exclusion set is
+purely structural — the implementation deliberately does not interpret
+CSS `display`, `visibility`, or any other stylesheet-driven signal.
+`aria-hidden` is deliberately **not** treated as visual invisibility
+— it's an accessibility-tree signal, not a rendering one, so a
+sighted-visible/`aria-hidden` link's text is still collected. A link
+discarded for being genuinely non-visible still consumes its original
+DOM `link_position` — positions are never renumbered around a discard,
+preserving the same content → ambiguous → chrome, position-ascending
+priority ordering `MAX_EXTRACTED_LINKS_PER_JOB` truncation already
+depended on. Accessibility skip links (e.g. "Skip to content") are
+classified as `chrome` using narrow structural/semantic signals (specific
+to that pattern, not a broad heuristic that could misclassify genuine
+in-article links). None of this changes what a `source_item_links` row
+*means* — it only improves the quality of the mechanical observation
+itself; a hyperlink is still never treated as an automatic provenance
+relationship, resolution and the advisory-only feed into
+`analyse_provenance` are unaffected.
 
 ### Status history (the two append-only ledgers)
 
