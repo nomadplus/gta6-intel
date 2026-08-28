@@ -1,5 +1,5 @@
 import "server-only";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { adminDb } from "@/db/adminClient";
 import type { DbExecutor } from "@/db/mutations/shared";
 import {
@@ -25,6 +25,7 @@ import {
   ingestionJobs,
   discoveryProviders,
   discoveryFeeds,
+  sourceItemLinks,
 } from "@/db/schema";
 
 export async function listClaimsForAdmin() {
@@ -320,6 +321,47 @@ export async function getSourceItemRelationships(sourceItemId: number) {
     outgoing: outgoing.rows.map((r) => ({ ...r, direction: "outgoing" as const })),
     incoming: incoming.rows.map((r) => ({ ...r, direction: "incoming" as const })),
   };
+}
+
+export interface AdminOutboundLinkRow {
+  id: number;
+  targetUrl: string;
+  anchorText: string | null;
+  linkContextSnippet: string | null;
+  placement: "content" | "chrome" | "ambiguous";
+  isSameSite: boolean;
+  toSourceItemId: number | null;
+  toSourceItemTitle: string | null;
+  toSourceItemUrl: string | null;
+}
+
+/**
+ * Phase 6 prerequisite: read-only outbound-link OBSERVATIONS for one
+ * source item's own admin detail page -- deliberately separate from
+ * getSourceItemRelationships above, which reads the epistemic
+ * source_relationships graph. This never joins into or implies anything
+ * about source_relationships; it is purely "what did this item's fetched
+ * HTML contain." No mutation function accompanies this query -- the admin
+ * page renders it read-only, with no edit/delete/resolve/promote control.
+ */
+export async function getOutboundSourceItemLinksForAdmin(sourceItemId: number): Promise<AdminOutboundLinkRow[]> {
+  const rows = await adminDb
+    .select({
+      id: sourceItemLinks.id,
+      targetUrl: sourceItemLinks.targetUrl,
+      anchorText: sourceItemLinks.anchorText,
+      linkContextSnippet: sourceItemLinks.linkContextSnippet,
+      placement: sourceItemLinks.placement,
+      isSameSite: sourceItemLinks.isSameSite,
+      toSourceItemId: sourceItemLinks.toSourceItemId,
+      toSourceItemTitle: sourceItems.title,
+      toSourceItemUrl: sourceItems.url,
+    })
+    .from(sourceItemLinks)
+    .leftJoin(sourceItems, eq(sourceItems.id, sourceItemLinks.toSourceItemId))
+    .where(eq(sourceItemLinks.fromSourceItemId, sourceItemId))
+    .orderBy(sourceItemLinks.linkPosition);
+  return rows;
 }
 
 export async function getEvidenceClaimLinks(evidenceId: number) {
@@ -1212,6 +1254,63 @@ export async function getProvenanceClusterForClaim(
     .where(eq(claimSources.claimId, claimId))
     .orderBy(sourceItems.id)
     .limit(limit);
+}
+
+export interface InClusterLinkRow {
+  fromSourceItemId: number;
+  toSourceItemId: number;
+  anchorText: string | null;
+  contextSnippet: string | null;
+  placement: "content" | "chrome" | "ambiguous";
+  isSameSite: boolean;
+  linkPosition: number;
+}
+
+/**
+ * Phase 6 prerequisite: every RESOLVED source_item_links row whose
+ * from/to are BOTH inside this claim's own provenance cluster -- the only
+ * link evidence analyseProvenanceTrigger.ts is permitted to forward into
+ * analyse_provenance's prompt (Section 11 of the PR spec: never an
+ * unresolved link, never an out-of-cluster target, never an arbitrary
+ * outbound URL merely because it was extracted). `clusterItemIds` is the
+ * exact same id set getProvenanceClusterForClaim just produced -- both
+ * endpoints are checked via `inArray` against that same set, so a link
+ * resolving to a real source_items row that simply isn't part of THIS
+ * claim's cluster is correctly excluded.
+ */
+export async function getInClusterLinksForCluster(
+  db: DbExecutor,
+  clusterItemIds: number[]
+): Promise<InClusterLinkRow[]> {
+  if (clusterItemIds.length === 0) return [];
+  const rows = await db
+    .select({
+      fromSourceItemId: sourceItemLinks.fromSourceItemId,
+      toSourceItemId: sourceItemLinks.toSourceItemId,
+      anchorText: sourceItemLinks.anchorText,
+      contextSnippet: sourceItemLinks.linkContextSnippet,
+      placement: sourceItemLinks.placement,
+      isSameSite: sourceItemLinks.isSameSite,
+      linkPosition: sourceItemLinks.linkPosition,
+    })
+    .from(sourceItemLinks)
+    .where(
+      and(
+        inArray(sourceItemLinks.fromSourceItemId, clusterItemIds),
+        inArray(sourceItemLinks.toSourceItemId, clusterItemIds),
+        // Defense-in-depth alongside the inArray-against-a-nullable-column
+        // behavior above (SQL IN never matches NULL): explicit, so intent
+        // is unambiguous regardless of driver/ORM quirks -- unresolved
+        // links must never reach this query's caller.
+        isNotNull(sourceItemLinks.toSourceItemId)
+      )
+    )
+    .orderBy(sourceItemLinks.fromSourceItemId, sourceItemLinks.linkPosition);
+
+  // The isNotNull filter above guarantees toSourceItemId is never null at
+  // runtime; this narrows the column's nullable static type to match, so
+  // callers get a genuinely non-null `number`, not `number | null`.
+  return rows.map((r) => ({ ...r, toSourceItemId: r.toSourceItemId! }));
 }
 
 export interface ProvenanceAnalysisJobForDisplayRow {

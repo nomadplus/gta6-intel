@@ -5,6 +5,7 @@ import {
   listSourceItemTypeOptions,
   listSourceItemsForAdmin,
   getSourceItemRelationships,
+  getOutboundSourceItemLinksForAdmin,
 } from "@/db/queries/admin";
 import { updateSourceItemAction, createSourceRelationshipAction, deleteSourceRelationshipAction } from "../../sources/actions";
 import { PROVENANCE_SUBJECT_FIELD, PROVENANCE_OBJECT_FIELD } from "@/lib/provenanceDirection";
@@ -20,11 +21,12 @@ export default async function AdminSourceItemDetailPage({ params, searchParams }
   const item = await getSourceItemForAdmin(Number(id));
   if (!item) notFound();
 
-  const [sources, itemTypes, allItems, relationships] = await Promise.all([
+  const [sources, itemTypes, allItems, relationships, outboundLinks] = await Promise.all([
     listSourcesForAdmin(),
     listSourceItemTypeOptions(),
     listSourceItemsForAdmin(),
     getSourceItemRelationships(item.id),
+    getOutboundSourceItemLinksForAdmin(item.id),
   ]);
 
   return (
@@ -129,6 +131,43 @@ export default async function AdminSourceItemDetailPage({ params, searchParams }
           <input type="hidden" name={PROVENANCE_SUBJECT_FIELD} value={item.id} />
           <button type="submit" className={submitClass}>Add Relationship</button>
         </form>
+      </section>
+
+      <section>
+        <h2 className="font-mono text-xs uppercase tracking-wide text-accent-brass">Extracted Outbound Links</h2>
+        <p className="mt-1 text-xs text-ink-600">
+          Deterministic, mechanical observations from this item&apos;s fetched HTML -- a hyperlink alone is never proof
+          of citation or any other relationship. Read-only: promoting evidence into a reviewed provenance
+          relationship happens only through analyse_provenance&apos;s human-review workflow, or the manual form above.
+        </p>
+
+        <ul className="mt-3 divide-y divide-hairline border border-hairline text-sm">
+          {outboundLinks.map((link) => (
+            <li key={link.id} className="space-y-1 p-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-xs text-accent-brass">{link.placement}</span>
+                <span className="font-mono text-xs text-ink-600">{link.isSameSite ? "same-site" : "cross-site"}</span>
+                <a href={link.targetUrl} target="_blank" rel="noreferrer" className="truncate text-ink-100 underline decoration-hairline underline-offset-2">
+                  {link.targetUrl}
+                </a>
+              </div>
+              {link.anchorText && <div className="text-xs text-ink-600">anchor: &ldquo;{link.anchorText}&rdquo;</div>}
+              {link.linkContextSnippet && <div className="text-xs text-ink-600">context: &ldquo;{link.linkContextSnippet}&rdquo;</div>}
+              <div className="text-xs">
+                {link.toSourceItemId ? (
+                  <span className="text-signal-confirmed">
+                    resolved -&gt; {link.toSourceItemTitle ?? link.toSourceItemUrl} (#{link.toSourceItemId})
+                  </span>
+                ) : (
+                  <span className="text-ink-600">unresolved</span>
+                )}
+              </div>
+            </li>
+          ))}
+          {outboundLinks.length === 0 && (
+            <li className="p-2 text-ink-600">No outbound links extracted from this item&apos;s fetch.</li>
+          )}
+        </ul>
       </section>
     </div>
   );

@@ -5,6 +5,7 @@
  * branch needs, nothing more.
  */
 import type { FailureIngestionStatus } from "./statusMapping";
+import type { ExtractedLink } from "./linkExtraction";
 
 export interface ReviewMetadata {
   /**
@@ -28,6 +29,14 @@ export interface ReviewMetadata {
   rawContentHash: string;
   httpStatus: number;
   contentType: string;
+  /**
+   * Phase 6 prerequisite: this fetch's already-filtered, already-truncated,
+   * already-priority-capped (max MAX_EXTRACTED_LINKS_PER_JOB) outbound
+   * links -- see linkExtraction.ts. Staged here transiently, exactly like
+   * every other ReviewMetadata field, until finalizeIngestionConfirmation
+   * promotes them into durable source_item_links rows.
+   */
+  extractedLinks: ExtractedLink[];
 }
 
 interface BaseResult {

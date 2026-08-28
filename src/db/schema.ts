@@ -69,6 +69,20 @@ export const sourceRelationshipTypeEnum = pgEnum("source_relationship_type", [
   "unknown",
 ]);
 
+// Phase 6 prerequisite (migration 0026): a PURELY STRUCTURAL classification
+// of where an extracted <a> tag sits in a fetched document's DOM -- never
+// an epistemic conclusion. "content" and "chrome" are deliberately NOT
+// named/shaped like "likely_citation" or "is_citation": a hyperlink is
+// evidence only, and whether it supports citation/derivative/repetition/etc
+// is decided exclusively by analyse_provenance (AI, proposal-only) or a
+// human, never by this table. See source_item_links below and
+// docs/architecture.md.
+export const sourceItemLinkPlacementEnum = pgEnum("source_item_link_placement", [
+  "content",
+  "chrome",
+  "ambiguous",
+]);
+
 export const claimSourceStanceEnum = pgEnum("claim_source_stance", [
   "supports",
   "contradicts",
@@ -363,6 +377,116 @@ export const sourceRelationships = pgTable(
 );
 
 /* =========================================================================
+ * SOURCE ITEM LINKS (Phase 6 prerequisite — migration 0026)
+ *
+ * An OBSERVATION ledger, not an inference table: one row per <a> tag
+ * encountered during a successful ingestion fetch, recording only
+ * deterministic, structural facts about that anchor -- where its resolved
+ * target points, where in the DOM it sat, and what visible text
+ * surrounded it. This is deliberately NOT source_relationships: a
+ * hyperlink alone never proves citation/derivative/repetition/etc -- that
+ * epistemic judgment stays exclusively with analyse_provenance (AI,
+ * proposal-only) or a human via the existing source_relationships admin
+ * form. Nothing in this table or the code that writes it is permitted to
+ * auto-create a source_relationships row.
+ *
+ * OBSERVATION VS ENRICHMENT: every column except (toSourceItemId,
+ * resolvedAt) is fixed forever at insert time. Those two may transition
+ * exactly once, from NULL to a value, when a later ingestion event makes
+ * the link's target unambiguously resolvable (see migration 0026's
+ * restrict_source_item_link_mutation() trigger) -- this is permitted
+ * enrichment of a previously-unknown pointer, never a rewrite of what the
+ * fetched HTML actually contained.
+ * ========================================================================= */
+export const sourceItemLinks = pgTable(
+  "source_item_links",
+  {
+    id: serial("id").primaryKey(),
+
+    // Direction mirrors source_relationships/provenanceDirection.ts exactly:
+    // fromSourceItemId = subject (the page/document containing the <a>),
+    // toSourceItemId = object (what it resolves to, once known). Never
+    // canonicalized/reordered.
+    fromSourceItemId: integer("from_source_item_id").notNull().references(() => sourceItems.id),
+    toSourceItemId: integer("to_source_item_id").references(() => sourceItems.id),
+
+    // Resolved absolute http(s) URL, fragment stripped -- never truncated;
+    // a resolved target exceeding the column's bound is dropped entirely
+    // at extraction, not stored. normalizedTargetUrl is the same value
+    // passed through the existing normalizeUrl(), reused verbatim -- the
+    // exact identity policy source_items.normalized_url already uses.
+    targetUrl: varchar("target_url", { length: 2048 }).notNull(),
+    normalizedTargetUrl: varchar("normalized_target_url", { length: 2048 }).notNull(),
+
+    // Bounded, human-readable text -- deterministically truncated (word
+    // boundary + ellipsis, same style as metadataExtraction.ts's
+    // toExcerpt()) when the source is longer, never dropped for length.
+    anchorText: varchar("anchor_text", { length: 300 }),
+    // Bounded, whitespace-normalized VISIBLE TEXT surrounding this specific
+    // link -- never serialized HTML, never full-article text. The
+    // no-full-article-body invariant (source_items.excerpt's own comment,
+    // contentHash.ts's header) remains in force; this is a small,
+    // per-link-scoped extract, categorically different from article
+    // storage.
+    linkContextSnippet: varchar("link_context_snippet", { length: 300 }),
+    relAttribute: varchar("rel_attribute", { length: 200 }),
+
+    // 0-indexed encounter order among ALL <a> tags in this fetch, assigned
+    // BEFORE any filtering/capping -- a stable per-fetch identity, not a
+    // compacted array index. Dropped/uncapped candidates simply leave
+    // gaps in the stored sequence for a given ingestion_job_id.
+    linkPosition: integer("link_position").notNull(),
+
+    // Structural facts only -- see sourceItemLinkPlacementEnum's own
+    // comment above. isSameSite is a separate, purely factual signal
+    // (exact hostname match against the fetched page's own finalUrl, no
+    // www-stripping -- same non-fuzzy convention sourceIdentity.ts's
+    // extractHostname() already uses) -- a same-site link is NEVER
+    // reclassified as chrome merely because it shares a hostname.
+    placement: sourceItemLinkPlacementEnum("placement").notNull(),
+    isSameSite: boolean("is_same_site").notNull(),
+
+    // The fetch that produced this observation -- its provenance. Always
+    // required: an extracted link with no known originating fetch would
+    // have no audit trail at all.
+    ingestionJobId: integer("ingestion_job_id").notNull().references(() => ingestionJobs.id),
+
+    extractedAt: timestamp("extracted_at", { withTimezone: true }).notNull().defaultNow(),
+    // Set only together with toSourceItemId, exactly once -- see the
+    // table header comment and migration 0026's trigger.
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    noSelfLink: check(
+      "source_item_links_no_self_link",
+      sql`${t.toSourceItemId} IS NULL OR ${t.fromSourceItemId} <> ${t.toSourceItemId}`
+    ),
+    linkPositionNonnegative: check("source_item_links_link_position_nonnegative", sql`${t.linkPosition} >= 0`),
+    resolvedAtRequiresTarget: check(
+      "source_item_links_resolved_at_requires_target",
+      sql`(${t.toSourceItemId} IS NULL) = (${t.resolvedAt} IS NULL)`
+    ),
+    // Idempotency/occurrence guard -- link_position is assigned
+    // deterministically per fetch, so this is trivially satisfied by
+    // correct code; it exists to catch an accidental double-insert (e.g.
+    // a retried confirmation transaction), not to prevent any legitimate
+    // case. Multiple different positions targeting the SAME URL/item
+    // remain fully allowed -- see fromIdx/toIdx below, no uniqueness on
+    // (fromSourceItemId, toSourceItemId).
+    jobPositionUnique: uniqueIndex("source_item_links_job_position_unique").on(t.ingestionJobId, t.linkPosition),
+    fromIdx: index("source_item_links_from_idx").on(t.fromSourceItemId),
+    toIdx: index("source_item_links_to_idx").on(t.toSourceItemId).where(sql`${t.toSourceItemId} IS NOT NULL`),
+    // The retroactive-resolution query's exact lookup shape: "find
+    // unresolved rows whose target matches this URL" -- scoped to exactly
+    // the rows that query ever touches.
+    unresolvedTargetIdx: index("source_item_links_unresolved_target_idx")
+      .on(t.normalizedTargetUrl)
+      .where(sql`${t.toSourceItemId} IS NULL`),
+  })
+);
+
+/* =========================================================================
  * DISCOVERY / INGESTION (Phase 4 PR 1 — schema foundation only)
  *
  * This is the pipeline that will eventually populate `sourceItems`, kept
@@ -445,6 +569,20 @@ export const ingestionJobs = pgTable(
     // See migration 0012's header for why this also anchors the
     // dedupe/race-safety constraint below.
     discoveryFeedId: integer("discovery_feed_id").references(() => discoveryFeeds.id),
+    // Added in migration 0027 (Phase 6 prerequisite) -- the pipeline's
+    // extracted, already-filtered, already-truncated, already-priority-
+    // capped (max MAX_EXTRACTED_LINKS_PER_JOB) link array, staged here
+    // for exactly the same reason extractedTitle/extractedExcerpt/etc
+    // above are staged: a needs_review/ready_for_confirmation job has no
+    // source_items.id yet for a source_item_links row's
+    // from_source_item_id to reference. Consumed and superseded by real
+    // source_item_links rows the moment finalizeIngestionConfirmation
+    // creates the source_items row; an unconfirmed job's staged links are
+    // simply never promoted -- harmless, bounded dead weight, same as an
+    // abandoned job's extracted_title today. By the time this column is
+    // written, every bound (count, per-field length) has ALREADY been
+    // enforced by the extractor -- this is never a raw, uncapped dump.
+    extractedLinksStaging: jsonb("extracted_links_staging"),
   },
   (t) => ({
     // Shaped for the approved future in-flight-redundancy rule ("reuse a

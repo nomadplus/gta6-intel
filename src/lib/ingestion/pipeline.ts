@@ -2,6 +2,7 @@ import "server-only";
 import { safeFetch } from "./safeFetch";
 import { normalizeUrl } from "./urlNormalization";
 import { extractMetadata } from "./metadataExtraction";
+import { extractLinks } from "./linkExtraction";
 import { computeRawContentHash } from "./contentHash";
 import { classifyDuplicateCandidate } from "./duplicateDetection";
 import { extractHostname, proposeSourceIdentity } from "./sourceIdentity";
@@ -41,6 +42,11 @@ function toReviewMetadataPatch(metadata: ReviewMetadata): IngestionReviewMetadat
     extractedAuthor: metadata.author,
     extractedPublishedAt: metadata.publishedAt,
     extractedExcerpt: metadata.excerpt,
+    // Phase 6 prerequisite -- already bounded by linkExtraction.ts before
+    // it ever reaches this patch; see that module's header and migration
+    // 0027's header for why this is staged rather than written directly
+    // to source_item_links at this point.
+    extractedLinksStaging: metadata.extractedLinks,
   };
 }
 
@@ -102,6 +108,11 @@ export async function processIngestionJob(job: JobToProcess): Promise<IngestionJ
 
   const rawContentHash = computeRawContentHash(fetchResult.bodyText);
   const extracted = extractMetadata(fetchResult.bodyText);
+  // Same already-in-memory HTML, same pass-shape as extractMetadata above --
+  // no additional fetch, no additional cost. Bounds (count/length) are all
+  // enforced INSIDE extractLinks() itself; nothing downstream needs to
+  // re-filter or re-cap this array.
+  const extractedLinks = extractLinks(fetchResult.bodyText, fetchResult.finalUrl);
 
   const paywallStatus = classifySuccessfulFetchForPaywall(extracted.isAccessibleForFree);
   if (paywallStatus) {
@@ -134,6 +145,7 @@ export async function processIngestionJob(job: JobToProcess): Promise<IngestionJ
     rawContentHash,
     httpStatus: fetchResult.status,
     contentType: fetchResult.contentType,
+    extractedLinks: extractedLinks.links,
   };
 
   const candidates = await findCandidateSourceItemsByUrl(postNormalizedUrl, extracted.canonicalUrl);

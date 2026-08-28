@@ -28,7 +28,10 @@ is a data insert, not a migration. This is unlike `investigation_status`/
 because they define core business logic.
 
 `source_items.excerpt` is a short, legally-safe excerpt only — the
-platform does not store full-article copies.
+platform does not store full-article copies. (Phase 6 prerequisite:
+`source_item_links` extends this same discipline to outbound links —
+see "Outbound link observations" below — storing only a small,
+per-link-scoped context snippet, never article bodies.)
 
 ### Provenance: `source_relationships`
 
@@ -1037,6 +1040,144 @@ cluster-item payload sent to the model, deliberately excluding
 call time, and the admin UI only offers "reanalyse" from a `succeeded`
 state when the claim's *current* cluster fingerprint no longer matches
 it.
+
+### Outbound link observations: `source_item_links` (Phase 6 prerequisite)
+
+Before Phase 6's autonomous discovery providers are built, this PR closes
+a gap the ingestion pipeline had from Phase 4 onward: it fetched full HTML
+but discarded every `<a>` tag, meaning `analyse_provenance`'s prompt could
+never actually check whether one item's page linked to another's, despite
+its own instructions describing exactly that kind of evidence
+("...paragraph 2 links directly to the to item's URL"). `source_item_links`
+closes that gap.
+
+**`source_item_links` is a MECHANICAL OBSERVATION table, not an epistemic
+conclusion table — this distinction must never be blurred.** It records
+only deterministic, structural facts extracted from one fetch: that an
+`<a>` tag existed, what URL it resolved to, where it sat in the DOM
+(`placement`: `content` / `chrome` / `ambiguous`), whether its target was
+same-site or cross-site, and the anchor text/nearby visible text. It
+**never** asserts citation, derivative, repetition, or any other
+relationship — there is deliberately no column shaped like
+`is_citation`/`likely_citation` anywhere in this table. `source_relationships`
+remains, exactly as it always has been, the **reviewed epistemic
+conclusion** table: populated only by a human directly, or by AI proposal
+(`analyse_provenance`) followed by mandatory human review
+(`source_relationship_reviews`). A hyperlink observation is evidence to
+weigh; a `source_relationships` row is a judgment that has actually been
+made. Nothing in this PR's code path writes `source_relationships`
+directly — `source_item_links` rows are read-only input to
+`analyse_provenance`'s prompt and to the admin's own eyes, never a second,
+implicit way to materialize a provenance edge.
+
+**Observation vs. enrichment.** Every column except (`to_source_item_id`,
+`resolved_at`) is fixed forever at insert time — the same "historical
+information must not silently disappear or be overwritten" principle
+governing every other table in this project. Exactly one transition is
+permitted after insert: `to_source_item_id` may move from `NULL` to a real
+id, exactly once, together with `resolved_at`, enforced by a **new kind of
+trigger** for this codebase — `restrict_source_item_link_mutation()` is a
+*partial*-immutability trigger (every other append-only table here uses a
+blanket "reject every UPDATE/DELETE" trigger); this one permits exactly
+the one legitimate transition and rejects everything else, including a
+second resolution attempt, a no-op update, and any change to an
+observation column. This is deliberately framed as *enrichment of a
+previously-unknown pointer*, not a rewrite of what the HTML actually
+contained.
+
+**Unresolved links are intentionally retained, not noise.** A
+freshly-fetched page overwhelmingly links to URLs this project hasn't
+ingested yet — discarding those would throw away exactly the
+forward-looking discovery signal later Phase 6 providers are meant to use.
+Unresolved rows remain subject to the same
+`MAX_EXTRACTED_LINKS_PER_JOB` (200) cap as everything else.
+
+**Resolution is deterministic, exact-match-only, and never guessed.** A
+link resolves to a `source_items` row if and only if **exactly one**
+distinct id matches its `normalized_target_url` via the same dual-field
+policy dedup already uses (`normalized_url OR canonical_url`, reusing
+`findCandidateSourceItemsByUrl`'s identity policy, not a second
+implementation). Zero matches, or more than one distinct match (the
+"edited content re-ingested as a new row" case — `source_items.normalized_url`
+is deliberately non-unique, so two rows can legitimately share a URL),
+both leave the link unresolved rather than guessing. A self-referential
+link (a page linking its own permalink) is explicitly guarded against
+resolving to itself. Two resolution passes happen at every
+`finalizeIngestionConfirmation` call, inside its existing transaction:
+**forward** (this fetch's own new links, against already-existing items)
+and **retroactive** (other, pre-existing unresolved links, against the
+item just created) — both call the exact same matching function, so the
+policy can never drift between the two directions. Once resolved, a row
+is never re-touched, even by a later, unrelated confirmation.
+
+**No full article-body persistence — this remains locked.** The extractor
+(`linkExtraction.ts`) reuses the same already-in-memory HTML
+`extractMetadata()` already parses (no new fetch), and stores only a
+small, per-link-scoped, whitespace-normalized `link_context_snippet`
+(≤300 chars, built from DOM sibling text, never serialized HTML) — never
+the article body. `source_items.excerpt`'s own "no full-article storage"
+policy is unaffected and unchanged.
+
+**Bounds, enforced both in the extractor and at the column level:**
+`MAX_EXTRACTED_LINKS_PER_JOB` = 200 (priority-capped content → ambiguous →
+chrome, `link_position` ascending as tiebreaker — never a naive
+first-N-encountered cut, which would systematically favor early-DOM
+nav/chrome over genuine later in-article content); `target_url` /
+`normalized_target_url` ≤ 2048 chars (an over-length resolved URL is
+**dropped entirely, never truncated** — a truncated URL is a different,
+broken URL); `anchor_text` / `link_context_snippet` ≤ 300 chars, `rel_attribute`
+≤ 200 chars (all three truncated at a word boundary with a trailing
+ellipsis, reusing `metadataExtraction.ts`'s `toExcerpt()` style rather
+than a second ad hoc truncation). The raw, pre-resolution `href` is
+deliberately **not** persisted at all — the resolved/normalized forms
+already carry the useful identity, and an `href` can embed tracking
+tokens with no justification for a second stored copy.
+
+**`analyse_provenance`'s prompt only ever receives a narrow slice of this
+evidence** (`analyseProvenanceTrigger.ts`'s `getInClusterLinksForCluster` +
+`buildKnownOutboundLinksByItem`): only links that are **resolved** AND
+whose target is **another item already inside this exact claim's own
+cluster** — never an unresolved link, never an out-of-cluster target,
+never an arbitrary extracted URL merely because it exists. At most 3
+occurrences per directed `(from, to)` pair are forwarded (same
+content→ambiguous→chrome, then `link_position` priority as the extractor's
+own cap), so a repeated "sources:" footnote block can't balloon the
+prompt. The system prompt explicitly tells the model these are mechanical
+observations, not proof of citation — a `chrome`-placed link is much
+weaker evidence than a `content`-placed one, but even the latter is
+weighed, not deferred to automatically, under the same "dependence can be
+evidenced, independence must never be inferred" rule already governing
+every other part of this operation.
+
+**Fingerprint compatibility (critical, verified against a fixed
+pre-feature hash — see `provenanceClusterFingerprint.check.ts`).**
+`ClusterItemPayload.knownOutboundLinks` is optional and, when an item has
+zero qualifying in-cluster links, is **omitted from the canonical object
+entirely** (not serialized as an empty array) — producing byte-identical
+JSON, and therefore an identical fingerprint, to what this function
+computed before this feature existed. This is what guarantees every
+pre-existing successful `analyse_provenance` result across production does
+NOT appear stale merely because the payload shape gained a new property.
+Only once an item gains real, non-empty link evidence does the canonical
+shape — and therefore the hash — change, correctly making a previously
+`succeeded` analysis newly eligible for re-analysis under the existing,
+unmodified cluster-change-gated rule.
+
+**Nothing about PR8b's own contract changes.** The six AI-proposable
+relationship types, direction semantics, the mandatory human-review path,
+supersession/actionability rules, the confidence/evidence_note-NULL-on-
+approval policy, and the immutable review-snapshot bridge are all
+untouched — this PR only enriches `analyse_provenance`'s *input*, never
+its output schema or review pipeline.
+
+**Provider-agnostic by design.** Nothing in `source_item_links` or
+`linkExtraction.ts` assumes the source item came from a traditional news
+article. `from`/`to` reference `source_items` rows regardless of which
+discovery provider produced them. This PR does **not** implement any new
+discovery provider (GTAForums, Reddit, X, RSS polling, search APIs, or
+general crawling/historical backfill) — it is reusable infrastructure a
+later Phase 6 provider PR is expected to feed into, each producing this
+same bounded evidence shape through its own adapter.
 
 ### Status history (the two append-only ledgers)
 

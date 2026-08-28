@@ -1,6 +1,6 @@
 import "server-only";
 import { adminDb } from "@/db/adminClient";
-import { getClaimForProvenanceAnalysis, getProvenanceClusterForClaim } from "@/db/queries/admin";
+import { getClaimForProvenanceAnalysis, getProvenanceClusterForClaim, getInClusterLinksForCluster, type InClusterLinkRow } from "@/db/queries/admin";
 import { analyseProvenance, PROVENANCE_CLUSTER_HARD_CAP, type AnalyseProvenanceOutput } from "./analyseProvenance";
 import { computeClusterFingerprint, type ClusterItemPayload } from "@/lib/ai/provenanceClusterFingerprint";
 import { getAnthropicProvider } from "@/lib/ai/providers/anthropicProvider";
@@ -25,6 +25,78 @@ import type { RunAiOperationResult } from "@/lib/ai/runAiOperation";
  * claim's own project_id is read and returned only for callers that need
  * it for display, never used to filter the cluster.
  */
+
+// Per (from,to) directed-pair cap on how many link occurrences are ever
+// forwarded into analyse_provenance's prompt (Section 29 of the PR spec) --
+// keeps the prompt/fingerprint bounded even when one item links another
+// many times (e.g. a repeated "sources:" footnote block). Selection
+// priority mirrors linkExtraction.ts's own cap exactly: content first,
+// then ambiguous, then chrome, with link_position ascending as the stable
+// tiebreaker -- never a naive "first 3 by document order", which would
+// systematically favor nav/chrome occurrences over genuine body-content
+// ones on some pages.
+const MAX_LINK_OCCURRENCES_PER_PAIR = 3;
+
+const PLACEMENT_PRIORITY: Record<InClusterLinkRow["placement"], number> = {
+  content: 0,
+  ambiguous: 1,
+  chrome: 2,
+};
+
+/**
+ * Groups resolved in-cluster link rows by (fromSourceItemId,
+ * toSourceItemId), keeps at most MAX_LINK_OCCURRENCES_PER_PAIR per pair
+ * using the priority rule above, and reshapes the survivors into
+ * ClusterItemPayload's `knownOutboundLinks` entries, attached to each
+ * cluster item that actually HAS outbound in-cluster links. Deterministic
+ * output ordering (by toSourceItemId, then original selection order) is
+ * what makes computeClusterFingerprint's re-analysis gate stable across
+ * repeated calls with unchanged underlying evidence.
+ */
+function buildKnownOutboundLinksByItem(
+  rows: InClusterLinkRow[]
+): Map<number, NonNullable<ClusterItemPayload["knownOutboundLinks"]>> {
+  const byPair = new Map<string, InClusterLinkRow[]>();
+  for (const row of rows) {
+    const key = `${row.fromSourceItemId}:${row.toSourceItemId}`;
+    const bucket = byPair.get(key);
+    if (bucket) bucket.push(row);
+    else byPair.set(key, [row]);
+  }
+
+  const byFromItem = new Map<number, NonNullable<ClusterItemPayload["knownOutboundLinks"]>>();
+  for (const [, occurrences] of byPair) {
+    const capped = [...occurrences]
+      .sort((a, b) => {
+        const priorityDiff = PLACEMENT_PRIORITY[a.placement] - PLACEMENT_PRIORITY[b.placement];
+        if (priorityDiff !== 0) return priorityDiff;
+        return a.linkPosition - b.linkPosition;
+      })
+      .slice(0, MAX_LINK_OCCURRENCES_PER_PAIR);
+
+    const fromId = capped[0]!.fromSourceItemId;
+    const entries = byFromItem.get(fromId) ?? [];
+    for (const row of capped) {
+      entries.push({
+        toSourceItemId: row.toSourceItemId,
+        anchorText: row.anchorText,
+        contextSnippet: row.contextSnippet,
+        placement: row.placement,
+        isSameSite: row.isSameSite,
+      });
+    }
+    byFromItem.set(fromId, entries);
+  }
+
+  // Deterministic final ordering per item: by target id, then insertion
+  // order (which already reflects the priority/link_position order from
+  // the per-pair cap above) -- stable regardless of Map iteration order.
+  for (const entries of byFromItem.values()) {
+    entries.sort((a, b) => a.toSourceItemId - b.toSourceItemId);
+  }
+
+  return byFromItem;
+}
 
 export class ProvenanceAnchorClaimNotFoundError extends Error {
   constructor(claimId: number) {
@@ -64,14 +136,35 @@ export async function triggerAnalyseProvenance(
     return { kind: "no_analysable_cluster" };
   }
 
-  const clusterItems: ClusterItemPayload[] = cluster.map((item) => ({
-    id: item.id,
-    title: item.title,
-    url: item.url,
-    publishedAt: item.publishedAt ? item.publishedAt.toISOString() : null,
-    excerpt: item.excerpt,
-  }));
+  // Phase 6 prerequisite: only RESOLVED links whose from/to are BOTH
+  // inside this exact cluster ever reach the model -- never an unresolved
+  // link, never a target outside this claim's own cluster, never an
+  // arbitrary extracted URL. getInClusterLinksForCluster already enforces
+  // this at the query level (Section 11/28 of the PR spec); this trigger
+  // does no further URL-based filtering of its own.
+  const clusterItemIds = cluster.map((item) => item.id);
+  const inClusterLinkRows = await getInClusterLinksForCluster(adminDb, clusterItemIds);
+  const knownOutboundLinksByItem = buildKnownOutboundLinksByItem(inClusterLinkRows);
 
+  const clusterItems: ClusterItemPayload[] = cluster.map((item) => {
+    const knownOutboundLinks = knownOutboundLinksByItem.get(item.id);
+    return {
+      id: item.id,
+      title: item.title,
+      url: item.url,
+      publishedAt: item.publishedAt ? item.publishedAt.toISOString() : null,
+      excerpt: item.excerpt,
+      // Omitted entirely (not an empty array) when this item has no
+      // qualifying in-cluster links -- see computeClusterFingerprint's
+      // header for why this is a fingerprint-compatibility requirement,
+      // not a stylistic choice.
+      ...(knownOutboundLinks && knownOutboundLinks.length > 0 ? { knownOutboundLinks } : {}),
+    };
+  });
+
+  // The SAME clusterItems array (link-enriched or not) is used for BOTH
+  // the fingerprint and the actual model call below -- these must never
+  // diverge into two separately-constructed payloads.
   const clusterFingerprint = computeClusterFingerprint(clusterItems);
 
   const result = await analyseProvenance({

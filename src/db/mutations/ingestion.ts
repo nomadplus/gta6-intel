@@ -1,7 +1,7 @@
 import "server-only";
-import { and, eq, inArray, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import { adminDb } from "@/db/adminClient";
-import { ingestionJobs, discoveryProviders, sourceItems, sources } from "@/db/schema";
+import { ingestionJobs, discoveryProviders, sourceItems, sources, sourceItemLinks } from "@/db/schema";
 import { requireAdmin, type AuthorizedAdmin } from "@/lib/auth/requireAdmin";
 import { submitIngestionUrlSchema, confirmIngestionSchema } from "@/lib/validation/adminSchemas";
 import { normalizeUrl } from "@/lib/ingestion/urlNormalization";
@@ -17,6 +17,7 @@ import {
 import type { CandidateSourceItem } from "@/lib/ingestion/duplicateDetection";
 import type { CandidateSource } from "@/lib/ingestion/sourceIdentity";
 import type { IngestionFailureOutcome } from "@/lib/ingestion/statusMapping";
+import type { ExtractedLink } from "@/lib/ingestion/linkExtraction";
 
 /**
  * NOTE on admin_audit_log (updated in Phase 4 PR 6): the `ingestion_job`
@@ -206,6 +207,14 @@ export interface IngestionReviewMetadataPatch {
   extractedAuthor: string | null;
   extractedPublishedAt: Date | null;
   extractedExcerpt: string | null;
+  /**
+   * Phase 6 prerequisite (migration 0027): this fetch's already-bounded
+   * extracted links (see linkExtraction.ts), staged until
+   * finalizeIngestionConfirmation promotes them into durable
+   * source_item_links rows. Stored as plain JSON-serializable objects --
+   * ExtractedLink itself is already just strings/numbers/booleans/null.
+   */
+  extractedLinksStaging: ExtractedLink[];
 }
 
 /**
@@ -256,6 +265,7 @@ export async function completeJobReviewOutcome(
           extractedAuthor: params.reviewMetadata.extractedAuthor,
           extractedPublishedAt: params.reviewMetadata.extractedPublishedAt,
           extractedExcerpt: params.reviewMetadata.extractedExcerpt,
+          extractedLinksStaging: params.reviewMetadata.extractedLinksStaging,
         }
       : {};
 
@@ -360,6 +370,31 @@ export class JobNotConfirmableError extends Error {
  * this and this path previously did not -- and an `ingestion_job`
  * `update` entry recording that this specific job reached `stored`.
  */
+/**
+ * Phase 6 prerequisite: given a normalized/canonical URL value, returns the
+ * single `source_items.id` that uniquely matches it (via the SAME dual-field
+ * OR policy `findCandidateSourceItemsByUrl` already uses for dedup:
+ * normalized_url OR canonical_url), or `null` if zero or MORE THAN ONE
+ * distinct source_items row matches. This is the one and only place "is
+ * this link resolvable" is decided -- both forward resolution (this job's
+ * own newly-staged links) and retroactive resolution (other, pre-existing
+ * unresolved links) call this SAME function, so the matching policy can
+ * never drift between the two directions. No fuzzy matching of any kind:
+ * exact equality only, reusing the existing normalizeUrl() identity, never
+ * a second/looser implementation.
+ */
+async function findUniqueResolutionTarget(
+  tx: Parameters<Parameters<typeof adminDb.transaction>[0]>[0],
+  normalizedTargetUrl: string
+): Promise<number | null> {
+  const rows = await tx
+    .select({ id: sourceItems.id })
+    .from(sourceItems)
+    .where(or(eq(sourceItems.normalizedUrl, normalizedTargetUrl), eq(sourceItems.canonicalUrl, normalizedTargetUrl)));
+  const distinctIds = Array.from(new Set(rows.map((r) => r.id)));
+  return distinctIds.length === 1 ? distinctIds[0]! : null;
+}
+
 export async function finalizeIngestionConfirmation(input: unknown): Promise<{ sourceItemId: number }> {
   const admin = await requireAdmin("editor");
   const data = confirmIngestionSchema.parse(input);
@@ -379,7 +414,12 @@ export async function finalizeIngestionConfirmation(input: unknown): Promise<{ s
 
   return adminDb.transaction(async (tx) => {
     const [job] = await tx
-      .select({ id: ingestionJobs.id, status: ingestionJobs.status, sourceItemId: ingestionJobs.sourceItemId })
+      .select({
+        id: ingestionJobs.id,
+        status: ingestionJobs.status,
+        sourceItemId: ingestionJobs.sourceItemId,
+        extractedLinksStaging: ingestionJobs.extractedLinksStaging,
+      })
       .from(ingestionJobs)
       .where(eq(ingestionJobs.id, data.jobId))
       .for("update");
@@ -410,6 +450,74 @@ export async function finalizeIngestionConfirmation(input: unknown): Promise<{ s
       .update(ingestionJobs)
       .set({ status: "stored", sourceItemId: sourceItem!.id, completedAt: new Date() })
       .where(eq(ingestionJobs.id, data.jobId));
+
+    // ---------------------------------------------------------------------
+    // Phase 6 prerequisite: promote this job's staged links into durable
+    // source_item_links rows, with FORWARD resolution against
+    // already-existing source_items rows. Each staged link's target was
+    // already fully validated/bounded by linkExtraction.ts before it ever
+    // reached the staging column -- nothing here re-filters or re-caps it.
+    //
+    // A self-link (this new item linking to its own URL) is guarded
+    // explicitly: findUniqueResolutionTarget necessarily sees the row we
+    // JUST inserted above (same transaction, read-your-own-writes), so a
+    // permalink-style self-referential anchor would otherwise resolve to
+    // itself -- resolvesToSelf below is what prevents that, matching the
+    // source_item_links_no_self_link CHECK constraint's own invariant.
+    // ---------------------------------------------------------------------
+    const stagedLinks = (job.extractedLinksStaging as unknown as ExtractedLink[] | null) ?? [];
+    for (const link of stagedLinks) {
+      const resolvedCandidate = await findUniqueResolutionTarget(tx, link.normalizedTargetUrl);
+      const resolvesToSelf = resolvedCandidate !== null && resolvedCandidate === sourceItem!.id;
+      const toSourceItemId = resolvedCandidate !== null && !resolvesToSelf ? resolvedCandidate : null;
+      const resolvedNow = toSourceItemId !== null ? new Date() : null;
+
+      await tx.insert(sourceItemLinks).values({
+        fromSourceItemId: sourceItem!.id,
+        toSourceItemId,
+        targetUrl: link.targetUrl,
+        normalizedTargetUrl: link.normalizedTargetUrl,
+        anchorText: link.anchorText,
+        linkContextSnippet: link.contextSnippet,
+        relAttribute: link.relAttribute,
+        linkPosition: link.linkPosition,
+        placement: link.placement,
+        isSameSite: link.isSameSite,
+        ingestionJobId: data.jobId,
+        resolvedAt: resolvedNow ?? undefined,
+      });
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 6 prerequisite: RETROACTIVE resolution. Pre-existing,
+    // still-unresolved source_item_links rows (created by EARLIER
+    // ingestion jobs, never this one -- excluded via ingestion_job_id
+    // below) whose target now uniquely matches the item just created are
+    // enriched. The just-inserted sourceItem row necessarily matches its
+    // own normalized_url, so findUniqueResolutionTarget returning
+    // non-null here means it is THE ONLY row matching storedNormalizedUrl
+    // -- if any OTHER pre-existing source_items row also shares this URL
+    // (the hash-mismatch/edited-content re-ingestion case), the match
+    // count is > 1 and this returns null, correctly leaving those older
+    // unresolved links unresolved rather than guessing which version of
+    // the content they actually meant. Already-resolved rows are never
+    // touched (the WHERE clause only ever selects toSourceItemId IS NULL
+    // rows), matching the "never re-resolve, never unset" invariant.
+    // ---------------------------------------------------------------------
+    const retroactiveTarget = await findUniqueResolutionTarget(tx, storedNormalizedUrl);
+    if (retroactiveTarget !== null && retroactiveTarget === sourceItem!.id) {
+      await tx
+        .update(sourceItemLinks)
+        .set({ toSourceItemId: sourceItem!.id, resolvedAt: new Date() })
+        .where(
+          and(
+            isNull(sourceItemLinks.toSourceItemId),
+            eq(sourceItemLinks.normalizedTargetUrl, storedNormalizedUrl),
+            ne(sourceItemLinks.ingestionJobId, data.jobId),
+            ne(sourceItemLinks.fromSourceItemId, sourceItem!.id)
+          )
+        );
+    }
 
     await logAdminAction(tx, admin, {
       action: "create",

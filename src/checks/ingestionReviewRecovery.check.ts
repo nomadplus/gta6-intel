@@ -131,6 +131,7 @@ async function createNeedsReviewJob(
             extractedAuthor: overrides.extractedAuthor ?? "Test Author",
             extractedPublishedAt: null,
             extractedExcerpt: overrides.extractedExcerpt ?? "A short excerpt for the review-recovery check.",
+            extractedLinksStaging: [],
           },
   });
 
