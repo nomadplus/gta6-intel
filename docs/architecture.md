@@ -278,42 +278,169 @@ IDs and fixed versions). Three layers, not one:
    predefined XML entities and numeric character references in each
    already-extracted, short URL string, with a hard input-length cap.
 
-**Dedupe (locked design, see migration 0012):** two layers, not one.
-The **application pre-check** (`createSystemDiscoveredJob`) skips
-creating a job if *any* prior `ingestion_jobs` row exists for a
-normalized URL — manual or system-discovered, any status — since
-re-queuing a URL a human already pushed through the pipeline has no
-value. The **database partial unique index**
-(`ingestion_jobs_discovery_feed_normalized_url_unique`, on
-`normalized_url` `WHERE discovery_feed_id IS NOT NULL`) is the
-*authoritative* protection against a race between two overlapping
-invocations: the pre-check alone cannot close that window, only a
-constraint can. A losing insert raises a Postgres `23505` unique
-violation, which the application catches and treats as "already
-discovered," not a hard failure — never aborting the rest of that
-feed's items. The index is deliberately scoped to
-`discovery_feed_id IS NOT NULL` so manual ingestion semantics are
-completely untouched: a manual resubmission of a URL a feed already
-discovered (or vice versa) is unaffected, since manual jobs always have
-`discovery_feed_id = NULL` and fall outside the index's predicate
-entirely.
+**Dedupe: superseded by Phase 6 PR 6.2 (see below).** The
+`createSystemDiscoveredJob` application pre-check described in the
+original Phase 4 PR 10 design (a same-file, same-invocation
+`ingestion_jobs` existence check plus a partial unique index race guard)
+is retired — that function no longer exists. RSS discovery no longer
+creates `ingestion_jobs` directly at all. The `ingestion_jobs_discovery_feed_normalized_url_unique`
+partial unique index (migration 0012) still exists and is still checked
+by the candidate-ledger promotion path described below (as one of
+several unique-constraint conflicts `ON CONFLICT DO NOTHING` covers),
+but the day-to-day dedupe work is now done further upstream, inside the
+candidate ledger itself (candidate identity is one row per normalized
+URL; see "Discovery candidate ledger" below).
 
 **`ingestion_jobs.discovery_feed_id`** (migration 0012, nullable FK to
-`discovery_feeds.id`) records which feed produced a system-discovered
-job — operational/pipeline provenance, populated only when
-`initiated_by = 'system'` and always `NULL` for manual submissions.
-Distinct from the epistemic `source_relationships` provenance graph
-described above.
+`discovery_feeds.id`) still records which feed produced a
+system-discovered job — operational/pipeline provenance, populated only
+when `initiated_by = 'system'` and always `NULL` for manual submissions.
+As of PR 6.2, this column is populated by candidate promotion (copied
+from the promotion origin observation), not by a direct insert at poll
+time. Distinct from the epistemic `source_relationships` provenance
+graph described above.
 
-This route only ever creates `ingestion_jobs` (`status = 'queued'`) — it
-never fetches an article page, runs duplicate detection against
-`source_items`, or touches anything PR 9's processor owns. That
-separation (`discovery` vs. `processing`) is deliberate: the two stages
-are independently replaceable.
+This route performs discovery-ledger recording and ingestion-job
+queueing only — downstream article fetching/processing/claim/AI/provenance
+work remains separate, owned by PR 9's processor. That separation
+(`discovery` vs. `processing`) is deliberate: the two stages are
+independently replaceable.
 
 With PR 10 merged, Phase 4 is complete: every `discovery_feeds` row can
 autonomously produce `ingestion_jobs`, and PR 9 autonomously processes
 them end to end, with no admin click required anywhere in the loop.
+**Phase 6 PR 6.2 (below) changes *how* that happens — RSS now writes
+through the candidate ledger instead of inserting directly — without
+changing this end-to-end guarantee.**
+
+### RSS bridged through the discovery candidate ledger (Phase 6 PR 6.2)
+
+`/api/discovery/poll/route.ts` no longer creates `ingestion_jobs`
+directly. Every valid feed item is now recorded as a discovery sighting
+through the Phase 6 PR 6.1 candidate ledger
+(`recordDiscoverySighting()`, `src/db/mutations/discoveryCandidates.ts`),
+then promoted in two bounded steps once every feed in that invocation
+has finished polling:
+
+```
+claimDueDiscoveryFeeds()
+        ↓
+safeFetch + parseFeed (unchanged)
+        ↓
+per item: recordDiscoverySighting({ rawUrl, discoveryProviderId: rss,
+                                     discoveryFeedId, admissibility: "eligible" })
+        ↓ (on "recorded", collect candidateId into one invocation-wide Set)
+[after ALL feeds finish]
+claimEligibleCandidatesForPromotionByIds([...observedCandidateIds])
+        ↓
+claimEligibleCandidatesForPromotion(RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE)
+        ↓
+ingestion_jobs (queued) — unchanged downstream (PR 9's processor)
+```
+
+**Locked admissibility rule.** Every syntactically valid URL observed
+through an enabled, admin-configured RSS/Atom feed receives
+`admissibility: "eligible"`. This means **pipeline admission only** — it
+conveys zero epistemic trust, confidence, corroboration, independence,
+provenance weight, or truth status. Multiple RSS/feed observations of
+the same URL remain operational discovery facts only
+(`discovery_candidate_observations` rows, per PR 6.1's own design) and
+never influence `claims`, `evidence`, `source_relationships`, claim
+confidence, public status, or any provenance conclusion. That graph
+remains exclusively `analyse_provenance`'s and, ultimately, a human
+reviewer's to decide — though `analyse_provenance` is not the *only*
+mechanism by which a `source_relationships` row can ever come to exist;
+existing human/admin review and write paths on that table remain valid
+independent of it. All existing downstream AI/human review safeguards
+are entirely unaffected by this bridge — a promoted candidate produces
+exactly the same `ingestion_jobs` row shape (`status: 'queued'`,
+`initiated_by: 'system'`) the old direct-insert path produced, entering
+the same downstream pipeline.
+
+**Two-step bounded promotion, no unbounded loop, no shared batch-size
+competition.**
+
+1. `claimEligibleCandidatesForPromotionByIds(candidateIds)`
+   (`src/db/mutations/discoveryCandidates.ts`) — promotes exactly the
+   candidate IDs observed by this invocation (deduplicated into one
+   `Set` across every feed the invocation polled). Internally this is
+   the *same* `selectClaimableCandidates()` query the global function
+   uses, with one additional `inArray(discoveryCandidates.id,
+   candidateIds)` condition AND-ed in, and the *same* shared
+   `promoteClaimedCandidates()` helper (extracted from what was
+   previously `claimEligibleCandidatesForPromotion`'s own inline loop)
+   — every exclusion, origin-selection, and `ON CONFLICT DO NOTHING`
+   race rule from PR 6.1 applies identically. This exists because
+   `selectClaimableCandidates()` orders oldest-first across the *whole*
+   ledger: an unscoped, shared-`LIMIT` call would let an unrelated
+   historical backlog compete for the same batch and potentially starve
+   the candidate IDs observed by this invocation. Filtering to exactly
+   the ids this caller observed removes that competition structurally —
+   the query can only ever match rows from the caller's own set. An
+   empty `candidateIds` array returns `[]` immediately, no transaction
+   opened.
+2. `claimEligibleCandidatesForPromotion(RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE)`
+   — **one bounded call, never looped** — recovers eligible candidates
+   left behind by an earlier invocation whose own promotion step failed
+   partway (crash, timeout). `RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE` is
+   locked at `250`, derived from and pinned (via
+   `src/checks/discoveryPolling.check.ts`'s live invariant check, not a
+   hardcoded duplicate) to
+   `DEFAULT_FEED_POLL_BATCH_SIZE × MAX_ITEMS_PER_FEED = 5 × 50 = 250`.
+   This provides bounded global recovery capacity of up to 250
+   candidates per successful poll invocation, matching one worst-case
+   poll's maximum candidate output — it does **not** guarantee that
+   every candidate stranded by one failed poll is always fully cleared
+   by exactly the next invocation: `FOR UPDATE SKIP LOCKED` can
+   temporarily skip a row still locked by concurrent activity, this
+   call's 250 slots are shared across the entire eligible, claimable
+   backlog (not reserved for any one prior failure), and some
+   candidates may be historically excluded (their normalized URL already
+   exists in `ingestion_jobs`/`source_items`) rather than genuinely
+   promotable at all. What 250 does guarantee is bounded, monotonic
+   forward progress on whatever backlog is currently claimable, every
+   successful invocation. This second call is genuinely global (no id
+   restriction), so it is *possible* — though not the common case — for
+   it to promote a candidate from the same invocation that `SKIP LOCKED`
+   had briefly made unavailable to the id-scoped call and that became
+   claimable by the time this second call ran; not every row promoted
+   here is necessarily old historical backlog, which is why the route's
+   own observability names this metric `globalRecoveryPromoted` rather
+   than implying every result is backlog.
+
+**No new database migration.** Every column, index, trigger, and
+constraint this bridge needs already exists from migration 0028 (PR
+6.1) — PR 6.2 is caller-side wiring plus one new promotion entry point
+(`claimEligibleCandidatesForPromotionByIds`) built by extending the
+existing internal query/helper functions in
+`src/db/mutations/discoveryCandidates.ts`, not by touching the schema.
+
+**URL normalization: a single authoritative boundary.**
+`recordDiscoverySighting()` already calls the canonical `normalizeUrl()`
+internally and returns `{ outcome: "invalid_url", reason }` *before*
+touching either ledger table. The poll route no longer calls
+`normalizeUrl()` itself — a second call at the route level would be
+redundant, not defense-in-depth, since it would be the same pure
+function run twice on the same input. A malformed/unsupported URL still
+produces zero `discovery_candidates` rows, zero
+`discovery_candidate_observations` rows, and zero `ingestion_jobs` rows.
+
+**Observability.** Per feed: `itemsParsed`, `sightingsRecorded` (a valid
+sighting that passed through `recordDiscoverySighting()` — may be a
+same-feed replay; the ledger's own design deliberately does not expose
+that distinction, so this route never claims to know it either — never
+described as "new"/"created"), `malformedUrlsSkipped`. At the
+invocation level: `uniqueCandidateIdsObserved`, `currentPollPromoted`,
+`globalRecoveryPromoted`, `totalJobsPromoted`. No per-feed job/promotion
+attribution is attempted or logged — `PromotedCandidate` is not extended
+for this purpose, and no extra database reads are added solely to
+manufacture that grouping.
+
+**Manual ingestion is completely unaffected.** `src/db/mutations/ingestion.ts`
+(the admin-request-driven mutation surface) shares no code path with any
+of this — it never called `createSystemDiscoveredJob` and does not call
+`recordDiscoverySighting`/`claimEligibleCandidatesForPromotion(ByIds)`
+either.
 
 ### Claims
 
@@ -1426,15 +1553,19 @@ skip the locked candidate (and successfully claim it once the lock
 releases), and two genuinely concurrent calls to the real function never
 promote the same candidate twice.
 
-**Dormant after this PR.** No discovery provider exists yet to call
-`recordDiscoverySighting()`, and no route or cron calls
-`claimEligibleCandidatesForPromotion()`. Both new tables are empty in
-production after this PR deploys — exactly `source_item_links`'s own
-rollout, which existed and was fully tested for one release before
-anything wrote to it in production. `/api/discovery/poll`,
+**No longer dormant as of Phase 6 PR 6.2.** `recordDiscoverySighting()`
+and `claimEligibleCandidatesForPromotion()` were dormant when PR 6.1
+deployed — no discovery provider called the former, and no route/cron
+called the latter, exactly like `source_item_links`'s own rollout one
+release earlier. As of PR 6.2, `/api/discovery/poll` is the first real
+caller of both, bridging the existing RSS/Atom poller through this
+ledger instead of creating `ingestion_jobs` directly (see "RSS bridged
+through the discovery candidate ledger" above for the exact flow,
+including the new `claimEligibleCandidatesForPromotionByIds()` entry
+point PR 6.2 added alongside the two functions described here).
 `discoveryPolling.ts`, the RSS production path, `pipeline.ts`, the
 ingestion processor, `safeFetch`, cron configuration, `discovery_feeds`,
-and the admin UI are all unchanged by this PR.
+and the admin UI are otherwise unchanged.
 
 ### Status history (the two append-only ledgers)
 

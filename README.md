@@ -367,9 +367,26 @@ the stable alias domain.
   or evidence. A companion promotion function claims eligible,
   not-yet-ingested candidates and creates `ingestion_jobs` rows for
   them, proven correct under concurrency (`FOR UPDATE SKIP LOCKED`) and
-  against a candidate whose URL was already historically ingested. No
-  production route or cron calls either function yet — the new tables
-  are unused/empty until a later PR wires a real discovery provider in.
+  against a candidate whose URL was already historically ingested.
+- **Phase 6 PR 6.2** — RSS/Atom discovery now writes through the PR 6.1
+  ledger instead of creating `ingestion_jobs` directly: every
+  syntactically valid URL from an enabled, admin-configured feed is
+  recorded with `admissibility: "eligible"` — pipeline admission only,
+  never epistemic trust; multiple feed sightings of the same URL remain
+  operational facts only, never corroboration. Promotion runs once per
+  poll invocation in two bounded steps, never an unbounded loop: first,
+  the candidate ids that invocation itself observed are promoted
+  through a new id-scoped entry point
+  (`claimEligibleCandidatesForPromotionByIds`), immune to competition
+  from any unrelated historical backlog; then one bounded global
+  recovery call (quota `250`, derived from
+  `5 feeds × 50 items/feed` — one complete worst-case failed poll's
+  output) recovers eligible candidates an earlier invocation's
+  promotion step failed to promote. Manual ingestion remains completely
+  separate and unaffected. No schema migration — every column, index,
+  and trigger this bridge needs already existed from PR 6.1's migration
+  0028. `/api/discovery/poll` runs at `04:00 UTC`;
+  `/api/ingestion/process` at `06:00 UTC` — a 2-hour gap.
 
 The current focus is the remainder of Phase 6: wiring an actual
 discovery provider (candidate sources may include forums, social

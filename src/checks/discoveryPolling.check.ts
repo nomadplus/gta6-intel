@@ -1,14 +1,28 @@
 /**
- * Regression check for Phase 4 PR 10 (src/db/mutations/discoveryPolling.ts,
+ * Regression check for Phase 4 PR 10 / Phase 6 PR 6.2
+ * (src/db/mutations/discoveryPolling.ts,
  * src/lib/ingestion/discoveryPollingLifecycle.ts): due-feed selection,
  * FOR UPDATE SKIP LOCKED claim safety, the last_polled_at/last_poll_status
- * claim write, the discovery pre-check dedupe (any prior job, manual or
- * system), the partial-unique-index race between two concurrent
- * system-discovery inserts for the same normalized URL, and correct
- * column population on created jobs.
+ * claim write, and the RSS provider identity lookup.
+ *
+ * Phase 6 PR 6.2 retired createSystemDiscoveredJob() -- RSS no longer
+ * creates ingestion_jobs directly. This file no longer exercises that
+ * function (it doesn't exist anymore); the RSS-through-the-candidate-
+ * ledger behavior it used to cover (dedupe, column population on created
+ * jobs, the partial-unique-index race) is now covered by
+ * discoveryCandidateLedger.check.ts's own recordDiscoverySighting() /
+ * claimEligibleCandidatesForPromotion(ByIds)() coverage, since that is
+ * where the actual logic now lives. What THIS file adds for PR 6.2 is
+ * the recovery-capacity invariant below: a live, non-hardcoded proof
+ * that RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE actually covers one
+ * complete worst-case poll invocation's own output
+ * (DEFAULT_FEED_POLL_BATCH_SIZE x MAX_ITEMS_PER_FEED), so a future
+ * change to either upstream constant that isn't also reflected in the
+ * recovery quota fails this check loudly rather than silently going
+ * stale.
  *
  * This exercises the REAL mutation functions (claimDueDiscoveryFeeds,
- * recordFeedPollOutcome, createSystemDiscoveredJob), not a
+ * recordFeedPollOutcome, getRssDiscoveryProviderId), not a
  * reimplementation -- all are "server-only"-guarded, so this must run
  * with `--conditions=react-server`, same as ingestionProcessor.check.ts.
  *
@@ -16,11 +30,9 @@
  * an automated poller -- see requireCronSecret.ts for that boundary
  * instead), so this check needs no LOCAL_FAKE_ADMIN_AUTH_USER_ID bypass.
  *
- * Seeds real discovery_feeds and ingestion_jobs rows directly (bypassing
- * createDiscoveryFeed/findOrCreateIngestionJob, which aren't the things
- * under test here) and removes everything it created in a finally
- * block, so this is safe to run repeatedly against the shared local dev
- * database.
+ * Seeds real discovery_feeds rows directly and removes everything it
+ * created in a finally block, so this is safe to run repeatedly against
+ * the shared local dev database.
  *
  * Run with: npx tsx --conditions=react-server src/checks/discoveryPolling.check.ts
  * (requires CHECK_DATABASE_URL, ADMIN_DATABASE_URL -- see README.md
@@ -30,13 +42,17 @@ import { randomUUID } from "node:crypto";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { eq, inArray } from "drizzle-orm";
-import { discoveryFeeds, ingestionJobs, discoveryProviders } from "../db/schema";
+import { discoveryFeeds, discoveryProviders } from "../db/schema";
+import { claimDueDiscoveryFeeds, recordFeedPollOutcome, getRssDiscoveryProviderId } from "../db/mutations/discoveryPolling";
 import {
-  claimDueDiscoveryFeeds,
-  recordFeedPollOutcome,
-  createSystemDiscoveredJob,
-} from "../db/mutations/discoveryPolling";
-import { isFeedDue, IN_PROGRESS_POLL_STATUS } from "../lib/ingestion/discoveryPollingLifecycle";
+  isFeedDue,
+  IN_PROGRESS_POLL_STATUS,
+  DEFAULT_FEED_POLL_BATCH_SIZE,
+  RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE,
+  PartialFeedPollError,
+  partialCountsFromUnexpectedFeedError,
+} from "../lib/ingestion/discoveryPollingLifecycle";
+import { MAX_ITEMS_PER_FEED } from "../lib/ingestion/feedParsing";
 
 let failures = 0;
 
@@ -51,7 +67,7 @@ function assert(condition: boolean, message: string) {
 
 // Seeded reference data (src/db/seed/seed.ts) -- the first source row in
 // a freshly seeded database. Any valid source id works here since this
-// check is about polling/job-creation logic, not source identity.
+// check is about polling logic, not source identity.
 const SEEDED_SOURCE_ID = 1;
 
 const NOW = new Date();
@@ -60,16 +76,9 @@ function testFeedUrl(label: string): string {
   return `https://example.test/discovery-poll-check-feed-${label}-${randomUUID()}`;
 }
 
-function testItemUrl(label: string): string {
-  return `https://example.test/discovery-poll-check-item-${label}-${randomUUID()}`;
-}
-
 async function main() {
   if (process.env.NODE_ENV === "production") {
-    throw new Error(
-      "Refusing to run: this check performs real writes against discovery_feeds and " +
-        "ingestion_jobs and must never be pointed at a production database."
-    );
+    throw new Error("Refusing to run: this check performs real writes against discovery_feeds and must never be pointed at a production database.");
   }
   const checkConnectionString = process.env.CHECK_DATABASE_URL;
   if (!checkConnectionString) {
@@ -79,7 +88,6 @@ async function main() {
   const pool = new Pool({ connectionString: checkConnectionString });
   const db = drizzle(pool);
   const createdFeedIds: number[] = [];
-  const createdJobIds: number[] = [];
 
   async function seedFeed(overrides: {
     enabled?: boolean;
@@ -105,33 +113,8 @@ async function main() {
     return row!;
   }
 
-  async function seedManualJob(normalizedUrl: string): Promise<number> {
-    const [manualProvider] = await db
-      .select({ id: discoveryProviders.id })
-      .from(discoveryProviders)
-      .where(eq(discoveryProviders.slug, "manual"));
-    const [row] = await db
-      .insert(ingestionJobs)
-      .values({
-        submittedUrl: normalizedUrl,
-        normalizedUrl,
-        discoveryProviderId: manualProvider!.id,
-        initiatedBy: "human",
-        adminUserId: null,
-        status: "queued",
-        discoveryFeedId: null,
-      })
-      .returning({ id: ingestionJobs.id });
-    createdJobIds.push(row!.id);
-    return row!.id;
-  }
-
-  async function jobsForNormalizedUrl(normalizedUrl: string) {
-    return db.select().from(ingestionJobs).where(eq(ingestionJobs.normalizedUrl, normalizedUrl));
-  }
-
   try {
-    console.log("=== Discovery polling: claim, dedupe, race safety (real functions, --conditions=react-server) ===\n");
+    console.log("=== Discovery polling: claim, dedupe, race safety, recovery-quota invariant (real functions, --conditions=react-server) ===\n");
 
     // -------------------------------------------------------------------
     // isFeedDue -- pure logic, no DB
@@ -148,6 +131,57 @@ async function main() {
     assert(
       !isFeedDue({ enabled: false, lastPolledAt: null, pollingIntervalMinutes: 60 }, NOW),
       "a disabled feed is never due, even if never polled"
+    );
+
+    // -------------------------------------------------------------------
+    // Phase 6 PR 6.2 correction: partial-feed unexpected-error
+    // observability. Pure logic, no DB -- proves
+    // partialCountsFromUnexpectedFeedError() recovers truthful partial
+    // progress from a PartialFeedPollError (the actual bug this
+    // correction fixes: an unexpected exception partway through a feed's
+    // item loop used to be reported as flat zeros, even when several
+    // items had already been successfully recorded), and still falls
+    // back safely to all-zero for any other kind of thrown value.
+    // -------------------------------------------------------------------
+    const partialFromRealError = partialCountsFromUnexpectedFeedError(
+      new PartialFeedPollError(12, 9, 2, new Error("simulated unexpected failure on item 10 of 12"))
+    );
+    assert(
+      partialFromRealError.itemsParsed === 12 && partialFromRealError.sightingsRecorded === 9 && partialFromRealError.malformedUrlsSkipped === 2,
+      `partialCountsFromUnexpectedFeedError() recovers the exact counts a PartialFeedPollError carried (got ${JSON.stringify(partialFromRealError)}, expected {itemsParsed: 12, sightingsRecorded: 9, malformedUrlsSkipped: 2})`
+    );
+
+    const partialFromOrdinaryError = partialCountsFromUnexpectedFeedError(new Error("some other unrelated exception"));
+    assert(
+      partialFromOrdinaryError.itemsParsed === 0 &&
+        partialFromOrdinaryError.sightingsRecorded === 0 &&
+        partialFromOrdinaryError.malformedUrlsSkipped === 0,
+      "partialCountsFromUnexpectedFeedError() falls back to all-zero for an ordinary (non-PartialFeedPollError) exception"
+    );
+
+    const partialFromNonError = partialCountsFromUnexpectedFeedError("a thrown string, not even an Error instance");
+    assert(
+      partialFromNonError.itemsParsed === 0 && partialFromNonError.sightingsRecorded === 0 && partialFromNonError.malformedUrlsSkipped === 0,
+      "partialCountsFromUnexpectedFeedError() falls back to all-zero for a thrown non-Error value too"
+    );
+
+    // The specific edge case this correction targets: ALL items in the
+    // feed were already successfully processed (sightingsRecorded +
+    // malformedUrlsSkipped together account for every parsed item) when
+    // the exception occurred -- e.g. pollOneFeed's final, success-path
+    // recordFeedPollOutcome() write itself threw, after every item had
+    // already been recorded. The counts must still be reported in full,
+    // not falsely zeroed just because the failure happened at the very
+    // end rather than partway through.
+    const partialFromFullCompletion = partialCountsFromUnexpectedFeedError(
+      new PartialFeedPollError(5, 4, 1, new Error("simulated failure writing the final success-path poll outcome"))
+    );
+    assert(
+      partialFromFullCompletion.itemsParsed === 5 &&
+        partialFromFullCompletion.sightingsRecorded === 4 &&
+        partialFromFullCompletion.malformedUrlsSkipped === 1 &&
+        partialFromFullCompletion.sightingsRecorded + partialFromFullCompletion.malformedUrlsSkipped === partialFromFullCompletion.itemsParsed,
+      `partialCountsFromUnexpectedFeedError() reports full item-processing progress even when the failure occurs after every item was already handled (got ${JSON.stringify(partialFromFullCompletion)})`
     );
 
     // -------------------------------------------------------------------
@@ -200,10 +234,10 @@ async function main() {
     // recordFeedPollOutcome -- overwrites last_poll_status, leaves last_polled_at alone
     // -------------------------------------------------------------------
     const polledAtBeforeOutcome = (await getFeed(dueId)).lastPolledAt;
-    await recordFeedPollOutcome(dueId, "ok: 3 items, 1 new, 2 already discovered");
+    await recordFeedPollOutcome(dueId, "ok: 3 items parsed, 3 sightings recorded, 0 malformed skipped");
     const feedAfterOutcome = await getFeed(dueId);
     assert(
-      feedAfterOutcome.lastPollStatus === "ok: 3 items, 1 new, 2 already discovered",
+      feedAfterOutcome.lastPollStatus === "ok: 3 items parsed, 3 sightings recorded, 0 malformed skipped",
       `recordFeedPollOutcome writes the final outcome string (got "${feedAfterOutcome.lastPollStatus}")`
     );
     assert(
@@ -230,80 +264,43 @@ async function main() {
     );
 
     // -------------------------------------------------------------------
-    // Discovery pre-check dedupe: skip if ANY prior job exists (manual or system)
+    // RSS discovery-provider identity (Phase 6 PR 6.2 -- now exported)
     // -------------------------------------------------------------------
-    const feedForDedupeTest = await seedFeed({ lastPolledAt: null });
-    const manualUrl = testItemUrl("manual-precheck");
-    await seedManualJob(manualUrl);
-
-    const precheckResult = await createSystemDiscoveredJob({
-      submittedUrl: manualUrl,
-      normalizedUrl: manualUrl,
-      discoveryFeedId: feedForDedupeTest,
-    });
+    const rssProviderId = await getRssDiscoveryProviderId();
+    const [rssProviderRow] = await db.select().from(discoveryProviders).where(eq(discoveryProviders.slug, "rss"));
     assert(
-      precheckResult.outcome === "already_discovered",
-      `a URL already covered by a prior MANUAL job is skipped by the system pre-check (got "${precheckResult.outcome}")`
+      rssProviderId === rssProviderRow!.id,
+      `getRssDiscoveryProviderId() returns the seeded 'rss' discovery_providers row's id (got ${rssProviderId}, expected ${rssProviderRow!.id})`
     );
-    const jobsForManualUrl = await jobsForNormalizedUrl(manualUrl);
-    assert(jobsForManualUrl.length === 1, "no second (system) job is created for a URL a manual job already covers");
+    const rssProviderIdSecondCall = await getRssDiscoveryProviderId();
+    assert(rssProviderIdSecondCall === rssProviderId, "getRssDiscoveryProviderId() returns a stable, cached id across calls");
 
     // -------------------------------------------------------------------
-    // Column correctness on a genuinely new system-discovered job
+    // Phase 6 PR 6.2: recovery-capacity invariant.
+    //
+    // RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE is a LOCKED value (250), not
+    // derived at runtime from DEFAULT_FEED_POLL_BATCH_SIZE x
+    // MAX_ITEMS_PER_FEED (see discoveryPollingLifecycle.ts's own header
+    // for why -- avoiding an import-cycle risk between that module and
+    // feedParsing.ts). This check is what actually pins the relationship:
+    // it imports both real upstream constants directly and asserts the
+    // arithmetic, so a future change to DEFAULT_FEED_POLL_BATCH_SIZE or
+    // MAX_ITEMS_PER_FEED that isn't also reflected in the recovery quota
+    // fails this check loudly, rather than silently leaving
+    // RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE stale.
     // -------------------------------------------------------------------
-    const freshUrl = testItemUrl("fresh");
-    const createResult = await createSystemDiscoveredJob({
-      submittedUrl: freshUrl + "?utm_source=feed", // deliberately different from normalizedUrl, to prove submittedUrl is stored as-given
-      normalizedUrl: freshUrl,
-      discoveryFeedId: feedForDedupeTest,
-    });
-    assert(createResult.outcome === "created", `a genuinely new URL creates a job (got "${createResult.outcome}")`);
-    if (createResult.outcome === "created") {
-      createdJobIds.push(createResult.jobId);
-      const [createdRow] = await db.select().from(ingestionJobs).where(eq(ingestionJobs.id, createResult.jobId));
-      assert(createdRow?.discoveryFeedId === feedForDedupeTest, "created job's discovery_feed_id matches the polling feed");
-      assert(createdRow?.initiatedBy === "system", `created job's initiated_by is 'system' (got "${createdRow?.initiatedBy}")`);
-      assert(createdRow?.adminUserId === null, "created job's admin_user_id is null");
-      assert(createdRow?.status === "queued", "created job's status is 'queued'");
-      assert(
-        createdRow?.submittedUrl === freshUrl + "?utm_source=feed",
-        "created job's submitted_url preserves the raw feed-supplied URL, distinct from normalized_url"
-      );
-
-      const [rssProvider] = await db.select().from(discoveryProviders).where(eq(discoveryProviders.slug, "rss"));
-      assert(createdRow?.discoveryProviderId === rssProvider!.id, "created job's discovery_provider_id is the seeded 'rss' provider");
-    }
-
-    // -------------------------------------------------------------------
-    // Partial unique index race: two concurrent system inserts for the
-    // SAME normalized URL produce exactly one job.
-    // -------------------------------------------------------------------
-    const raceFeedId = await seedFeed({ lastPolledAt: null });
-    const raceUrl = testItemUrl("race");
-
-    const [raceResultA, raceResultB] = await Promise.all([
-      createSystemDiscoveredJob({ submittedUrl: raceUrl, normalizedUrl: raceUrl, discoveryFeedId: raceFeedId }),
-      createSystemDiscoveredJob({ submittedUrl: raceUrl, normalizedUrl: raceUrl, discoveryFeedId: raceFeedId }),
-    ]);
-
-    const outcomes = [raceResultA.outcome, raceResultB.outcome].sort();
+    const worstCaseCandidatesPerPoll = DEFAULT_FEED_POLL_BATCH_SIZE * MAX_ITEMS_PER_FEED;
     assert(
-      outcomes[0] === "already_discovered" && outcomes[1] === "created",
-      `two concurrent system-discovery attempts for the same normalized URL yield exactly one 'created' and one 'already_discovered' (got [${outcomes.join(", ")}])`
+      worstCaseCandidatesPerPoll === 250,
+      `sanity check on this check's own inputs: DEFAULT_FEED_POLL_BATCH_SIZE (${DEFAULT_FEED_POLL_BATCH_SIZE}) x MAX_ITEMS_PER_FEED (${MAX_ITEMS_PER_FEED}) = ${worstCaseCandidatesPerPoll}, expected 250`
     );
-
-    if (raceResultA.outcome === "created") createdJobIds.push(raceResultA.jobId);
-    if (raceResultB.outcome === "created") createdJobIds.push(raceResultB.jobId);
-
-    const raceRows = await jobsForNormalizedUrl(raceUrl);
     assert(
-      raceRows.length === 1,
-      `exactly one ingestion_jobs row exists for the raced normalized URL, proving the partial unique index (not just the pre-check) is what prevented a duplicate (got ${raceRows.length} rows)`
+      RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE >= worstCaseCandidatesPerPoll,
+      `RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE (${RSS_POLL_BACKLOG_RECOVERY_BATCH_SIZE}) covers one complete worst-case failed poll's own output ` +
+        `(DEFAULT_FEED_POLL_BATCH_SIZE x MAX_ITEMS_PER_FEED = ${worstCaseCandidatesPerPoll}) -- this is the exact invariant that would catch a future ` +
+        `increase to either upstream constant silently making the recovery quota stale`
     );
   } finally {
-    if (createdJobIds.length > 0) {
-      await db.delete(ingestionJobs).where(inArray(ingestionJobs.id, createdJobIds));
-    }
     if (createdFeedIds.length > 0) {
       await db.delete(discoveryFeeds).where(inArray(discoveryFeeds.id, createdFeedIds));
     }

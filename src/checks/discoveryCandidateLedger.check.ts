@@ -58,20 +58,45 @@
  *     NULL) for every value pg_enum currently reports for
  *     discovery_admissibility, read live rather than hardcoded
  *
+ * Phase 6 PR 6.2 additions -- claimEligibleCandidatesForPromotionByIds(),
+ * the candidate-id-scoped promotion entry point added so the RSS poller
+ * can promote its own current-invocation candidates independent of any
+ * unrelated historical backlog:
+ *   - a candidate id NOT in the supplied set is never promoted by the
+ *     scoped call, even when it is eligible and otherwise claimable
+ *   - a large older eligible backlog cannot starve the scoped call's own
+ *     supplied ids -- the actual regression the unscoped design would
+ *     have been vulnerable to
+ *   - the same ingestion_jobs/source_items historical exclusions apply
+ *     inside the scoped path exactly as they do in the global path
+ *     (same shared query, same shared promoteClaimedCandidates() helper)
+ *   - raw submitted_url / normalized_url / candidate-observation
+ *     pairing are correct through the scoped path
+ *   - two different feeds observing the same URL collapse to one
+ *     candidate id, and the scoped call promotes it exactly once
+ *   - concurrent scoped calls (and a scoped call concurrent with a
+ *     global call) never produce two jobs for one candidate
+ *   - an empty candidate id array returns [] with no promotion side
+ *     effects
+ *   - calling the scoped function BEFORE the global recovery function,
+ *     in that exact order (matching src/app/api/discovery/poll/route.ts's
+ *     own sequence), promotes current-invocation candidates first and
+ *     the subsequent global call does not re-touch them
+ *
  * Cleanup note: discovery_candidates/discovery_candidate_observations
  * rows can never be deleted (migration 0028's own triggers) and this
  * check does not attempt to -- that part of the ledger's append-only
  * design is unaffected. What this check DOES clean up, in a top-level
  * finally block so it runs even if an assertion fails: every
  * ingestion_jobs row it created (directly, or via
- * claimEligibleCandidatesForPromotion -- tracked through the
- * promoteAndTrack() wrapper below) is transitioned to the real
- * 'blocked_by_policy' terminal status via the actual
- * completeWithFailure() patch builder (never claimable again by
- * claimEligibleIngestionJobsForProcessing, regardless of status/
- * nextRetryAt), and both synthetic discovery_feeds rows this check
- * creates are disabled (enabled=false, never due for polling). This is
- * what makes this check, and check:ingestion-processor after it,
+ * claimEligibleCandidatesForPromotion/claimEligibleCandidatesForPromotionByIds --
+ * tracked through the promoteAndTrack()/promoteByIdsAndTrack() wrappers
+ * below) is transitioned to the real 'blocked_by_policy' terminal status
+ * via the actual completeWithFailure() patch builder (never claimable
+ * again by claimEligibleIngestionJobsForProcessing, regardless of
+ * status/nextRetryAt), and both synthetic discovery_feeds rows this
+ * check creates are disabled (enabled=false, never due for polling).
+ * This is what makes this check, and check:ingestion-processor after it,
  * rerunnable against the same database without a reset -- a 'queued'
  * job left behind by an earlier run of this check was previously
  * claimable by an unrelated later check's own eligible-job query,
@@ -94,7 +119,11 @@ import {
   discoveryFeeds,
 } from "../db/schema";
 import { adminDb } from "../db/adminClient";
-import { recordDiscoverySighting, claimEligibleCandidatesForPromotion } from "../db/mutations/discoveryCandidates";
+import {
+  recordDiscoverySighting,
+  claimEligibleCandidatesForPromotion,
+  claimEligibleCandidatesForPromotionByIds,
+} from "../db/mutations/discoveryCandidates";
 import { fakeSighting, MANUAL_PROVIDER_ID, RSS_PROVIDER_ID } from "./helpers/fakeDiscoveryProvider";
 import { normalizeUrl } from "../lib/ingestion/urlNormalization";
 import { completeWithFailure } from "../lib/ingestion/ingestionJobLifecycle";
@@ -170,6 +199,12 @@ async function main() {
 
   async function promoteAndTrack(batchSize: number): Promise<PromotedCandidate[]> {
     const result = await claimEligibleCandidatesForPromotion(batchSize);
+    createdIngestionJobIds.push(...result.map((p) => p.ingestionJobId));
+    return result;
+  }
+
+  async function promoteByIdsAndTrack(candidateIds: number[]): Promise<PromotedCandidate[]> {
+    const result = await claimEligibleCandidatesForPromotionByIds(candidateIds);
     createdIngestionJobIds.push(...result.map((p) => p.ingestionJobId));
     return result;
   }
@@ -673,6 +708,304 @@ async function main() {
       !promoted.some((p) => p.candidateId === sighting.candidateId),
       "a candidate whose normalized URL already exists in source_items is never promoted"
     );
+  }
+
+  // =========================================================================
+  // Phase 6 PR 6.2 -- claimEligibleCandidatesForPromotionByIds()
+  // =========================================================================
+
+  // --- 17. Empty candidate-id array returns [] with no side effects -------
+  {
+    const emptyResult = await claimEligibleCandidatesForPromotionByIds([]);
+    assert(Array.isArray(emptyResult) && emptyResult.length === 0, "claimEligibleCandidatesForPromotionByIds([]) returns []");
+    // Not claimed here: that this avoided a database round trip. The
+    // function's own source is what actually guarantees the short-circuit
+    // (an early `if (candidateIds.length === 0) return [];` before
+    // adminDb.transaction() is ever called) -- this check only has the
+    // tools to observe the OUTPUT contract, not to instrument the
+    // absence of a query, so it asserts exactly that and no more.
+  }
+
+  // --- 18. A candidate id NOT in the supplied set is never promoted by
+  // the scoped call, even though it is eligible and otherwise perfectly
+  // claimable -- the core guarantee claimEligibleCandidatesForPromotionByIds
+  // exists to provide. ------------------------------------------------
+  {
+    const includedUrl = `https://example.test/scoped-included-${randomUUID()}`;
+    const excludedUrl = `https://example.test/scoped-excluded-${randomUUID()}`;
+    const included = await recordDiscoverySighting(fakeSighting({ rawUrl: includedUrl, admissibility: "eligible" }));
+    const excluded = await recordDiscoverySighting(fakeSighting({ rawUrl: excludedUrl, admissibility: "eligible" }));
+    if (included.outcome !== "recorded" || excluded.outcome !== "recorded") throw new Error("test setup error");
+
+    const promoted = await promoteByIdsAndTrack([included.candidateId]);
+    assert(
+      promoted.some((p) => p.candidateId === included.candidateId),
+      "scoped promotion promotes a candidate id that IS in the supplied set"
+    );
+    assert(
+      !promoted.some((p) => p.candidateId === excluded.candidateId),
+      "scoped promotion never promotes a candidate id that is NOT in the supplied set, even though it is eligible and claimable"
+    );
+
+    const excludedStillUnpromoted = await db
+      .select({ id: ingestionJobs.id })
+      .from(ingestionJobs)
+      .where(eq(ingestionJobs.discoveryCandidateId, excluded.candidateId));
+    assert(
+      excludedStillUnpromoted.length === 0,
+      "the out-of-scope candidate has no ingestion_jobs row after the scoped call -- it remains eligible and claimable by a later call"
+    );
+  }
+
+  // --- 19. Starvation regression: a large older eligible backlog cannot
+  // consume the scoped call's capacity for a caller's own current-poll
+  // ids. This is the exact bug the unscoped, shared-LIMIT design (a
+  // single claimEligibleCandidatesForPromotion(batchSize) call, or a
+  // bounded loop over it) would have been vulnerable to: backlog and
+  // fresh discoveries competing for the same LIMIT. The scoped call
+  // structurally cannot suffer from this, because its query can only
+  // ever match rows from the supplied id set. ------------------------
+  {
+    const BACKLOG_SIZE = 15; // deliberately > DEFAULT_PROMOTION_BATCH_SIZE (10, private to discoveryCandidates.ts)
+    const backlogCandidateIds: number[] = [];
+    for (let i = 0; i < BACKLOG_SIZE; i++) {
+      const url = `https://example.test/starvation-backlog-${i}-${randomUUID()}`;
+      const sighting = await recordDiscoverySighting(fakeSighting({ rawUrl: url, admissibility: "eligible" }));
+      if (sighting.outcome !== "recorded") throw new Error("test setup error");
+      backlogCandidateIds.push(sighting.candidateId);
+    }
+
+    const CURRENT_POLL_SIZE = 3;
+    const currentPollCandidateIds: number[] = [];
+    for (let i = 0; i < CURRENT_POLL_SIZE; i++) {
+      const url = `https://example.test/starvation-current-poll-${i}-${randomUUID()}`;
+      const sighting = await recordDiscoverySighting(fakeSighting({ rawUrl: url, admissibility: "eligible" }));
+      if (sighting.outcome !== "recorded") throw new Error("test setup error");
+      currentPollCandidateIds.push(sighting.candidateId);
+    }
+
+    // Scoped call sees ONLY the current-poll ids -- the 15-row backlog is
+    // deliberately never passed in, exactly like the RSS poll route,
+    // which only ever passes the ids it itself observed this invocation.
+    const promoted = await promoteByIdsAndTrack(currentPollCandidateIds);
+    const promotedIds = new Set(promoted.map((p) => p.candidateId));
+
+    assert(
+      currentPollCandidateIds.every((id) => promotedIds.has(id)),
+      `every one of this "poll"'s ${CURRENT_POLL_SIZE} own candidates is promoted, independent of the ${BACKLOG_SIZE}-row older backlog sitting in the same table (the old global-batchSize-only design would have failed this)`
+    );
+    assert(
+      !backlogCandidateIds.some((id) => promotedIds.has(id)),
+      "the scoped call promotes none of the backlog candidates (they were never in its id set)"
+    );
+
+    // Leave the 15 backlog candidates genuinely eligible and unpromoted --
+    // section 20 below reuses this exact backlog to prove global recovery
+    // picks it up afterward, in the same order the route actually calls
+    // these two functions.
+  }
+
+  // --- 20. Ordering: scoped promotion BEFORE global recovery, matching
+  // src/app/api/discovery/poll/route.ts's own call sequence exactly.
+  // Proves that once the scoped call has already promoted a caller's
+  // current-poll candidates, a SUBSEQUENT global recovery call does not
+  // re-touch them (they now have ingestion_jobs rows, so the shared
+  // ingestion_jobs exclusion in selectClaimableCandidates already
+  // filters them out) -- and that the same global call DOES make
+  // progress on genuinely older eligible backlog. ---------------------
+  {
+    const backlogUrl = `https://example.test/ordering-backlog-${randomUUID()}`;
+    const currentPollUrl = `https://example.test/ordering-current-poll-${randomUUID()}`;
+    const backlogSighting = await recordDiscoverySighting(fakeSighting({ rawUrl: backlogUrl, admissibility: "eligible" }));
+    const currentPollSighting = await recordDiscoverySighting(fakeSighting({ rawUrl: currentPollUrl, admissibility: "eligible" }));
+    if (backlogSighting.outcome !== "recorded" || currentPollSighting.outcome !== "recorded") {
+      throw new Error("test setup error");
+    }
+
+    // Step 1, exactly as the route does it: scope to this "invocation"'s
+    // own observed id only.
+    const scopedResult = await promoteByIdsAndTrack([currentPollSighting.candidateId]);
+    assert(
+      scopedResult.some((p) => p.candidateId === currentPollSighting.candidateId),
+      "step 1 (scoped): the current-poll candidate is promoted first"
+    );
+
+    // Step 2, exactly as the route does it next: one bounded global call.
+    const globalResult = await promoteAndTrack(50);
+    assert(
+      !globalResult.some((p) => p.candidateId === currentPollSighting.candidateId),
+      "step 2 (global recovery): does not re-promote the candidate step 1 already promoted (it now has an ingestion_jobs row, so the shared exclusion filters it out)"
+    );
+    assert(
+      globalResult.some((p) => p.candidateId === backlogSighting.candidateId),
+      "step 2 (global recovery): DOES make progress on genuinely older eligible backlog left unpromoted"
+    );
+  }
+
+  // --- 21. Two different feeds observing the same URL collapse to ONE
+  // candidate id; the scoped call given that single id promotes it
+  // exactly once (mirrors section 8/9's cross-feed behavior, exercised
+  // here specifically through the scoped promotion path). ------------
+  {
+    const sharedUrl = `https://example.test/scoped-cross-feed-${randomUUID()}`;
+    const sightingViaFeedA = await recordDiscoverySighting(
+      fakeSighting({ rawUrl: sharedUrl, admissibility: "eligible", discoveryProviderId: RSS_PROVIDER_ID, discoveryFeedId: feedA!.id })
+    );
+    const sightingViaFeedB = await recordDiscoverySighting(
+      fakeSighting({ rawUrl: sharedUrl, admissibility: "eligible", discoveryProviderId: RSS_PROVIDER_ID, discoveryFeedId: feedB!.id })
+    );
+    if (sightingViaFeedA.outcome !== "recorded" || sightingViaFeedB.outcome !== "recorded") {
+      throw new Error("test setup error");
+    }
+    assert(
+      sightingViaFeedA.candidateId === sightingViaFeedB.candidateId,
+      "two different feeds observing the same URL collapse to the same candidate id (sanity check on this section's own setup)"
+    );
+    assert(
+      sightingViaFeedA.observationId !== sightingViaFeedB.observationId,
+      "two different feeds still produce distinct observation rows (sanity check on this section's own setup)"
+    );
+
+    const promoted = await promoteByIdsAndTrack([sightingViaFeedA.candidateId]);
+    assert(
+      promoted.filter((p) => p.candidateId === sightingViaFeedA.candidateId).length === 1,
+      "the scoped call promotes the shared candidate exactly once"
+    );
+    const jobsForSharedCandidate = await db
+      .select({ id: ingestionJobs.id })
+      .from(ingestionJobs)
+      .where(eq(ingestionJobs.discoveryCandidateId, sightingViaFeedA.candidateId));
+    assert(jobsForSharedCandidate.length === 1, "exactly one ingestion_jobs row exists for the cross-feed-shared candidate");
+  }
+
+  // --- 22. Raw submitted_url / normalized_url / candidate-observation
+  // pairing remain correct through the SCOPED path -- same assertions
+  // as section 10c, run through claimEligibleCandidatesForPromotionByIds
+  // instead of the global function, proving the shared
+  // promoteClaimedCandidates() helper behaves identically either way. --
+  {
+    const rawUrlWithTracking = `https://example.test/scoped-tracked-${randomUUID()}/?utm_source=discovery-check`;
+    const expectedNormalized = normalizeUrl(rawUrlWithTracking);
+    if (!expectedNormalized.ok) throw new Error("test setup error: rawUrlWithTracking should normalize successfully");
+
+    const sighting = await recordDiscoverySighting(fakeSighting({ rawUrl: rawUrlWithTracking, admissibility: "eligible" }));
+    if (sighting.outcome !== "recorded") throw new Error("test setup error");
+
+    const promoted = await promoteByIdsAndTrack([sighting.candidateId]);
+    assert(
+      promoted.some((p) => p.candidateId === sighting.candidateId),
+      "the scoped call promotes the tracked-URL candidate"
+    );
+
+    const [job] = await db
+      .select({
+        submittedUrl: ingestionJobs.submittedUrl,
+        normalizedUrl: ingestionJobs.normalizedUrl,
+        discoveryCandidateId: ingestionJobs.discoveryCandidateId,
+        discoveryCandidateObservationId: ingestionJobs.discoveryCandidateObservationId,
+      })
+      .from(ingestionJobs)
+      .where(eq(ingestionJobs.discoveryCandidateId, sighting.candidateId));
+    assert(job?.submittedUrl === rawUrlWithTracking, "scoped-path job.submitted_url is the origin observation's raw observed URL");
+    assert(job?.normalizedUrl === expectedNormalized.normalizedUrl, "scoped-path job.normalized_url is the candidate's normalized URL");
+    assert(
+      job?.discoveryCandidateId === sighting.candidateId && job?.discoveryCandidateObservationId === sighting.observationId,
+      "scoped-path job populates discovery_candidate_id/discovery_candidate_observation_id as a matching pair"
+    );
+  }
+
+  // --- 23. Historical exclusions (ingestion_jobs / source_items) still
+  // apply INSIDE the scoped path -- proves the scoped query shares the
+  // exact same exclusion predicate as the global one (an added
+  // inArray() filter, not a second divergent query). ------------------
+  {
+    const blockedByJobUrl = `https://example.test/scoped-blocked-by-job-${randomUUID()}`;
+    const [blockingJob] = await adminDb
+      .insert(ingestionJobs)
+      .values({
+        submittedUrl: blockedByJobUrl,
+        normalizedUrl: blockedByJobUrl,
+        discoveryProviderId: MANUAL_PROVIDER_ID,
+        initiatedBy: "human",
+        status: "queued",
+      })
+      .returning({ id: ingestionJobs.id });
+    createdIngestionJobIds.push(blockingJob!.id);
+    const sightingBlockedByJob = await recordDiscoverySighting(fakeSighting({ rawUrl: blockedByJobUrl, admissibility: "eligible" }));
+    if (sightingBlockedByJob.outcome !== "recorded") throw new Error("test setup error");
+
+    const blockedByItemUrl = `https://example.test/scoped-blocked-by-item-${randomUUID()}`;
+    await db.insert(sourceItems).values({
+      sourceId: SEEDED_SOURCE_ID,
+      itemTypeId: SEEDED_ITEM_TYPE_ID,
+      url: blockedByItemUrl,
+      normalizedUrl: blockedByItemUrl,
+    });
+    const sightingBlockedByItem = await recordDiscoverySighting(fakeSighting({ rawUrl: blockedByItemUrl, admissibility: "eligible" }));
+    if (sightingBlockedByItem.outcome !== "recorded") throw new Error("test setup error");
+
+    const promoted = await promoteByIdsAndTrack([sightingBlockedByJob.candidateId, sightingBlockedByItem.candidateId]);
+    assert(
+      !promoted.some((p) => p.candidateId === sightingBlockedByJob.candidateId),
+      "scoped path: a candidate blocked by an existing ingestion_jobs normalized_url is never promoted"
+    );
+    assert(
+      !promoted.some((p) => p.candidateId === sightingBlockedByItem.candidateId),
+      "scoped path: a candidate blocked by an existing source_items normalized_url is never promoted"
+    );
+  }
+
+  // --- 24. Concurrency: two concurrent scoped calls (overlapping ids),
+  // and a scoped call concurrent with a global call, never produce two
+  // ingestion_jobs rows for the same candidate. -----------------------
+  {
+    const raceCandidateIds: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      const url = `https://example.test/scoped-race-${randomUUID()}`;
+      const sighting = await recordDiscoverySighting(fakeSighting({ rawUrl: url, admissibility: "eligible" }));
+      if (sighting.outcome !== "recorded") throw new Error("test setup error");
+      raceCandidateIds.push(sighting.candidateId);
+    }
+
+    // Two concurrent scoped calls given the SAME overlapping id set.
+    const [scopedA, scopedB] = await Promise.all([
+      promoteByIdsAndTrack(raceCandidateIds),
+      promoteByIdsAndTrack(raceCandidateIds),
+    ]);
+    const combined = [...scopedA, ...scopedB].map((p) => p.candidateId).filter((id) => raceCandidateIds.includes(id));
+    const uniqueCombined = new Set(combined);
+    assert(
+      uniqueCombined.size === combined.length,
+      "no candidate is returned as promoted by both concurrent SCOPED calls given overlapping id sets (no duplicate claim)"
+    );
+    assert(
+      uniqueCombined.size === raceCandidateIds.length,
+      `all ${raceCandidateIds.length} candidates are promoted exactly once, combined across the two concurrent scoped calls (found ${uniqueCombined.size})`
+    );
+    for (const candidateId of raceCandidateIds) {
+      const jobs = await db.select({ id: ingestionJobs.id }).from(ingestionJobs).where(eq(ingestionJobs.discoveryCandidateId, candidateId));
+      assert(jobs.length === 1, `race candidate ${candidateId} has exactly one ingestion_jobs row after concurrent SCOPED promotion`);
+    }
+
+    // A scoped call racing a global call over the same candidate.
+    const mixedUrl = `https://example.test/scoped-vs-global-race-${randomUUID()}`;
+    const mixedSighting = await recordDiscoverySighting(fakeSighting({ rawUrl: mixedUrl, admissibility: "eligible" }));
+    if (mixedSighting.outcome !== "recorded") throw new Error("test setup error");
+
+    const [mixedScoped, mixedGlobal] = await Promise.all([
+      promoteByIdsAndTrack([mixedSighting.candidateId]),
+      promoteAndTrack(50),
+    ]);
+    const mixedCombined = [...mixedScoped, ...mixedGlobal].filter((p) => p.candidateId === mixedSighting.candidateId);
+    assert(
+      mixedCombined.length === 1,
+      "a scoped call racing a concurrent global call over the same candidate produces exactly one promotion, not two"
+    );
+    const mixedJobs = await db
+      .select({ id: ingestionJobs.id })
+      .from(ingestionJobs)
+      .where(eq(ingestionJobs.discoveryCandidateId, mixedSighting.candidateId));
+    assert(mixedJobs.length === 1, "exactly one ingestion_jobs row exists for the scoped-vs-global race candidate");
   }
 
   // --- 15. admin_role can INSERT into both ledger tables (sequence grants) ---

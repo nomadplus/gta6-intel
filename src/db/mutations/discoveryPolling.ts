@@ -1,7 +1,7 @@
 import "server-only";
 import { and, eq, asc, sql } from "drizzle-orm";
 import { adminDb } from "@/db/adminClient";
-import { discoveryFeeds, ingestionJobs, discoveryProviders } from "@/db/schema";
+import { discoveryFeeds, discoveryProviders } from "@/db/schema";
 import {
   DEFAULT_FEED_POLL_BATCH_SIZE,
   IN_PROGRESS_POLL_STATUS,
@@ -13,10 +13,20 @@ import {
  * separate from src/db/mutations/ingestion.ts (the manual,
  * admin-request-driven mutation surface) and from
  * src/db/mutations/ingestionProcessor.ts (PR 9's automated job
- * processor) — this file is the one place that claims discovery_feeds
- * rows and creates system-initiated ingestion_jobs, with no preceding
+ * processor) — this file claims discovery_feeds rows, with no preceding
  * requireAdmin() call, same boundary-auditability rationale as
  * ingestionProcessor.ts's own file header.
+ *
+ * Phase 6 PR 6.2: this file no longer creates ingestion_jobs directly.
+ * createSystemDiscoveredJob() (and its unique-violation helpers) is
+ * retired — the poll route now calls recordDiscoverySighting() /
+ * claimEligibleCandidatesForPromotion(ByIds)() in
+ * src/db/mutations/discoveryCandidates.ts instead, bridging RSS through
+ * the Phase 6 PR 6.1 candidate ledger. getRssDiscoveryProviderId() below
+ * is now exported, since the poll route still needs the RSS provider id
+ * to build each DiscoverySighting -- RSS-specific provider knowledge
+ * deliberately stays in this file rather than moving into the
+ * provider-neutral discoveryCandidates.ts module.
  */
 
 // ---------------------------------------------------------------------------
@@ -94,13 +104,23 @@ export async function recordFeedPollOutcome(feedId: number, statusText: string):
 }
 
 // ---------------------------------------------------------------------------
-// Phase B: system-discovered job creation
+// Phase B (Phase 6 PR 6.2): RSS discovery-provider identity
 // ---------------------------------------------------------------------------
 
 let cachedRssDiscoveryProviderId: number | null = null;
 
-/** `discovery_providers` is tiny, seeded, effectively-static reference data — same caching rationale as ingestion.ts's getManualDiscoveryProviderId. */
-async function getRssDiscoveryProviderId(): Promise<number> {
+/**
+ * `discovery_providers` is tiny, seeded, effectively-static reference
+ * data — same caching rationale as ingestion.ts's
+ * getManualDiscoveryProviderId. Exported as of Phase 6 PR 6.2: the poll
+ * route needs this id to build each DiscoverySighting passed to
+ * recordDiscoverySighting() (src/db/mutations/discoveryCandidates.ts).
+ * Kept in this file rather than moved into discoveryCandidates.ts
+ * because that module is deliberately provider-neutral — it has no
+ * opinion on which provider is calling it, and RSS-specific identity
+ * resolution should not live there.
+ */
+export async function getRssDiscoveryProviderId(): Promise<number> {
   if (cachedRssDiscoveryProviderId !== null) return cachedRssDiscoveryProviderId;
   const [row] = await adminDb
     .select({ id: discoveryProviders.id })
@@ -112,95 +132,4 @@ async function getRssDiscoveryProviderId(): Promise<number> {
   }
   cachedRssDiscoveryProviderId = row.id;
   return row.id;
-}
-
-/**
- * Postgres unique-violation SQLSTATE. Used to recognize the one error
- * this function is specifically designed to handle gracefully (Locked
- * Decision 3): a concurrent invocation won the race on
- * ingestion_jobs_discovery_feed_normalized_url_unique for this same
- * normalizedUrl between our pre-check and this insert.
- */
-const POSTGRES_UNIQUE_VIOLATION = "23505";
-
-/**
- * drizzle-orm's node-postgres driver wraps every query error in a
- * DrizzleQueryError, whose `.cause` holds the real `pg` error (the one
- * with `.code`) -- verified empirically against this project's actual
- * error output, not assumed. Checks both the outer error and `.cause`
- * defensively, in case a raw pg error is ever thrown directly by a
- * different code path.
- */
-function isUniqueViolation(err: unknown): boolean {
-  const codeOf = (e: unknown): unknown => (typeof e === "object" && e !== null && "code" in e ? (e as { code?: unknown }).code : undefined);
-  if (codeOf(err) === POSTGRES_UNIQUE_VIOLATION) return true;
-  const cause = typeof err === "object" && err !== null && "cause" in err ? (err as { cause?: unknown }).cause : undefined;
-  return codeOf(cause) === POSTGRES_UNIQUE_VIOLATION;
-}
-
-export type CreateSystemJobResult =
-  | { outcome: "created"; jobId: number }
-  | { outcome: "already_discovered" };
-
-/**
- * Creates a system-discovered ingestion_job for one feed item URL, per
- * the locked dedupe design:
- *
- *   1. Application pre-check: does ANY ingestion_jobs row already exist
- *      for this normalizedUrl (manual OR system, any status)? If so,
- *      skip -- a human or an earlier poll already pushed this URL into
- *      the pipeline, and re-queuing it has no value (Locked Decision,
- *      final open question).
- *   2. Insert. The database's partial unique index
- *      (ingestion_jobs_discovery_feed_normalized_url_unique, scoped to
- *      discovery_feed_id IS NOT NULL) is the AUTHORITATIVE protection
- *      against a race between overlapping invocations -- if another
- *      poll run created a system job for this exact normalizedUrl
- *      between our pre-check and this insert, the insert raises a
- *      23505 unique violation, which is caught here and treated as
- *      "already discovered," never as a hard failure that would abort
- *      the rest of this feed's items.
- *
- * Manual ingestion semantics are entirely unaffected: this function
- * never touches a job with discovery_feed_id NULL, and the unique
- * index it relies on explicitly excludes those rows.
- */
-export async function createSystemDiscoveredJob(params: {
-  submittedUrl: string;
-  normalizedUrl: string;
-  discoveryFeedId: number;
-}): Promise<CreateSystemJobResult> {
-  const rssProviderId = await getRssDiscoveryProviderId();
-
-  const [existing] = await adminDb
-    .select({ id: ingestionJobs.id })
-    .from(ingestionJobs)
-    .where(eq(ingestionJobs.normalizedUrl, params.normalizedUrl))
-    .limit(1);
-  if (existing) {
-    return { outcome: "already_discovered" };
-  }
-
-  try {
-    const [job] = await adminDb
-      .insert(ingestionJobs)
-      .values({
-        submittedUrl: params.submittedUrl,
-        normalizedUrl: params.normalizedUrl,
-        discoveryProviderId: rssProviderId,
-        discoveryFeedId: params.discoveryFeedId,
-        initiatedBy: "system",
-        adminUserId: null,
-        status: "queued",
-      })
-      .returning({ id: ingestionJobs.id });
-    return { outcome: "created", jobId: job!.id };
-  } catch (err) {
-    if (isUniqueViolation(err)) {
-      // Lost the race to a concurrent invocation -- not a failure, the
-      // URL is now discovered either way. See file header.
-      return { outcome: "already_discovered" };
-    }
-    throw err;
-  }
 }
