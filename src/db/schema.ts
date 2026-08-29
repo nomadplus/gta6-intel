@@ -12,6 +12,8 @@ import {
   uniqueIndex,
   index,
   check,
+  unique,
+  foreignKey,
   type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
@@ -87,6 +89,25 @@ export const claimSourceStanceEnum = pgEnum("claim_source_stance", [
   "supports",
   "contradicts",
   "mentions",
+]);
+
+// Phase 6 PR 6.1 (migration 0028): one enum, not two. This is an
+// OPERATIONAL admissibility fold for the discovery ledger only -- it has
+// no epistemic meaning whatsoever (unlike claimSourceStanceEnum above) and
+// must never be read as a confidence or truth signal. "excluded" is the
+// mandatory starting point for every candidate (enforced by a BEFORE
+// INSERT trigger in migration 0028, not merely by this default); "held"
+// and "eligible" are populated entirely by upstream provider/feed logic
+// that does not exist yet in this PR. The relative ORDER of
+// excluded < held < eligible is NEVER derived from this enum's declaration
+// order -- see discovery_admissibility_rank() in migration 0028 and its
+// mirror in src/lib/discovery/candidateEligibility.ts, so a future
+// addition to this enum (e.g. inserting a new value) can never silently
+// change fold semantics.
+export const discoveryAdmissibilityEnum = pgEnum("discovery_admissibility", [
+  "excluded",
+  "held",
+  "eligible",
 ]);
 
 export const initiatedByEnum = pgEnum("initiated_by", ["ai", "human", "system"]);
@@ -518,6 +539,133 @@ export const discoveryProviders = pgTable("discovery_providers", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/* =========================================================================
+ * DISCOVERY CANDIDATE LEDGER (Phase 6 PR 6.1 — migration 0028)
+ *
+ * A durable ledger sitting UPSTREAM of ingestionJobs in the discovery
+ * pipeline:
+ *
+ *   provider/feed sighting
+ *           |
+ *           v
+ *   discoveryCandidateObservations  (one row per operational sighting)
+ *           |
+ *           v
+ *   discoveryCandidates             (one row per globally-normalized URL)
+ *           |
+ *           v
+ *   ingestionJobs                   (existing Phase 4 pipeline)
+ *
+ * Multiple feeds/providers surfacing the same normalized URL are
+ * OPERATIONAL DISCOVERY FACTS ONLY -- never corroboration, provenance, or
+ * epistemic weight of any kind (that graph lives exclusively in
+ * sourceRelationships above, decided by analyse_provenance or a human).
+ * This ledger answers "has the system already seen this URL, and is it
+ * currently allowed to promote it into the ingestion pipeline" -- nothing
+ * more.
+ *
+ * No production code writes to or reads from either table yet -- no
+ * discovery provider that would call recordDiscoverySighting() exists in
+ * this PR, and nothing calls claimEligibleCandidatesForPromotion() from a
+ * route or cron. Both tables are dormant/empty after this PR deploys,
+ * exactly like sourceItemLinks was between migration 0026 and its first
+ * real caller.
+ * ========================================================================= */
+
+// One row per globally-normalized URL the discovery pipeline has ever
+// seen. `admissibility` is a DATABASE-MAINTAINED, MONOTONIC fold over
+// every observation ever recorded against this candidate -- it can only
+// ever move toward `eligible`, never backward (enforced by a BEFORE
+// UPDATE trigger in migration 0028, not application discipline). Every
+// newly inserted candidate is forced to `excluded` regardless of what a
+// caller supplies (a second BEFORE INSERT trigger) -- inserting a genuine
+// observation is the ONLY mechanism that can ever raise a candidate's
+// admissibility; there is deliberately no application-facing way to
+// create a candidate at `held`/`eligible` directly.
+export const discoveryCandidates = pgTable(
+  "discovery_candidates",
+  {
+    id: serial("id").primaryKey(),
+    normalizedUrl: text("normalized_url").notNull(),
+    admissibility: discoveryAdmissibilityEnum("admissibility").notNull().default("excluded"),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    normalizedUrlUnique: uniqueIndex("discovery_candidates_normalized_url_unique").on(t.normalizedUrl),
+    // Shaped exactly for the promotion-claim query: oldest-eligible-first,
+    // scoped to only the rows that query ever touches.
+    eligibleFirstSeenIdx: index("discovery_candidates_eligible_first_seen_idx")
+      .on(t.firstSeenAt, t.id)
+      .where(sql`${t.admissibility} = 'eligible'`),
+    lastSeenAtNotBeforeFirstSeen: check(
+      "discovery_candidates_last_seen_not_before_first_seen",
+      sql`${t.lastSeenAt} >= ${t.firstSeenAt}`
+    ),
+  })
+);
+
+// One row per individual operational sighting of a candidate URL by one
+// provider/feed. `observedUrl` preserves exactly what that sighting
+// reported (pre-normalization) for audit, the same submitted/normalized
+// separation ingestionJobs/sourceItems already use -- discoveryCandidateId
+// carries the normalized identity. Replay identity is deliberately
+// RSS/feed-specific (the partial unique index below, scoped to
+// discoveryFeedId IS NOT NULL) -- this is NOT a general provider-identity
+// rule; a future non-feed provider is expected to insert a fresh row per
+// sighting until its own replay semantics are designed.
+export const discoveryCandidateObservations = pgTable(
+  "discovery_candidate_observations",
+  {
+    id: serial("id").primaryKey(),
+    discoveryCandidateId: integer("discovery_candidate_id")
+      .notNull()
+      .references(() => discoveryCandidates.id),
+    discoveryProviderId: integer("discovery_provider_id")
+      .notNull()
+      .references(() => discoveryProviders.id),
+    // NULL for any non-feed provider. Populated only for RSS/Atom
+    // sightings -- see the replay-identity note above.
+    discoveryFeedId: integer("discovery_feed_id").references(() => discoveryFeeds.id),
+    observedUrl: text("observed_url").notNull(),
+    // Populated by the calling provider/feed logic -- this PR has no
+    // opinion on HOW that value is computed (no provider exists yet); it
+    // only records and folds whatever admissibility a sighting carries.
+    admissibility: discoveryAdmissibilityEnum("admissibility").notNull(),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    candidateIdIdx: index("discovery_candidate_observations_candidate_id_idx").on(t.discoveryCandidateId),
+    // Shaped exactly for the deterministic promotion-origin query:
+    // WHERE discoveryCandidateId = $1 AND admissibility = 'eligible'
+    // ORDER BY firstSeenAt ASC, id ASC LIMIT 1.
+    eligibleOriginIdx: index("discovery_candidate_observations_eligible_origin_idx")
+      .on(t.discoveryCandidateId, t.firstSeenAt, t.id)
+      .where(sql`${t.admissibility} = 'eligible'`),
+    // RSS/feed-specific replay identity -- see table comment above. A
+    // repeated sighting of the same candidate by the same feed updates
+    // this row's lastSeenAt only; it is never a second distinct
+    // observation.
+    feedReplayUnique: uniqueIndex("discovery_candidate_observations_feed_replay_unique")
+      .on(t.discoveryFeedId, t.discoveryCandidateId)
+      .where(sql`${t.discoveryFeedId} IS NOT NULL`),
+    // Composite-FK target for ingestionJobs below -- proves a job's
+    // discoveryCandidateObservationId genuinely belongs to its
+    // discoveryCandidateId, not merely that both ids independently exist.
+    idCandidateUnique: unique("discovery_candidate_observations_id_candidate_unique").on(
+      t.id,
+      t.discoveryCandidateId
+    ),
+    lastSeenAtNotBeforeFirstSeen: check(
+      "discovery_candidate_observations_last_seen_not_before_first_seen",
+      sql`${t.lastSeenAt} >= ${t.firstSeenAt}`
+    ),
+  })
+);
+
 // One row per ingestion/discovery attempt.
 export const ingestionJobs = pgTable(
   "ingestion_jobs",
@@ -583,6 +731,20 @@ export const ingestionJobs = pgTable(
     // written, every bound (count, per-field length) has ALREADY been
     // enforced by the extractor -- this is never a raw, uncapped dump.
     extractedLinksStaging: jsonb("extracted_links_staging"),
+    // Added in migration 0028 (Phase 6 PR 6.1) — both NULL for every
+    // existing/manual/legacy job (and remain NULL for any future manual
+    // submission). Populated together, exactly once, only when a job is
+    // created by claimEligibleCandidatesForPromotion() from the discovery
+    // candidate ledger above. discoveryCandidateId alone would let a job
+    // point at a candidate via an observation that doesn't actually
+    // belong to it -- the composite FK below (paired with
+    // discoveryCandidateObservationId) is what proves the two ids are
+    // mutually consistent, not merely that both independently exist.
+    discoveryCandidateId: integer("discovery_candidate_id").references(() => discoveryCandidates.id),
+    // Deliberately NOT given its own single-column .references() here --
+    // its only foreign-key relationship is the composite one below, which
+    // covers both this column and discoveryCandidateId together.
+    discoveryCandidateObservationId: integer("discovery_candidate_observation_id"),
   },
   (t) => ({
     // Shaped for the approved future in-flight-redundancy rule ("reuse a
@@ -609,6 +771,39 @@ export const ingestionJobs = pgTable(
     discoveryFeedNormalizedUrlUnique: uniqueIndex("ingestion_jobs_discovery_feed_normalized_url_unique")
       .on(t.normalizedUrl)
       .where(sql`${t.discoveryFeedId} IS NOT NULL`),
+    // Added in migration 0028 (Phase 6 PR 6.1). General-purpose (not
+    // partial) — unlike the two indexes above, the promotion-claim query
+    // deliberately checks whether a normalizedUrl already exists among
+    // ingestion_jobs rows of ANY status and ANY discovery_provider_id, not
+    // just queued/fetching or feed-discovered ones.
+    normalizedUrlIdx: index("ingestion_jobs_normalized_url_idx").on(t.normalizedUrl),
+    // AUTHORITATIVE concurrency guard for candidate promotion (same
+    // pattern as discoveryFeedNormalizedUrlUnique above): a plain unique
+    // index permits any number of NULL rows (every manual/legacy job) but
+    // rejects a second non-NULL value, so two concurrent promotion
+    // attempts racing on the same candidate can never both succeed. This
+    // index is the authoritative guard regardless of how the losing
+    // racer's conflict is observed: claimEligibleCandidatesForPromotion()
+    // inserts via unqualified ON CONFLICT DO NOTHING, so a losing INSERT
+    // returns no row rather than raising a 23505 -- there is deliberately
+    // no caught-exception control flow here (a raised constraint
+    // violation would abort the whole surrounding transaction, which
+    // spans multiple candidates).
+    discoveryCandidateIdUnique: uniqueIndex("ingestion_jobs_discovery_candidate_id_unique").on(
+      t.discoveryCandidateId
+    ),
+    discoveryCandidatePairing: check(
+      "ingestion_jobs_discovery_candidate_pairing",
+      sql`(${t.discoveryCandidateId} IS NULL) = (${t.discoveryCandidateObservationId} IS NULL)`
+    ),
+    // The composite FK itself -- proves discoveryCandidateObservationId
+    // genuinely belongs to discoveryCandidateId (see
+    // discoveryCandidateObservations.idCandidateUnique, its FK target).
+    candidateObservationCompositeFk: foreignKey({
+      name: "ingestion_jobs_candidate_observation_composite_fk",
+      columns: [t.discoveryCandidateObservationId, t.discoveryCandidateId],
+      foreignColumns: [discoveryCandidateObservations.id, discoveryCandidateObservations.discoveryCandidateId],
+    }),
   })
 );
 

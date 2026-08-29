@@ -1269,6 +1269,173 @@ itself; a hyperlink is still never treated as an automatic provenance
 relationship, resolution and the advisory-only feed into
 `analyse_provenance` are unaffected.
 
+### Discovery candidate ledger: `discovery_candidates` / `discovery_candidate_observations` (Phase 6 PR 6.1)
+
+A durable ledger sitting **upstream** of `ingestion_jobs` in the discovery
+pipeline:
+
+```
+provider/feed sighting
+        |
+        v
+discovery_candidate_observations   (one row per operational sighting)
+        |
+        v
+discovery_candidates                (one row per globally-normalized URL)
+        |
+        v
+ingestion_jobs                      (existing Phase 4 pipeline)
+```
+
+**Operational discovery facts only — never corroboration, provenance, or
+evidence.** Multiple feeds/providers surfacing the same normalized URL
+tell the system nothing more than "more than one operational source has
+pointed at this URL" — that fact never touches `source_relationships`,
+`claims`, or any other epistemic table. That graph remains exclusively
+`analyse_provenance`'s and a human's, decided from actual page content and
+hyperlink observations (`source_item_links`), never from how many
+discovery channels happened to surface the same link.
+
+**One enum, one strict fold order, enforced by the database, never by
+enum declaration order.** `discovery_admissibility` is `excluded` <
+`held` < `eligible` — a `discovery_admissibility_rank()` SQL function is
+the single source of truth for that ordering (mirrored in pure TypeScript
+by `ADMISSIBILITY_RANK`/`foldAdmissibility()` in
+`src/lib/discovery/candidateEligibility.ts`, for deterministic test parity
+only — it is **never** the authority for persisted state). A future
+addition to this enum can never silently change fold semantics, because
+nothing anywhere compares admissibility values by their position in the
+`CREATE TYPE` list.
+
+**A candidate's admissibility is a database-maintained, monotonic fold —
+not application discipline.** Every newly inserted `discovery_candidates`
+row is forced to `admissibility = 'excluded'` by a `BEFORE INSERT`
+trigger, regardless of what any caller supplies — there is deliberately
+no application-facing path that creates a candidate at `held`/`eligible`
+directly. Inserting a genuine observation is the *only* mechanism that
+can raise a candidate's admissibility, via an `AFTER INSERT` trigger on
+`discovery_candidate_observations` (`raise_discovery_candidate_admissibility()`)
+that takes the rank-wise maximum of the candidate's current admissibility
+and the new observation's. A second trigger
+(`restrict_discovery_candidate_mutation()`) enforces monotonicity
+structurally: admissibility can never decrease, `last_seen_at` can never
+move backwards, and `normalized_url`/`first_seen_at`/`created_at` are
+immutable identity fields. `DELETE` is rejected outright on both tables —
+this ledger never shrinks. Critically, **the guard does not stop at
+"never decrease"** — an UPDATE that *raises* admissibility is itself
+verified against the candidate's own observations before being allowed:
+a candidate may never carry a rank higher than the highest rank actually
+represented by one of its observations. An arbitrary direct
+`UPDATE ... SET admissibility = 'eligible'` with no qualifying
+observation on record is rejected, even though it isn't a decrease —
+closing a gap an earlier revision of this trigger left open. The
+legitimate path (`INSERT` observation → `AFTER INSERT` raise trigger →
+`UPDATE` candidate) always passes this check, because the just-inserted
+observation is already visible to the same transaction by the time that
+`UPDATE` runs. This could not have been solved by trusting application
+code, nor by revoking `UPDATE` from `admin_role` — the replay path
+(above) legitimately needs `UPDATE` for `last_seen_at`, so the guard has
+to distinguish a *justified* raise from an *unjustified* one at the row
+level, not deny the operation category outright.
+
+**Replay is RSS/feed-specific, not a general provider-identity rule.** A
+partial unique index on `(discovery_feed_id, discovery_candidate_id)`
+(`WHERE discovery_feed_id IS NOT NULL`) is the only replay-idempotency
+mechanism in this PR. A repeated sighting of the same candidate by the
+same feed resolves via `INSERT ... ON CONFLICT ... DO UPDATE`, advancing
+only `last_seen_at` (via `GREATEST`) — never a second observation row,
+never a change to admissibility or any other observation column. A
+non-feed provider has no such conflict target and always inserts a fresh
+row per sighting; that provider's own replay semantics, if any, are a
+decision for whichever future PR introduces it, not a rule generalized
+from this one. Critically, the candidate's own `last_seen_at` is advanced
+by the **candidate upsert itself** (`ON CONFLICT (normalized_url) DO
+UPDATE SET last_seen_at = GREATEST(...)`), not by the observation's
+`AFTER INSERT` raise trigger — that trigger deliberately fires on
+`INSERT` only, never on `UPDATE`, so a replay's forward-only
+`last_seen_at` change can never re-evaluate or re-raise admissibility.
+Without the candidate's own upsert advancing `last_seen_at` on every
+valid sighting (including a replay), a repeatedly-reobserved candidate's
+`last_seen_at` would go stale even while its observation kept advancing —
+this was caught and corrected during implementation planning before any
+code was written.
+
+**The composite candidate/observation link on `ingestion_jobs` is a new
+pattern for this codebase — the first multi-column foreign key.**
+`discovery_candidate_observations` carries `UNIQUE (id,
+discovery_candidate_id)` (its `id` is already a primary key, so no
+separate `UNIQUE(id)` is needed); `ingestion_jobs.discovery_candidate_observation_id`
+and `discovery_candidate_id` are jointly constrained by
+`FOREIGN KEY (discovery_candidate_observation_id, discovery_candidate_id)
+REFERENCES discovery_candidate_observations (id, discovery_candidate_id)`.
+This proves a job's observation genuinely belongs to its candidate — not
+merely that both ids independently exist. Both columns are `NULL` for
+every manual/legacy job and populated together, exactly once, only by
+candidate promotion. A separate `CHECK` constraint
+(`(discovery_candidate_id IS NULL) = (discovery_candidate_observation_id
+IS NULL)`) enforces that pairing — verified during implementation to be
+load-bearing in its own right, not redundant with the composite FK: a
+multi-column foreign key uses `MATCH SIMPLE` semantics by default, which
+does **not** enforce the constraint at all when only one of its columns
+is `NULL`. Without the separate `CHECK`, a row with
+`discovery_candidate_observation_id` set but `discovery_candidate_id`
+`NULL` would pass the FK silently. The `CHECK` is what actually closes
+that gap.
+
+**Promotion: claim, verify, insert — all in one transaction.**
+`claimEligibleCandidatesForPromotion()` (`src/db/mutations/discoveryCandidates.ts`)
+selects up to a batch size of eligible candidates using `FOR UPDATE SKIP
+LOCKED` (the same batch-worker primitive `discoveryPolling.ts`'s
+`claimDueDiscoveryFeeds` already uses), excluding any candidate whose
+normalized URL already exists in `ingestion_jobs` (any status, any
+provider — a new general-purpose index, `ingestion_jobs_normalized_url_idx`,
+supports this) or `source_items`. This exclusion lives in the claim query
+itself, not only a later per-row recheck — a URL that was already
+manually ingested, or discovered by an old feed run before this ledger
+existed, must never be repeatedly reclaimed for promotion. For each
+claimed candidate, in the same transaction: the exclusion check is
+repeated immediately before `INSERT` (defense-in-depth against a race the
+claim query's own snapshot can't fully close), the deterministic
+promotion origin is selected (`WHERE admissibility = 'eligible' ORDER BY
+first_seen_at ASC, id ASC LIMIT 1` — proven, not merely assumed, to pick
+the earliest eligible observation even when a later one is also
+eligible), and the `ingestion_jobs` row is created. `submittedUrl` is
+that exact origin observation's own `observedUrl` — the raw URL the
+provider/feed sighting actually reported — never the candidate's
+already-normalized identity; `normalizedUrl` on the job is the
+candidate's normalized form; `discoveryProviderId`/`discoveryFeedId` are
+copied from that same origin. The insert uses
+`INSERT ... ON CONFLICT DO NOTHING` with **no explicit conflict
+target** — deliberately, so it covers *any* unique-constraint conflict on
+the table in one statement: both
+`ingestion_jobs_discovery_candidate_id_unique` (the authoritative
+one-candidate-one-job guard) and the pre-existing
+`ingestion_jobs_discovery_feed_normalized_url_unique` dedupe index (a
+race against the RSS poller claiming the same normalized URL). This is
+**not** a caught `23505` — a raised unique-constraint violation aborts
+the entire surrounding Postgres transaction until rollback, so catching
+the resulting JS exception would not actually recover it; every other
+candidate already promoted earlier in the same loop would be silently
+lost. `ON CONFLICT DO NOTHING` avoids raising the error at all: a losing
+insert simply returns no row, which the code treats as "already handled
+by a racing insert" and skips, without ever entering an aborted
+transaction state. Verified directly against a real local PostgreSQL
+instance under two concurrency scenarios: a manually-held row lock
+deterministically demonstrates `SKIP LOCKED` causing a second caller to
+skip the locked candidate (and successfully claim it once the lock
+releases), and two genuinely concurrent calls to the real function never
+promote the same candidate twice.
+
+**Dormant after this PR.** No discovery provider exists yet to call
+`recordDiscoverySighting()`, and no route or cron calls
+`claimEligibleCandidatesForPromotion()`. Both new tables are empty in
+production after this PR deploys — exactly `source_item_links`'s own
+rollout, which existed and was fully tested for one release before
+anything wrote to it in production. `/api/discovery/poll`,
+`discoveryPolling.ts`, the RSS production path, `pipeline.ts`, the
+ingestion processor, `safeFetch`, cron configuration, `discovery_feeds`,
+and the admin UI are all unchanged by this PR.
+
 ### Status history (the two append-only ledgers)
 
 `claim_investigation_status_history` and

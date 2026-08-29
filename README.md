@@ -358,13 +358,25 @@ the stable alias domain.
   deterministic page-to-page hyperlink observations to weigh, in an
   advisory capacity only — a hyperlink observation is never itself a
   provenance conclusion.
+- **Phase 6 PR 6.1** — Durable discovery ledger foundation
+  (`discovery_candidates` / `discovery_candidate_observations`):
+  records provider/feed sightings as globally-normalized candidates
+  with an operational-only, database-enforced, monotonic admissibility
+  fold (`excluded` → `held` → `eligible`). Multiple sightings of the
+  same URL are operational discovery facts only — never corroboration
+  or evidence. A companion promotion function claims eligible,
+  not-yet-ingested candidates and creates `ingestion_jobs` rows for
+  them, proven correct under concurrency (`FOR UPDATE SKIP LOCKED`) and
+  against a candidate whose URL was already historically ingested. No
+  production route or cron calls either function yet — the new tables
+  are unused/empty until a later PR wires a real discovery provider in.
 
-The current focus is Phase 6 proper: autonomous, bounded discovery
-providers (candidate sources may include forums, social platforms, or
-search-style discovery) that will only ever use permitted access
-methods and feed into the same bounded ingestion pipeline and
-downstream human-review gates described above. No specific provider or
-access method has been committed to yet.
+The current focus is the remainder of Phase 6: wiring an actual
+discovery provider (candidate sources may include forums, social
+platforms, or search-style discovery) into the ledger above, using only
+permitted access methods, feeding into the same bounded ingestion
+pipeline and downstream human-review gates described above. No specific
+provider or access method has been committed to yet.
 
 ---
 
