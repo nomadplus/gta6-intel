@@ -20,7 +20,15 @@
  *     dedicated columns ONLY when the caller supplies them explicitly
  *     (the same opaque-passthrough mechanism as claimId), independent of
  *     whatever the structured output itself contains
- *   - malformed structured output: job ends 'failed', ZERO ai_results rows
+ *   - malformed structured output, BOTH attempts fail (the bounded
+ *     automatic retry -- Phase 6 hardening -- is exhausted): job ends
+ *     'failed', ZERO ai_results rows, exactly 2 provider.complete()
+ *     calls, summed token/cost accounting, error text records the retry
+ *   - malformed structured output on attempt 1, success on the automatic
+ *     retry: job ends 'succeeded' with ONE ai_results row holding the
+ *     SECOND attempt's data, summed token counts across both attempts
+ *   - provider_error is NEVER retried (only invalid_structured_output
+ *     is) -- exactly 1 provider.complete() call
  *   - provider_error: job ends 'failed', zero ai_results rows
  *   - an unexpected throw from provider.complete() is still caught and
  *     produces a terminal 'failed' job (runAiOperation's own defensive
@@ -213,9 +221,15 @@ async function main() {
       }
     }
 
-    // --- Malformed structured output --------------------------------------
+    // --- Malformed structured output, BOTH attempts fail (Phase 6
+    // hardening: exactly one automatic retry now applies to
+    // invalid_structured_output, so exhausting it requires two queued
+    // failures, not one) ------------------------------------------------
     {
-      const provider = new FakeAiProvider([{ kind: "success", rawOutput: { summary: 12345 }, tokensIn: 200, tokensOut: 30 }]);
+      const provider = new FakeAiProvider([
+        { kind: "success", rawOutput: { summary: 12345 }, tokensIn: 200, tokensOut: 30 },
+        { kind: "success", rawOutput: { summary: 67890 }, tokensIn: 150, tokensOut: 20 },
+      ]);
       const result = await runAiOperation({
         operation: "classify_relevance",
         provider,
@@ -223,19 +237,76 @@ async function main() {
         userPrompt: "user",
         outputSchema: exampleOutputSchema,
       });
-      assert(result.ok === false, "malformed structured output returns ok:false");
+      assert(result.ok === false, "malformed structured output (both attempts) returns ok:false");
+      assert(provider.receivedRequests.length === 2, `exactly one automatic retry is attempted -- provider.complete() called twice (got ${provider.receivedRequests.length})`);
       if (!result.ok) {
         assert(result.jobId !== null, "a job row IS created for this failure reason (not already_in_flight)");
         if (result.jobId !== null) {
           createdJobIds.push(result.jobId);
           assert(result.reason === "invalid_structured_output", `failure reason is 'invalid_structured_output' (got ${result.reason})`);
           const job = await loadJob(result.jobId);
-          assert(job.status === "failed", "job row status is 'failed' on malformed output");
+          assert(job.status === "failed", "job row status is 'failed' when both attempts fail");
           assert(job.error !== null && job.error.startsWith("invalid_structured_output:"), `job row error is prefixed with the failure reason (got ${job.error})`);
-          assert(job.tokensIn === 200 && job.tokensOut === 30, "token counts the provider DID report before failing validation are still persisted");
+          assert(job.error !== null && job.error.includes("after 1 automatic retry"), `job row error truthfully records that an automatic retry occurred (got ${job.error})`);
+          assert(job.tokensIn === 350 && job.tokensOut === 50, `token counts are SUMMED across both attempts, not just the last one (got ${job.tokensIn}/${job.tokensOut})`);
+          assert(job.costEstimateUsd !== null, "cost is computed from the summed token counts, not left null, when both attempts reported tokens");
           const results = await loadResultsForJob(result.jobId);
           assert(results.length === 0, `zero ai_results rows exist for a failed job (got ${results.length})`);
         }
+      }
+    }
+
+    // --- invalid_structured_output on the FIRST attempt, success on the
+    // automatic retry -- one ai_jobs row still ends 'succeeded', with
+    // token counts from BOTH attempts summed onto it -------------------
+    {
+      const provider = new FakeAiProvider([
+        { kind: "success", rawOutput: { summary: 12345 }, tokensIn: 90, tokensOut: 15 }, // malformed: summary must be a string
+        { kind: "success", rawOutput: { summary: "recovered on retry" }, tokensIn: 60, tokensOut: 25 },
+      ]);
+      const result = await runAiOperation({
+        operation: "embed",
+        provider,
+        systemPrompt: "sys",
+        userPrompt: "user",
+        outputSchema: exampleOutputSchema,
+      });
+      assert(result.ok === true, "a transient invalid_structured_output on attempt 1 self-heals via the automatic retry -- ok:true overall");
+      assert(provider.receivedRequests.length === 2, `exactly 2 provider.complete() calls were made (1 failed + 1 automatic retry) (got ${provider.receivedRequests.length})`);
+      if (result.ok) {
+        createdJobIds.push(result.jobId);
+        assert(result.data.summary === "recovered on retry", "the returned data comes from the SECOND (successful) attempt");
+        assert(result.tokensIn === 150 && result.tokensOut === 40, `returned token counts are the SUM of both attempts, 90+60=150 in / 15+25=40 out (got ${result.tokensIn}/${result.tokensOut})`);
+
+        const job = await loadJob(result.jobId);
+        assert(job.status === "succeeded", "job row status is 'succeeded' -- the retry's own success is what matters, not attempt 1's failure");
+        assert(job.error === null, "job row has no error once the retry succeeds -- attempt 1's failure is not surfaced as a job-level error");
+        assert(job.tokensIn === 150 && job.tokensOut === 40, "job row persists the SUMMED token counts across both attempts, not just the winning attempt's");
+
+        const results = await loadResultsForJob(result.jobId);
+        assert(results.length === 1, `exactly ONE ai_results row exists -- the retry does not create a second job or a duplicate result row (got ${results.length})`);
+        const [resultRow] = results;
+        const structuredOutput = resultRow.structuredOutput as { summary: string };
+        assert(structuredOutput.summary === "recovered on retry", "ai_results.structured_output persists the SECOND (validated, successful) attempt's data, never the first attempt's malformed one");
+      }
+    }
+
+    // --- provider_error must NEVER be retried, even though it's also a
+    // failure reason returned from provider.complete() -- only
+    // invalid_structured_output gets the bounded automatic retry -------
+    {
+      const provider = new FakeAiProvider([{ kind: "provider_error", message: "upstream 500, attempt 1" }]);
+      const result = await runAiOperation({
+        operation: "evaluate_evidence",
+        provider,
+        systemPrompt: "sys",
+        userPrompt: "user",
+        outputSchema: exampleOutputSchema,
+      });
+      assert(result.ok === false, "provider_error still returns ok:false");
+      assert(provider.receivedRequests.length === 1, `provider_error is NEVER retried -- exactly 1 provider.complete() call, not 2 (got ${provider.receivedRequests.length})`);
+      if (!result.ok && result.jobId !== null) {
+        createdJobIds.push(result.jobId);
       }
     }
 

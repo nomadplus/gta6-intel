@@ -228,6 +228,13 @@ async function main() {
       // --- fabricated otherClaimId rejected at the operation level --------
       const badProvider = new FakeAiProvider([
         { kind: "success", rawOutput: { assessments: [{ otherClaimId: 999999999, relationshipType: "related", confidence: 0.5, reasoning: "fabricated" }] } },
+        // Phase 6 hardening: runAiOperation now makes exactly one bounded
+        // automatic retry on invalid_structured_output -- a second,
+        // equally-invalid response is queued so that retry has something
+        // to consume (an exhausted FakeAiProvider queue throws, which
+        // would be misreported as provider_error instead of the
+        // invalid_structured_output this block actually tests).
+        { kind: "success", rawOutput: { assessments: [{ otherClaimId: 999999999, relationshipType: "related", confidence: 0.5, reasoning: "fabricated, retry attempt" }] } },
       ]);
       const badResult = await compareClaims({
         provider: badProvider,

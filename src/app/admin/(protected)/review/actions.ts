@@ -54,7 +54,17 @@ export async function runClassificationRecoveryAction(formData: FormData) {
 
   const result = classifyOutcome.data;
   const status = result.ok ? "succeeded" : result.reason;
-  redirect(`/admin/review?recoveryStatus=${status}&sourceItemId=${sourceItemId}`);
+  // Phase 6 hardening: revalidate again HERE, after the mutating call
+  // actually completed -- the earlier revalidatePath (above, before
+  // triggerClassifyRelevance ran) only reflected pre-mutation state.
+  // Redirecting to a URL keyed only on a coarse status word can collide
+  // with a URL already visited earlier in the session (e.g. two
+  // "failed" retries in a row), so the redirect target also carries the
+  // new job's own id -- real identity, not an arbitrary timestamp --
+  // guaranteeing this exact URL was never visited before.
+  revalidatePath("/admin/review");
+  const jobIdParam = result.jobId !== null ? `&jobId=${result.jobId}` : "";
+  redirect(`/admin/review?recoveryStatus=${status}&sourceItemId=${sourceItemId}${jobIdParam}`);
 }
 
 /**
@@ -106,7 +116,13 @@ export async function runExtractClaimsAction(formData: FormData) {
 
   const result = extractOutcome.data;
   const status = result.ok ? "succeeded" : result.reason;
-  redirect(`/admin/review?extractStatus=${status}&sourceItemId=${sourceItemId}`);
+  // Phase 6 hardening: see runClassificationRecoveryAction's matching
+  // comment above -- revalidate again after the mutation actually
+  // completed, and key the redirect on the new job's own id rather than
+  // risking a URL collision with an earlier identical status word.
+  revalidatePath("/admin/review");
+  const jobIdParam = result.jobId !== null ? `&jobId=${result.jobId}` : "";
+  redirect(`/admin/review?extractStatus=${status}&sourceItemId=${sourceItemId}${jobIdParam}`);
 }
 
 /**
@@ -196,5 +212,12 @@ export async function runDetectDuplicatesAction(formData: FormData) {
 
   const outcome = detectOutcome.data;
   const status = outcome.kind === "no_existing_claims" ? "no_existing_claims" : outcome.result.ok ? "succeeded" : outcome.result.reason;
-  redirect(`/admin/review?duplicateStatus=${status}&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}`);
+  // Phase 6 hardening: see runClassificationRecoveryAction's matching
+  // comment above. "no_existing_claims" never creates an ai_jobs row (no
+  // provider call was made), so there is no job id to key on there --
+  // the redirect target is left as-is for that one outcome, same as
+  // before.
+  revalidatePath("/admin/review");
+  const jobIdParam = outcome.kind === "ran" && outcome.result.jobId !== null ? `&jobId=${outcome.result.jobId}` : "";
+  redirect(`/admin/review?duplicateStatus=${status}&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}${jobIdParam}`);
 }

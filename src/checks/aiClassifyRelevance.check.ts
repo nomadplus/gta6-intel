@@ -165,7 +165,16 @@ async function main() {
       const sourceItem = await createTestSourceItem();
       const beforeSnapshot = await loadSourceItem(sourceItem.id);
 
-      const provider = new FakeAiProvider([{ kind: "success", rawOutput: { relevance: "not-a-real-value" }, tokensIn: 50, tokensOut: 10 }]);
+      const provider = new FakeAiProvider([
+        { kind: "success", rawOutput: { relevance: "not-a-real-value" }, tokensIn: 50, tokensOut: 10 },
+        // Phase 6 hardening: runAiOperation now makes exactly one bounded
+        // automatic retry on invalid_structured_output -- a second,
+        // equally-invalid response is queued so that retry has something
+        // to consume (an exhausted FakeAiProvider queue throws, which
+        // would be misreported as provider_error instead of the
+        // invalid_structured_output this block actually tests).
+        { kind: "success", rawOutput: { relevance: "not-a-real-value" }, tokensIn: 50, tokensOut: 10 },
+      ]);
       const result = await classifyRelevance({ provider, sourceItem });
 
       assert(result.ok === false, "malformed structured output returns ok:false");

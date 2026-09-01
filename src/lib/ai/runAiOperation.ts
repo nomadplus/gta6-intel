@@ -200,68 +200,131 @@ export async function runAiOperation<T>(input: RunAiOperationInput<T>): Promise<
 
   await markAiJobRunning(job.id);
 
-  let result: AiCompletionResult<T>;
-  try {
-    result = await input.provider.complete({
-      operation: input.operation,
-      model,
-      systemPrompt: input.systemPrompt,
-      userPrompt: input.userPrompt,
-      outputSchema: input.outputSchema,
-      inputRef: input.inputRef,
-      maxOutputTokens: input.maxOutputTokens,
-    });
-  } catch (err) {
-    // A conforming AiProvider should never throw (see types.ts), but a
-    // job must always reach a terminal state regardless -- an unexpected
-    // throw is treated as a provider_error, same as a well-behaved
-    // provider's own reported failure would be. No token counts are
-    // available from a bare throw, so cost is left null -- unmeasurable,
-    // not zero (see budget.ts's hasUnmeasuredRows).
-    const message = err instanceof Error ? err.message : String(err);
-    await completeAiJobFailure({ jobId: job.id, error: `provider_error: ${message}` });
-    return { ok: false, jobId: job.id, reason: "provider_error", message };
-  }
+  // Phase 6 hardening: exactly ONE automatic retry, and ONLY when the
+  // model's response fails schema validation (invalid_structured_output).
+  // provider_error, every AiSafetyBlockedReason, and already_in_flight
+  // are NEVER retried here -- a real provider outage or a budget/kill-
+  // switch block retrying immediately would just compound the problem,
+  // not fix it. This is deliberately NOT the "retry scheduler"
+  // aiJobLifecycle.ts's header excludes from PR1's scope -- there is no
+  // delay, no queue, and no attempt_count column; it's a single bounded,
+  // synchronous re-attempt of the SAME job, still transitioning
+  // pending -> running -> exactly one terminal state. One ai_jobs row
+  // always represents the whole job, however many provider round-trips
+  // it took to get there -- deliberately narrow, not general-purpose
+  // retry machinery.
+  const MAX_INVALID_STRUCTURED_OUTPUT_ATTEMPTS = 2;
 
-  if (!result.ok) {
+  // Token/cost accounting must reflect BOTH attempts when a retry
+  // happens -- a failed invalid_structured_output attempt can still have
+  // consumed real, billable tokens, and that spend must never go
+  // unaccounted for just because a later attempt succeeded or also
+  // failed. Stays null (unmeasurable, not zero -- see budget.ts's
+  // hasUnmeasuredRows) the moment any attempt fails to report a token
+  // count.
+  let sumTokensIn: number | null = 0;
+  let sumTokensOut: number | null = 0;
+  const addTokens = (tokensIn: number | undefined, tokensOut: number | undefined) => {
+    sumTokensIn = sumTokensIn === null || tokensIn === undefined ? null : sumTokensIn + tokensIn;
+    sumTokensOut = sumTokensOut === null || tokensOut === undefined ? null : sumTokensOut + tokensOut;
+  };
+
+  let retriedAfterInvalidStructuredOutput = false;
+
+  for (let attempt = 1; ; attempt++) {
+    let attemptResult: AiCompletionResult<T>;
+    try {
+      attemptResult = await input.provider.complete({
+        operation: input.operation,
+        model,
+        systemPrompt: input.systemPrompt,
+        userPrompt: input.userPrompt,
+        outputSchema: input.outputSchema,
+        inputRef: input.inputRef,
+        maxOutputTokens: input.maxOutputTokens,
+      });
+    } catch (err) {
+      // A conforming AiProvider should never throw (see types.ts), but a
+      // job must always reach a terminal state regardless -- an unexpected
+      // throw is treated as a provider_error, same as a well-behaved
+      // provider's own reported failure would be, and is never retried
+      // (see header note above). No token counts are available from a
+      // bare throw for THIS attempt, but any tokens already accumulated
+      // from an earlier invalid_structured_output attempt are still
+      // real spend and are still persisted.
+      const message = err instanceof Error ? err.message : String(err);
+      const costEstimateUsd =
+        sumTokensIn !== null && sumTokensOut !== null
+          ? microsToUsdString(calculateCostMicros(pricing, sumTokensIn, sumTokensOut))
+          : null;
+      await completeAiJobFailure({
+        jobId: job.id,
+        error: `provider_error: ${message}`,
+        tokensIn: sumTokensIn,
+        tokensOut: sumTokensOut,
+        costEstimateUsd,
+      });
+      return { ok: false, jobId: job.id, reason: "provider_error", message };
+    }
+
+    if (attemptResult.ok) {
+      addTokens(attemptResult.tokensIn, attemptResult.tokensOut);
+      const tokensIn = sumTokensIn ?? attemptResult.tokensIn;
+      const tokensOut = sumTokensOut ?? attemptResult.tokensOut;
+      const costEstimateUsd = microsToUsdString(calculateCostMicros(pricing, tokensIn, tokensOut));
+
+      const completed = await completeAiJobSuccess({
+        jobId: job.id,
+        tokensIn,
+        tokensOut,
+        costEstimateUsd,
+        structuredOutput: attemptResult.data,
+        confidence: input.confidence ?? null,
+        reasoning: input.reasoning ?? null,
+        claimId: input.claimId ?? null,
+      });
+
+      return {
+        ok: true,
+        jobId: job.id,
+        aiResultId: completed.aiResultId,
+        data: attemptResult.data,
+        tokensIn,
+        tokensOut,
+      };
+    }
+
     // Phase 5 PR 2: a failure this far in (provider_error after a partial
     // response, or invalid_structured_output) may still have consumed
-    // real, billable tokens -- compute and persist cost whenever the
-    // provider actually reported token counts, same pricing used for the
-    // success path below.
-    const tokensIn = result.tokensIn ?? null;
-    const tokensOut = result.tokensOut ?? null;
-    const costEstimateUsd =
-      tokensIn !== null && tokensOut !== null ? microsToUsdString(calculateCostMicros(pricing, tokensIn, tokensOut)) : null;
-    await completeAiJobFailure({
-      jobId: job.id,
-      error: `${result.reason}: ${result.message}`,
-      tokensIn,
-      tokensOut,
-      costEstimateUsd,
-    });
-    return { ok: false, jobId: job.id, reason: result.reason, message: result.message };
+    // real, billable tokens -- accumulate them regardless of whether
+    // this attempt is retried.
+    addTokens(attemptResult.tokensIn, attemptResult.tokensOut);
+
+    const canRetry = attemptResult.reason === "invalid_structured_output" && attempt < MAX_INVALID_STRUCTURED_OUTPUT_ATTEMPTS;
+    if (!canRetry) {
+      const costEstimateUsd =
+        sumTokensIn !== null && sumTokensOut !== null
+          ? microsToUsdString(calculateCostMicros(pricing, sumTokensIn, sumTokensOut))
+          : null;
+      // Truthful documentation (Section 26): the persisted error records
+      // whether an automatic retry actually happened, so the audit trail
+      // never silently implies a single clean attempt when there were
+      // in fact two.
+      const error = retriedAfterInvalidStructuredOutput
+        ? `${attemptResult.reason}: ${attemptResult.message} (after 1 automatic retry)`
+        : `${attemptResult.reason}: ${attemptResult.message}`;
+      await completeAiJobFailure({
+        jobId: job.id,
+        error,
+        tokensIn: sumTokensIn,
+        tokensOut: sumTokensOut,
+        costEstimateUsd,
+      });
+      return { ok: false, jobId: job.id, reason: attemptResult.reason, message: attemptResult.message };
+    }
+
+    retriedAfterInvalidStructuredOutput = true;
+    // Loop again -- exactly one further attempt, bounded by
+    // MAX_INVALID_STRUCTURED_OUTPUT_ATTEMPTS above.
   }
-
-  const costEstimateUsd = microsToUsdString(calculateCostMicros(pricing, result.tokensIn, result.tokensOut));
-
-  const completed = await completeAiJobSuccess({
-    jobId: job.id,
-    tokensIn: result.tokensIn,
-    tokensOut: result.tokensOut,
-    costEstimateUsd,
-    structuredOutput: result.data,
-    confidence: input.confidence ?? null,
-    reasoning: input.reasoning ?? null,
-    claimId: input.claimId ?? null,
-  });
-
-  return {
-    ok: true,
-    jobId: job.id,
-    aiResultId: completed.aiResultId,
-    data: result.data,
-    tokensIn: result.tokensIn,
-    tokensOut: result.tokensOut,
-  };
 }

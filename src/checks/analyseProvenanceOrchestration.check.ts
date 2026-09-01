@@ -235,7 +235,18 @@ async function main() {
       const itemB = await createTestSourceItem("Item B", "https://example.test/valid-b");
 
       async function expectInvalid(rawOutput: unknown, label: string) {
-        const provider = new FakeAiProvider([{ kind: "success", rawOutput }]);
+        // Phase 6 hardening: runAiOperation now makes exactly one bounded
+        // automatic retry on invalid_structured_output -- the SAME
+        // malformed response is queued twice so that retry has something
+        // to consume (an exhausted FakeAiProvider queue throws, which
+        // would be misreported as provider_error instead of the
+        // invalid_structured_output every call site here actually
+        // tests). Fixed once, in this shared helper, rather than at each
+        // of the 7 call sites below.
+        const provider = new FakeAiProvider([
+          { kind: "success", rawOutput },
+          { kind: "success", rawOutput },
+        ]);
         const result = await analyseProvenance({
           provider,
           claimId: claim.id,

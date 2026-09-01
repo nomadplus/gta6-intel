@@ -1232,6 +1232,80 @@ call time, and the admin UI only offers "reanalyse" from a `succeeded`
 state when the claim's *current* cluster fingerprint no longer matches
 it.
 
+### Structured-output bounded retry & admin recovery UI hardening (Phase 6 hardening)
+
+Production verification of PR 6.2 surfaced two defects, both fixed
+narrowly rather than with general-purpose machinery.
+
+**Bounded automatic retry for `invalid_structured_output`.**
+`runAiOperation()` (Phase 5 PR 1) now makes exactly one automatic retry —
+two provider attempts maximum — but only when the failure reason is
+`invalid_structured_output`. This absorbs ordinary model-side tool-call
+flakiness (e.g. an array field occasionally emitted as a string) without
+burning an admin's manual "Retry" click on something the model would
+have gotten right a moment later.
+
+- **Scope is deliberately narrow.** `provider_error`, every
+  `AiSafetyBlockedReason` (kill switch, unpriced model, budget ceiling),
+  and `already_in_flight` are never retried here — a real provider outage
+  or a budget/kill-switch block retrying immediately would compound the
+  problem, not fix it. Only a schema-validation failure is safe and cheap
+  to retry once, immediately.
+- **Synchronous and request-scoped, not a retry scheduler.** This is a
+  single bounded in-request loop inside `runAiOperation()` — no delay, no
+  queue, no new `attempt_count`/`next_retry_at` columns on `ai_jobs`. One
+  `ai_jobs` row still represents the whole job regardless of how many
+  provider round-trips it took to reach a terminal state — this is
+  explicitly *not* the "retry scheduler" `aiJobLifecycle.ts`'s own header
+  comment excludes from scope (that refers to an async, delayed,
+  ingestion-style backoff mechanism; this is neither delayed nor async).
+- **Token/cost accounting is summed across both attempts.** A failed
+  first attempt can still have consumed real, billable tokens; those are
+  never dropped. Whether the job ultimately succeeds (on the retry) or
+  fails (both attempts invalid), the persisted `ai_jobs.tokens_in` /
+  `.tokens_out` / `.cost_estimate_usd` reflect the total across every
+  attempt, not just the last one.
+- **A double failure truthfully records the retry.** If both attempts
+  fail, the persisted `ai_jobs.error` text is suffixed `(after 1
+  automatic retry)` — the audit trail never silently implies a single
+  clean attempt when there were in fact two.
+- **No change to AI advisory authority or human-review semantics.** This
+  only affects whether a job succeeds in getting valid structured output
+  from the model. It has zero effect on classification/extraction/
+  duplicate-check/comparison/provenance recommendations still requiring
+  the same explicit admin approve/reject/edit before anything is written
+  to `claims`, `claim_relationships`, or `source_relationships`.
+
+**Admin recovery UI: stale post-retry rendering.** The three admin
+recovery server actions (`runClassificationRecoveryAction`,
+`runExtractClaimsAction`, `runDetectDuplicatesAction` in
+`src/app/admin/(protected)/review/actions.ts`) previously called
+`revalidatePath("/admin/review")` once, before the actual mutating
+`trigger...()` call ran — meaning the revalidation signal reflected
+pre-mutation state, not the job's real outcome. Combined with a final
+redirect URL keyed only on a coarse status word (e.g. `extractStatus=
+failed`), a repeat status across two clicks could redirect to a
+byte-identical URL to one already visited, risking a stale cached render
+surviving until a manual browser refresh.
+
+All three actions now:
+
+- call `revalidatePath("/admin/review")` again, immediately before the
+  final redirect, *after* the mutating operation has actually completed
+  — so the invalidation reflects the true final state, not a snapshot
+  from before the job ran;
+- append the newly created job's own id to the redirect URL as a
+  cache-busting parameter wherever one exists (real identity, not an
+  arbitrary timestamp), guaranteeing the exact redirect target was never
+  visited before. The one exception is `detect_duplicates`'
+  `no_existing_claims` outcome, which never creates an `ai_jobs` row (no
+  provider call is made), so there is no job id to key on there — that
+  redirect target is unchanged.
+
+The earlier `revalidatePath` call before the `fresh_in_flight` early-exit
+branch (no mutation follows it in that branch) was already correctly
+ordered and is unchanged.
+
 ### Outbound link observations: `source_item_links` (Phase 6 prerequisite)
 
 Before Phase 6's autonomous discovery providers are built, this PR closes

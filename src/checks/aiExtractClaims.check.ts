@@ -200,6 +200,30 @@ async function main() {
           tokensIn: 50,
           tokensOut: 20,
         },
+        // Phase 6 hardening: runAiOperation now makes exactly one bounded
+        // automatic retry on invalid_structured_output -- a second,
+        // equally-invalid response is queued here so that retry has
+        // something to consume (an exhausted FakeAiProvider queue throws,
+        // which would be misreported as provider_error instead of the
+        // invalid_structured_output this block actually tests). Same
+        // fabricated-excerpt violation, so the invariant under test is
+        // unchanged.
+        {
+          kind: "success",
+          rawOutput: {
+            claims: [
+              {
+                statement: "GTA VI will release on a Tuesday.",
+                informationType: "speculation",
+                supportingExcerpt: "confirmed release date is a Tuesday in October",
+                confidence: 0.5,
+                reasoning: "fabricated for this check, retry attempt",
+              },
+            ],
+          },
+          tokensIn: 50,
+          tokensOut: 20,
+        },
       ]);
       const result = await extractClaims({ provider, sourceItem });
 
@@ -272,6 +296,27 @@ async function main() {
           tokensIn: 50,
           tokensOut: 20,
         },
+        // Phase 6 hardening: queue a second, equally-invalid response so
+        // the bounded automatic retry has something to consume -- see
+        // the matching comment on the fabricated-supportingExcerpt block
+        // above.
+        {
+          kind: "success",
+          rawOutput: {
+            claims: [
+              {
+                statement: "GTA VI is set in Vice City.",
+                informationType: "official",
+                supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
+                confidence: 0.9,
+                reasoning: "stated directly, retry attempt",
+              },
+            ],
+            noExtractableClaimsNote: "this should not be allowed alongside a non-empty claims array",
+          },
+          tokensIn: 50,
+          tokensOut: 20,
+        },
       ]);
       const result = await extractClaims({ provider, sourceItem });
       assert(result.ok === false, "noExtractableClaimsNote + non-empty claims: rejected as invalid_structured_output");
@@ -302,6 +347,33 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.85,
                 reasoning: "duplicate",
+              },
+            ],
+          },
+          tokensIn: 60,
+          tokensOut: 25,
+        },
+        // Phase 6 hardening: queue a second, equally-invalid response so
+        // the bounded automatic retry has something to consume -- see
+        // the matching comment on the fabricated-supportingExcerpt block
+        // above.
+        {
+          kind: "success",
+          rawOutput: {
+            claims: [
+              {
+                statement: "GTA VI is set in Vice City.",
+                informationType: "official",
+                supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
+                confidence: 0.9,
+                reasoning: "first, retry attempt",
+              },
+              {
+                statement: "  gta vi is set in vice city.  ",
+                informationType: "official",
+                supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
+                confidence: 0.85,
+                reasoning: "duplicate, retry attempt",
               },
             ],
           },
@@ -369,7 +441,14 @@ async function main() {
     {
       const sourceItem = await createTestSourceItem();
       const beforeSnapshot = await loadSourceItem(sourceItem.id);
-      const provider = new FakeAiProvider([{ kind: "success", rawOutput: { claims: "not-an-array" }, tokensIn: 20, tokensOut: 5 }]);
+      const provider = new FakeAiProvider([
+        { kind: "success", rawOutput: { claims: "not-an-array" }, tokensIn: 20, tokensOut: 5 },
+        // Phase 6 hardening: same wrong-shape response queued twice so the
+        // bounded automatic retry still lands on invalid_structured_output
+        // rather than exhausting the fake queue into a misreported
+        // provider_error -- see the matching comment earlier in this file.
+        { kind: "success", rawOutput: { claims: "not-an-array" }, tokensIn: 20, tokensOut: 5 },
+      ]);
       const result = await extractClaims({ provider, sourceItem });
       assert(result.ok === false, "malformed output (wrong shape): returns ok:false");
       if (!result.ok && result.jobId !== null) {

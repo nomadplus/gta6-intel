@@ -173,6 +173,19 @@ async function main() {
           tokensIn: 40,
           tokensOut: 15,
         },
+        // Phase 6 hardening: queue a second, equally-invalid response so
+        // the bounded automatic retry (runAiOperation.ts) has something
+        // to consume -- an exhausted FakeAiProvider queue throws, which
+        // would be misreported as provider_error instead of the
+        // invalid_structured_output this block actually tests.
+        {
+          kind: "success",
+          rawOutput: {
+            matches: [{ existingClaimId: 999999, confidence: 0.8, reasoning: "fabricated for this check, retry attempt" }],
+          },
+          tokensIn: 40,
+          tokensOut: 15,
+        },
       ]);
       const result = await detectDuplicates({
         provider,
@@ -233,6 +246,17 @@ async function main() {
           tokensIn: 30,
           tokensOut: 10,
         },
+        // Phase 6 hardening: see the matching comment on the fabricated
+        // existingClaimId block above.
+        {
+          kind: "success",
+          rawOutput: {
+            matches: [{ existingClaimId: existingClaim.id, confidence: 0.7, reasoning: "test, retry attempt" }],
+            noLikelyDuplicateNote: "should not co-occur with a non-empty matches array",
+          },
+          tokensIn: 30,
+          tokensOut: 10,
+        },
       ]);
       const result = await detectDuplicates({
         provider,
@@ -258,6 +282,19 @@ async function main() {
             matches: [
               { existingClaimId: claimA.id, confidence: 0.6, reasoning: "first mention" },
               { existingClaimId: claimA.id, confidence: 0.7, reasoning: "duplicate mention of the same id" },
+            ],
+          },
+          tokensIn: 30,
+          tokensOut: 10,
+        },
+        // Phase 6 hardening: see the matching comment on the fabricated
+        // existingClaimId block above.
+        {
+          kind: "success",
+          rawOutput: {
+            matches: [
+              { existingClaimId: claimA.id, confidence: 0.6, reasoning: "first mention, retry attempt" },
+              { existingClaimId: claimA.id, confidence: 0.7, reasoning: "duplicate mention of the same id, retry attempt" },
             ],
           },
           tokensIn: 30,
@@ -312,6 +349,9 @@ async function main() {
       const extractionAiResultId = await createParentAiResult();
       const provider = new FakeAiProvider([
         { kind: "success", rawOutput: { matches: [{ existingClaimId: existingClaim.id, confidence: 1.5, reasoning: "out of range" }] }, tokensIn: 20, tokensOut: 10 },
+        // Phase 6 hardening: see the matching comment on the fabricated
+        // existingClaimId block above.
+        { kind: "success", rawOutput: { matches: [{ existingClaimId: existingClaim.id, confidence: 1.5, reasoning: "out of range, retry attempt" }] }, tokensIn: 20, tokensOut: 10 },
       ]);
       const result = await detectDuplicates({
         provider,
