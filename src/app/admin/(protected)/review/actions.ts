@@ -133,23 +133,40 @@ export async function runExtractClaimsAction(formData: FormData) {
  */
 export async function approveClaimProposalAction(formData: FormData) {
   const input = formDataToObject(formData, ["topicIds"]);
+  // Admin Review workspace (PR-A): aiResultId/candidateIndex are read
+  // straight from this exact form's own hidden inputs -- the same values
+  // approveClaimProposal itself re-reads and re-validates from `input`
+  // below. Carrying them into the redirect URL is navigation context only
+  // (so the workspace reselects this candidate and shows the outcome next
+  // to it); it grants no additional authority and does not change what
+  // approveClaimProposal validates or writes.
+  const aiResultIdParam = typeof input.aiResultId === "string" ? input.aiResultId : "";
+  const candidateIndexParam = typeof input.candidateIndex === "string" ? input.candidateIndex : "";
   const outcome = await safeAction(() => approveClaimProposal(input));
   if (!outcome.ok) {
-    redirect(`/admin/review?proposalError=${encodeURIComponent(outcome.error)}`);
+    redirect(
+      `/admin/review?proposalError=${encodeURIComponent(outcome.error)}&aiResultId=${aiResultIdParam}&candidateIndex=${candidateIndexParam}#candidate-review-workspace`
+    );
   }
   revalidatePath("/admin/review");
   revalidatePath("/admin/claims");
-  redirect(`/admin/review?proposalStatus=approved&claimId=${outcome.data.claim.id}`);
+  redirect(
+    `/admin/review?proposalStatus=approved&claimId=${outcome.data.claim.id}&aiResultId=${aiResultIdParam}&candidateIndex=${candidateIndexParam}#candidate-review-workspace`
+  );
 }
 
 export async function rejectClaimProposalAction(formData: FormData) {
   const input = formDataToObject(formData);
+  const aiResultIdParam = typeof input.aiResultId === "string" ? input.aiResultId : "";
+  const candidateIndexParam = typeof input.candidateIndex === "string" ? input.candidateIndex : "";
   const outcome = await safeAction(() => rejectClaimProposal(input));
   if (!outcome.ok) {
-    redirect(`/admin/review?proposalError=${encodeURIComponent(outcome.error)}`);
+    redirect(
+      `/admin/review?proposalError=${encodeURIComponent(outcome.error)}&aiResultId=${aiResultIdParam}&candidateIndex=${candidateIndexParam}#candidate-review-workspace`
+    );
   }
   revalidatePath("/admin/review");
-  redirect("/admin/review?proposalStatus=rejected");
+  redirect(`/admin/review?proposalStatus=rejected&aiResultId=${aiResultIdParam}&candidateIndex=${candidateIndexParam}#candidate-review-workspace`);
 }
 
 /**
@@ -162,13 +179,19 @@ export async function rejectClaimProposalAction(formData: FormData) {
  */
 export async function resolveAsExistingClaimAction(formData: FormData) {
   const input = formDataToObject(formData);
+  const aiResultIdParam = typeof input.aiResultId === "string" ? input.aiResultId : "";
+  const candidateIndexParam = typeof input.candidateIndex === "string" ? input.candidateIndex : "";
   const outcome = await safeAction(() => resolveProposalAsExistingClaim(input));
   if (!outcome.ok) {
-    redirect(`/admin/review?proposalError=${encodeURIComponent(outcome.error)}`);
+    redirect(
+      `/admin/review?proposalError=${encodeURIComponent(outcome.error)}&aiResultId=${aiResultIdParam}&candidateIndex=${candidateIndexParam}#candidate-review-workspace`
+    );
   }
   revalidatePath("/admin/review");
   revalidatePath("/admin/claims");
-  redirect(`/admin/review?proposalStatus=linked_existing_claim&claimId=${outcome.data.existingClaim.id}`);
+  redirect(
+    `/admin/review?proposalStatus=linked_existing_claim&claimId=${outcome.data.existingClaim.id}&aiResultId=${aiResultIdParam}&candidateIndex=${candidateIndexParam}#candidate-review-workspace`
+  );
 }
 
 /**
@@ -196,18 +219,28 @@ export async function runDetectDuplicatesAction(formData: FormData) {
 
   const reclaimOutcome = await safeAction(() => reclaimStaleInFlightDetectDuplicatesJob(aiResultId, candidateIndex));
   if (!reclaimOutcome.ok) {
-    redirect(`/admin/review?duplicateError=${encodeURIComponent(reclaimOutcome.error)}`);
+    // Preserves the same aiResultId/candidateIndex already resolved above
+    // and passed to reclaimStaleInFlightDetectDuplicatesJob itself --
+    // navigation context only, not re-derived or trusted as authority; the
+    // mutation already validated this identity before this point.
+    redirect(
+      `/admin/review?duplicateError=${encodeURIComponent(reclaimOutcome.error)}&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}#candidate-review-workspace`
+    );
   }
 
   revalidatePath("/admin/review");
 
   if (reclaimOutcome.data.outcome === "fresh_in_flight") {
-    redirect(`/admin/review?duplicateStatus=fresh_in_flight&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}`);
+    redirect(`/admin/review?duplicateStatus=fresh_in_flight&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}#candidate-review-workspace`);
   }
 
   const detectOutcome = await safeAction(() => triggerDetectDuplicates(aiResultId, candidateIndex));
   if (!detectOutcome.ok) {
-    redirect(`/admin/review?duplicateError=${encodeURIComponent(detectOutcome.error)}`);
+    // Same identity already passed to triggerDetectDuplicates itself --
+    // see the comment on the reclaim error redirect above.
+    redirect(
+      `/admin/review?duplicateError=${encodeURIComponent(detectOutcome.error)}&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}#candidate-review-workspace`
+    );
   }
 
   const outcome = detectOutcome.data;
@@ -219,5 +252,5 @@ export async function runDetectDuplicatesAction(formData: FormData) {
   // before.
   revalidatePath("/admin/review");
   const jobIdParam = outcome.kind === "ran" && outcome.result.jobId !== null ? `&jobId=${outcome.result.jobId}` : "";
-  redirect(`/admin/review?duplicateStatus=${status}&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}${jobIdParam}`);
+  redirect(`/admin/review?duplicateStatus=${status}&aiResultId=${aiResultId}&candidateIndex=${candidateIndex}${jobIdParam}#candidate-review-workspace`);
 }

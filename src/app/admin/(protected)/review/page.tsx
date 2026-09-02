@@ -1,5 +1,5 @@
+import Link from "next/link";
 import {
-  listAiReviewRecords,
   listSourceItemClassificationStatus,
   listSourceItemExtractionStatus,
   listTopicsForAdmin,
@@ -12,27 +12,17 @@ import { adminDb } from "@/db/adminClient";
 import { computeClassificationDisplayStatus, type ClassificationDisplayStatus } from "@/lib/ai/classificationRecoveryLifecycle";
 import { computeExtractionDisplayStatus, type ExtractionDisplayStatus } from "@/lib/ai/extractClaimsRecoveryLifecycle";
 import { canTriggerExtraction, extractionButtonLabel } from "@/lib/ai/extractionActionability";
-import { computeDuplicateCheckDisplayState, canTriggerDuplicateCheck, duplicateCheckButtonLabel, type DuplicateCheckDisplayState } from "@/lib/ai/duplicateCheckActionability";
+import { computeDuplicateCheckDisplayState } from "@/lib/ai/duplicateCheckActionability";
 import { DUPLICATE_CHECK_DEFAULT_PROJECT_ID } from "@/lib/ai/operations/detectDuplicatesTrigger";
-import { developmentOutcomeDisplay, informationTypeLabel, investigationStatusDisplay } from "@/lib/statusDisplay";
 import {
-  approveClaimProposalAction,
-  rejectClaimProposalAction,
-  runClassificationRecoveryAction,
-  runExtractClaimsAction,
-  runDetectDuplicatesAction,
-  resolveAsExistingClaimAction,
-} from "./actions";
-
-function suggestedSlug(statement: string, candidateIndex: number): string {
-  const slug = statement
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 220)
-    .replace(/-+$/g, "");
-  return slug || `extracted-claim-${candidateIndex + 1}`;
-}
+  computeCandidateWorkflowState,
+  orderWorkspaceCandidatesUnresolvedFirst,
+  selectWorkspaceCandidate,
+  type CandidateWorkflowState,
+} from "@/lib/ai/candidateWorkflowState";
+import { CandidateList, type CandidateListRow } from "./CandidateList";
+import { CandidateDetail, type CandidateDetailData } from "./CandidateDetail";
+import { runClassificationRecoveryAction, runExtractClaimsAction } from "./actions";
 
 const STATUS_LABEL: Record<ClassificationDisplayStatus, string> = {
   unclassified: "Unclassified",
@@ -72,28 +62,16 @@ const EXTRACTION_STATUS_CLASS: Record<ExtractionDisplayStatus, string> = {
   succeeded: "text-signal-confirmed",
 };
 
-// Phase 5 PR 6: six-state duplicate-check display model (see
-// duplicateCheckActionability.ts). no_existing_claims is distinct from
-// not_checked -- a check has genuinely never run in either case, but
-// no_existing_claims means running one would be pointless (and free),
-// while not_checked means one is available and would cost something.
-const DUPLICATE_STATUS_LABEL: Record<DuplicateCheckDisplayState, string> = {
-  no_existing_claims: "No existing claims yet to compare against",
-  not_checked: "Not yet checked for duplicates",
-  in_progress: "Checking for duplicates…",
-  stale: "Stale — recovery available",
-  failed: "Duplicate check failed",
-  succeeded: "Duplicate check complete",
-};
+/** Parses a searchParams string value into a finite number, or null for anything else (absent, empty, non-numeric). Never throws. */
+function parseIntOrNull(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
-const DUPLICATE_STATUS_CLASS: Record<DuplicateCheckDisplayState, string> = {
-  no_existing_claims: "text-ink-600",
-  not_checked: "text-ink-600",
-  in_progress: "text-accent-brass",
-  stale: "text-signal-disproven",
-  failed: "text-signal-disproven",
-  succeeded: "text-signal-confirmed",
-};
+interface WorkspaceCandidate extends CandidateDetailData {
+  candidateStatementPreview: string;
+}
 
 export default async function AdminReviewPage({
   searchParams,
@@ -124,26 +102,22 @@ export default async function AdminReviewPage({
     sourceItemId,
     duplicateStatus,
     duplicateError,
-    aiResultId: duplicateAiResultId,
-    candidateIndex: duplicateCandidateIndex,
+    aiResultId: aiResultIdParam,
+    candidateIndex: candidateIndexParam,
   } = await searchParams;
-  const records = await listAiReviewRecords();
   const classificationRows = await listSourceItemClassificationStatus();
   const extractionRows = await listSourceItemExtractionStatus();
   const topics = await listTopicsForAdmin();
   const now = new Date();
 
-  // Phase 5 PR 6: one project-wide fact (is there anything at all to
-  // compare a duplicate check against), computed once for the whole
-  // page rather than per candidate, plus each unreviewed candidate's own
-  // latest detect_duplicates job/matches. Deliberately per-candidate
-  // reads here rather than a batched LATERAL-join query (the pattern
-  // listSourceItemExtractionStatus itself uses to avoid N+1) -- the
-  // number of unreviewed candidates on this admin-only page is small
-  // (at most MAX_EXTRACTED_CLAIMS=8 per source item), so this trades a
-  // small, known amount of query fan-out for staying within this PR's
-  // locked file-count scope; a batched query would be a reasonable
-  // follow-up if this page's candidate volume ever grows materially.
+  // Phase 5 PR 6 (unchanged by PR-A): one project-wide fact (is there
+  // anything at all to compare a duplicate check against), computed once
+  // for the whole page rather than per candidate, plus each unreviewed
+  // candidate's own latest detect_duplicates job/matches. Deliberately
+  // per-candidate reads here rather than a batched LATERAL-join query --
+  // see the original PR 6 comment this preserves verbatim below. PR-A
+  // does not change this fetching strategy; it only changes how the
+  // results are laid out on the page.
   const hasExistingClaims = (await countClaimsForProject(adminDb, DUPLICATE_CHECK_DEFAULT_PROJECT_ID)) > 0;
   const duplicateCheckDataByCandidate = new Map<
     string,
@@ -159,16 +133,83 @@ export default async function AdminReviewPage({
     }
   }
 
+  // Admin Review workspace (PR-A): flatten every extracted candidate
+  // across all source items into one list, each carrying its own
+  // presentation-only six-state workflow label (candidateWorkflowState.ts)
+  // -- this replaces the previous per-source-item inline candidate
+  // rendering with a single cross-source-item review queue.
+  const workspaceCandidatesUnordered: WorkspaceCandidate[] = [];
+  for (const row of extractionRows) {
+    if (row.aiResultId === null) continue;
+    const aiResultId = row.aiResultId;
+    for (const candidate of row.candidates) {
+      const duplicateData = duplicateCheckDataByCandidate.get(`${aiResultId}:${candidate.candidateIndex}`);
+      const duplicateState = computeDuplicateCheckDisplayState(hasExistingClaims, duplicateData?.job ?? null, now);
+      const workflowState: CandidateWorkflowState = computeCandidateWorkflowState(candidate.review, duplicateState);
+      workspaceCandidatesUnordered.push({
+        aiResultId,
+        candidateIndex: candidate.candidateIndex,
+        sourceItemId: row.sourceItemId,
+        sourceItemTitle: row.title,
+        sourceItemUrl: row.url,
+        statement: candidate.statement,
+        candidateStatementPreview: candidate.statement,
+        informationType: candidate.informationType,
+        supportingExcerpt: candidate.supportingExcerpt,
+        confidence: candidate.confidence,
+        reasoning: candidate.reasoning,
+        review: candidate.review,
+        workflowState,
+      });
+    }
+  }
+  const workspaceCandidates = orderWorkspaceCandidatesUnresolvedFirst(workspaceCandidatesUnordered);
+
+  const requestedAiResultId = parseIntOrNull(aiResultIdParam);
+  const requestedCandidateIndex = parseIntOrNull(candidateIndexParam);
+  const selectedCandidate = selectWorkspaceCandidate(workspaceCandidates, {
+    aiResultId: requestedAiResultId,
+    candidateIndex: requestedCandidateIndex,
+  });
+
+  // Scoped feedback (locked in the approved PR-A spec): only show the
+  // proposal/duplicate-check outcome banner when the requested identity in
+  // the URL exactly matches the candidate actually selected -- a stale or
+  // invalid link that fell back to a different candidate (see
+  // selectWorkspaceCandidate) must never attach someone else's feedback to
+  // the wrong candidate.
+  const feedbackMatchesSelection =
+    selectedCandidate !== null &&
+    requestedAiResultId === selectedCandidate.aiResultId &&
+    requestedCandidateIndex === selectedCandidate.candidateIndex;
+
+  const selectedDuplicateData = selectedCandidate
+    ? duplicateCheckDataByCandidate.get(`${selectedCandidate.aiResultId}:${selectedCandidate.candidateIndex}`) ?? null
+    : null;
+
+  const listRows: CandidateListRow[] = workspaceCandidates.map((candidate) => ({
+    aiResultId: candidate.aiResultId,
+    candidateIndex: candidate.candidateIndex,
+    sourceItemTitle: candidate.sourceItemTitle,
+    sourceItemUrl: candidate.sourceItemUrl,
+    statement: candidate.candidateStatementPreview,
+    workflowState: candidate.workflowState,
+  }));
+
   return (
-    <div className="max-w-4xl">
+    <div className="max-w-6xl">
       <h1 className="font-display text-3xl italic text-ink-100">AI / Admin Review</h1>
       <p className="mt-2 max-w-2xl text-sm text-ink-400">
-        Record of AI recommendations and the admin decisions made on them, plus the live
-        classify_relevance (Phase 5 PR 3) and extract_claims (Phase 5 PR 4) processing queues below.
-        Both AI operations produce advisory output only — a classification or an extracted claim
-        candidate is a recommendation for human review, never an automatic change to any claim,
-        evidence, or source-item record. Extraction candidates below can only become claims through
-        an explicit editor review; accepting one records the decision and its source provenance.
+        Live classify_relevance (Phase 5 PR 3) and extract_claims (Phase 5 PR 4) processing queues,
+        plus a candidate review workspace below. Both AI operations produce advisory output only —
+        a classification or an extracted claim candidate is a recommendation for human review, never
+        an automatic change to any claim, evidence, or source-item record. Extraction candidates can
+        only become claims through an explicit editor review; accepting one records the decision and
+        its source provenance. For the full historical audit log, see{" "}
+        <Link href="/admin/review/history" className="text-accent-brass hover:underline">
+          AI Review History
+        </Link>
+        .
       </p>
 
       {recoveryError && (
@@ -191,29 +232,6 @@ export default async function AdminReviewPage({
         <p className="mt-4 text-sm text-ink-400">
           Claim extraction for source item #{sourceItemId}:{" "}
           <span className="font-mono text-ink-100">{extractStatus}</span>
-        </p>
-      )}
-      {proposalError && (
-        <p className="mt-4 border border-signal-disproven/50 px-3 py-2 text-sm text-signal-disproven">
-          {proposalError}
-        </p>
-      )}
-      {proposalStatus && (
-        <p className="mt-4 text-sm text-ink-400">
-          Claim proposal review: <span className="font-mono text-ink-100">{proposalStatus}</span>
-          {proposalStatus === "approved" && claimId && <> — claim #{claimId} created.</>}
-          {proposalStatus === "linked_existing_claim" && claimId && <> — linked to existing claim #{claimId}.</>}
-        </p>
-      )}
-      {duplicateError && (
-        <p className="mt-4 border border-signal-disproven/50 px-3 py-2 text-sm text-signal-disproven">
-          {duplicateError}
-        </p>
-      )}
-      {duplicateStatus && (
-        <p className="mt-4 text-sm text-ink-400">
-          Duplicate check for candidate {duplicateCandidateIndex} of AI result #{duplicateAiResultId}:{" "}
-          <span className="font-mono text-ink-100">{duplicateStatus}</span>
         </p>
       )}
 
@@ -284,15 +302,13 @@ export default async function AdminReviewPage({
         </ul>
       )}
 
-      <h2 className="mt-10 font-display text-xl italic text-ink-100">Claim extraction candidates</h2>
+      <h2 className="mt-10 font-display text-xl italic text-ink-100">Claim extraction status</h2>
       <p className="mt-2 max-w-2xl text-sm text-ink-400">
         extract_claims status per source item (Phase 5 PR 4) — proposal only. A source item becomes
         eligible only once its <em>latest successful</em> classify_relevance result is exactly
         "relevant"; a never-classified, only-ever-failed, or currently-in-flight-with-no-prior-success
-        item shows as ineligible below and cannot trigger extraction, even by direct request. Nothing
-        here changes a claim automatically. An editor may review, edit, approve, or reject each
-        candidate independently. Approval creates a claim and one supporting source citation in a
-        single audited transaction; rejection creates no claim, evidence, or provenance record.
+        item shows as ineligible below and cannot trigger extraction, even by direct request.
+        Extracted candidates are reviewed in the workspace further down this page.
       </p>
 
       {extractionRows.length === 0 ? (
@@ -336,169 +352,23 @@ export default async function AdminReviewPage({
                 )}
 
                 {eligible && status === "succeeded" && (
-                  <div className="mt-2 space-y-2">
+                  <div className="mt-2">
                     {row.candidates.length === 0 ? (
                       <p className="text-xs text-ink-600">
                         No extractable claims found.
                         {row.noExtractableClaimsNote && <> — {row.noExtractableClaimsNote}</>}
                       </p>
                     ) : (
-                      row.candidates.map((candidate) => (
-                        <div key={candidate.candidateIndex} className="border-l-2 border-hairline pl-3 text-xs text-ink-400">
-                          <p className="text-ink-100">{candidate.statement}</p>
-                          <p className="mt-1 font-mono text-[10px] uppercase tracking-wide text-ink-600">
-                            {candidate.informationType} · confidence {candidate.confidence.toFixed(2)}
-                          </p>
-                          <p className="mt-1">"{candidate.supportingExcerpt}"</p>
-                          <p className="mt-1 text-ink-600">{candidate.reasoning}</p>
-                          {candidate.review ? (
-                            <p className={`mt-3 border-l-2 pl-2 ${candidate.review.action === "reject" ? "border-signal-disproven text-signal-disproven" : "border-signal-confirmed text-signal-confirmed"}`}>
-                              {candidate.review.action === "approve"
-                                ? "Approved"
-                                : candidate.review.action === "link_existing_claim"
-                                  ? "Resolved to existing claim"
-                                  : "Rejected"}
-                              {candidate.review.materializedClaimId && <> — claim #{candidate.review.materializedClaimId}</>}
-                              {candidate.review.notes && <>: {candidate.review.notes}</>}
-                            </p>
-                          ) : row.aiResultId !== null ? (
-                            (() => {
-                              const aiResultId = row.aiResultId as number;
-                              const key = `${aiResultId}:${candidate.candidateIndex}`;
-                              const duplicateData = duplicateCheckDataByCandidate.get(key);
-                              const duplicateState = computeDuplicateCheckDisplayState(hasExistingClaims, duplicateData?.job ?? null, now);
-                              const showDuplicateAction = canTriggerDuplicateCheck(duplicateState);
-                              const duplicateLabel = showDuplicateAction ? duplicateCheckButtonLabel(duplicateState) : null;
-                              const matches = duplicateData?.matches ?? null;
-
-                              return (
-                                <>
-                                  <div className="mt-3 border border-hairline p-3">
-                                    <div className="flex flex-wrap items-center justify-between gap-2">
-                                      <span className="font-mono text-[10px] uppercase tracking-wide text-ink-600">Duplicate check</span>
-                                      <span className={`font-mono text-[10px] uppercase tracking-wide ${DUPLICATE_STATUS_CLASS[duplicateState]}`}>
-                                        {DUPLICATE_STATUS_LABEL[duplicateState]}
-                                      </span>
-                                    </div>
-
-                                    {duplicateState === "stale" && (
-                                      <p className="mt-2 text-ink-600">
-                                        An in-flight attempt started but never reached a terminal outcome within the staleness
-                                        window — safe to reclaim and retry.
-                                      </p>
-                                    )}
-                                    {duplicateState === "failed" && duplicateData?.job?.error && (
-                                      <p className="mt-2 text-signal-disproven">{duplicateData.job.error}</p>
-                                    )}
-
-                                    {matches && matches.length > 0 && (
-                                      <div className="mt-3 space-y-2">
-                                        <p className="text-ink-600">Possible matches — advisory only, review before acting:</p>
-                                        {matches.map((match) => (
-                                          <div key={match.existingClaimId} className="border-l-2 border-accent-brass/50 pl-2">
-                                            <p className="text-ink-100">
-                                              Claim #{match.existingClaimId} · confidence {match.confidence.toFixed(2)}
-                                            </p>
-                                            <p className="mt-1 text-ink-600">{match.reasoning}</p>
-                                            <form action={resolveAsExistingClaimAction} className="mt-2 flex flex-wrap items-center gap-2">
-                                              <input type="hidden" name="aiResultId" value={aiResultId} />
-                                              <input type="hidden" name="candidateIndex" value={candidate.candidateIndex} />
-                                              <input type="hidden" name="existingClaimId" value={match.existingClaimId} />
-                                              <input
-                                                name="reason"
-                                                required
-                                                placeholder="Reason for using this existing claim"
-                                                className={`${reviewInputClass} flex-1`}
-                                              />
-                                              <button type="submit" className={reviewApproveClass}>
-                                                Use existing claim #{match.existingClaimId}
-                                              </button>
-                                            </form>
-                                          </div>
-                                        ))}
-                                      </div>
-                                    )}
-                                    {matches && matches.length === 0 && duplicateState === "succeeded" && (
-                                      <p className="mt-2 text-ink-600">No likely duplicate found.</p>
-                                    )}
-
-                                    {showDuplicateAction && duplicateLabel && (
-                                      <form action={runDetectDuplicatesAction} className="mt-3">
-                                        <input type="hidden" name="aiResultId" value={aiResultId} />
-                                        <input type="hidden" name="candidateIndex" value={candidate.candidateIndex} />
-                                        <button
-                                          type="submit"
-                                          className="border border-accent-brass px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-accent-brass hover:bg-accent-brass hover:text-bg-void"
-                                        >
-                                          {duplicateLabel}
-                                        </button>
-                                      </form>
-                                    )}
-                                  </div>
-
-                                  <details className="mt-3 border border-hairline p-3">
-                                    <summary className="cursor-pointer font-mono text-[10px] uppercase tracking-wide text-accent-brass">
-                                      Review this candidate
-                                    </summary>
-                                    <p className="mt-3 text-ink-600">
-                                      The quoted source text is fixed provenance. You may edit the proposed claim metadata before approval.
-                                    </p>
-
-                                    <form action={approveClaimProposalAction} className="mt-3 space-y-3">
-                                      <input type="hidden" name="aiResultId" value={aiResultId} />
-                                      <input type="hidden" name="candidateIndex" value={candidate.candidateIndex} />
-                                      <input type="hidden" name="projectId" value="1" />
-                                      <ReviewField label="Canonical statement">
-                                        <textarea name="statement" required rows={3} defaultValue={candidate.statement} className={reviewInputClass} />
-                                      </ReviewField>
-                                      <ReviewField label="Slug">
-                                        <input name="slug" required defaultValue={suggestedSlug(candidate.statement, candidate.candidateIndex)} className={reviewInputClass} />
-                                      </ReviewField>
-                                      <ReviewField label="Information type">
-                                        <select name="informationType" required defaultValue={candidate.informationType} className={reviewInputClass}>
-                                          {Object.entries(informationTypeLabel).map(([value, label]) => (
-                                            <option key={value} value={value}>{label}</option>
-                                          ))}
-                                        </select>
-                                      </ReviewField>
-                                      <ReviewField label="First reported date (optional)">
-                                        <input type="date" name="firstReportedAt" className={reviewInputClass} />
-                                      </ReviewField>
-                                      <ReviewField label="Topics">
-                                        <select name="topicIds" multiple className={`${reviewInputClass} h-28`}>
-                                          {topics.map((topic) => <option key={topic.id} value={topic.id}>{topic.name}</option>)}
-                                        </select>
-                                      </ReviewField>
-                                      <ReviewField label="Initial investigation status">
-                                        <select name="initialInvestigationStatus" defaultValue="unverified" className={reviewInputClass}>
-                                          {Object.entries(investigationStatusDisplay).map(([value, display]) => <option key={value} value={value}>{display.label}</option>)}
-                                        </select>
-                                      </ReviewField>
-                                      <ReviewField label="Initial development outcome">
-                                        <select name="initialDevelopmentOutcome" defaultValue="unknown" className={reviewInputClass}>
-                                          {Object.entries(developmentOutcomeDisplay).map(([value, display]) => <option key={value} value={value}>{display.label}</option>)}
-                                        </select>
-                                      </ReviewField>
-                                      <ReviewField label="Reason for approval and initial statuses">
-                                        <textarea name="reason" required rows={2} defaultValue="Approved after review of the quoted source material." className={reviewInputClass} />
-                                      </ReviewField>
-                                      <button type="submit" className={reviewApproveClass}>Approve and create claim</button>
-                                    </form>
-
-                                    <form action={rejectClaimProposalAction} className="mt-3 border-t border-hairline pt-3">
-                                      <input type="hidden" name="aiResultId" value={aiResultId} />
-                                      <input type="hidden" name="candidateIndex" value={candidate.candidateIndex} />
-                                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wide text-ink-600">Rejection reason</label>
-                                      <textarea name="notes" required rows={2} className={reviewInputClass} />
-                                      <button type="submit" className={reviewRejectClass}>Reject candidate</button>
-                                    </form>
-                                  </details>
-                                </>
-                              );
-                            })()
-                          ) : null}
-                        </div>
-                      ))
+                      <p className="text-xs text-ink-600">
+                        {row.candidates.length} candidate{row.candidates.length === 1 ? "" : "s"} extracted —{" "}
+                        <Link
+                          href={`/admin/review?aiResultId=${row.aiResultId}&candidateIndex=${row.candidates[0].candidateIndex}`}
+                          className="text-accent-brass hover:underline"
+                        >
+                          review in the workspace below
+                        </Link>
+                        .
+                      </p>
                     )}
                   </div>
                 )}
@@ -530,49 +400,31 @@ export default async function AdminReviewPage({
         </ul>
       )}
 
-      <h2 className="mt-10 font-display text-xl italic text-ink-100">All AI results</h2>
+      <h2 id="candidate-review-workspace" className="mt-10 font-display text-xl italic text-ink-100">Candidate review workspace</h2>
+      <p className="mt-2 max-w-2xl text-sm text-ink-400">
+        Every extracted claim candidate across all source items, unresolved first. Select one to
+        review its full detail, duplicate-check result, and approve / link / reject actions.
+      </p>
 
-      {records.length === 0 ? (
-        <p className="mt-8 text-sm text-ink-600">No AI recommendation records yet.</p>
-      ) : (
-        <ul className="mt-6 divide-y divide-hairline border border-hairline text-sm">
-          {records.map((r) => (
-            <li key={`${r.aiResultId}-${r.decisionId ?? "none"}`} className="p-4">
-              <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-wide text-ink-600">
-                <span>{r.provider} / {r.model}</span>
-                <span>·</span>
-                <span>{r.operation}</span>
-                <span>·</span>
-                <span>confidence {r.confidence ? Number(r.confidence).toFixed(2) : "—"}</span>
-              </div>
-              <p className="mt-2 text-ink-100">{r.reasoning}</p>
-              {r.claimId && <p className="mt-1 font-mono text-xs text-ink-600">claim #{r.claimId}</p>}
-              {r.decisionAction && (
-                <p
-                  className={`mt-2 border-l-2 pl-2 text-xs ${
-                    r.decisionAction === "reject" ? "border-signal-disproven text-signal-disproven" : "border-signal-confirmed text-signal-confirmed"
-                  }`}
-                >
-                  {r.decisionAction.toUpperCase()}: {r.decisionNotes}
-                </p>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-const reviewInputClass = "w-full border border-hairline bg-bg-void px-2 py-1 text-xs text-ink-100 focus-visible:border-accent-brass";
-const reviewApproveClass = "border border-signal-confirmed px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-signal-confirmed hover:bg-signal-confirmed hover:text-bg-void";
-const reviewRejectClass = "mt-2 border border-signal-disproven px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-signal-disproven hover:bg-signal-disproven hover:text-bg-void";
-
-function ReviewField({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wide text-ink-600">{label}</label>
-      {children}
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+        <CandidateList
+          candidates={listRows}
+          selected={selectedCandidate ? { aiResultId: selectedCandidate.aiResultId, candidateIndex: selectedCandidate.candidateIndex } : null}
+        />
+        <CandidateDetail
+          candidate={selectedCandidate}
+          hasExistingClaims={hasExistingClaims}
+          duplicateJob={selectedDuplicateData?.job ?? null}
+          duplicateMatches={selectedDuplicateData?.matches ?? null}
+          topics={topics}
+          feedback={
+            feedbackMatchesSelection
+              ? { proposalStatus, proposalError, claimId, duplicateStatus, duplicateError }
+              : {}
+          }
+          now={now}
+        />
+      </div>
     </div>
   );
 }

@@ -44,6 +44,18 @@ export type DuplicateCheckDisplayState = "no_existing_claims" | DetectDuplicates
  * true, and a candidate naturally and correctly flips from
  * no_existing_claims to not_checked the moment the project's first claim
  * exists, with no special-case transition logic needed here.
+ *
+ * PRECEDENCE (fixed after PR-A visual QA surfaced a pre-existing Phase 5
+ * PR 6 defect): a real, already-recorded job's terminal status is
+ * historical fact and must never be masked by hasExistingClaims -- a
+ * coarse, single-default-project-scoped signal (see
+ * DUPLICATE_CHECK_DEFAULT_PROJECT_ID's own header in
+ * detectDuplicatesTrigger.ts for why it can legitimately diverge from
+ * where a given job's claims actually live). The job is therefore
+ * checked FIRST; hasExistingClaims only decides the "no_existing_claims"
+ * vs "not_checked" distinction for a candidate that has no job at all --
+ * exactly the case this function was documented to describe above, and
+ * the only case where hasExistingClaims was ever meant to matter.
  */
 export function computeDuplicateCheckDisplayState(
   hasExistingClaims: boolean,
@@ -51,8 +63,9 @@ export function computeDuplicateCheckDisplayState(
   now: Date,
   thresholdMs?: number
 ): DuplicateCheckDisplayState {
+  if (job !== null) return computeDetectDuplicatesJobDisplayStatus(job, now, thresholdMs);
   if (!hasExistingClaims) return "no_existing_claims";
-  return computeDetectDuplicatesJobDisplayStatus(job, now, thresholdMs);
+  return computeDetectDuplicatesJobDisplayStatus(null, now, thresholdMs);
 }
 
 export type DuplicateCheckAction = "check" | "recover" | "retry";
