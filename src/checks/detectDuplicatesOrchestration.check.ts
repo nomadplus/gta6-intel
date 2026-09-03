@@ -23,6 +23,14 @@
  *     exactly one succeeds
  *   - all six DuplicateCheckDisplayState values compute correctly
  *
+ * Phase 6 PR-B adds a direct backward-compatibility proof: a candidate
+ * with NO officialBasis key (the genuine pre-PR-B ai_results shape --
+ * every fixture in this file already happens to be shaped this way)
+ * resolves through getExtractionCandidate()'s tolerant
+ * buildPersistedExtractClaimsOutputSchema and is NOT rejected as
+ * DuplicateCheckCandidateNotFoundError merely because that field didn't
+ * exist yet at write time.
+ *
  * Run with: npx tsx --conditions=react-server src/checks/detectDuplicatesOrchestration.check.ts
  * (requires CHECK_DATABASE_URL, ADMIN_DATABASE_URL, AI_DEFAULT_MODEL -- see README.md)
  */
@@ -138,6 +146,33 @@ async function main() {
       } catch (err) {
         assert(err instanceof DuplicateCheckCandidateNotFoundError, "candidate not found: throws DuplicateCheckCandidateNotFoundError");
       }
+    }
+
+    // --- Phase 6 PR-B: a LEGACY candidate (no officialBasis -- the exact
+    // pre-PR-B ai_results.structured_output shape createExtractionCandidate
+    // above already produces) resolves through getExtractionCandidate()
+    // and is fully actionable via triggerDetectDuplicates, NOT rejected as
+    // "not found" solely because officialBasis is absent. This is the
+    // direct proof for the getExtractionCandidate() backward-compatibility
+    // fix (buildPersistedExtractClaimsOutputSchema) -- every other test in
+    // this file already relies on this same fixture shape, but this block
+    // exists specifically to make the guarantee explicit and self-evident
+    // on its own, not merely incidental to other tests passing. ----------
+    {
+      const { aiResultId } = await createExtractionCandidate("The GTA VI map includes a legacy-shaped swamp biome.");
+      const provider = new FakeAiProvider([{ kind: "success", rawOutput: { matches: [] }, tokensIn: 10, tokensOut: 5 }]);
+
+      let threw: unknown = null;
+      try {
+        await triggerDetectDuplicates(aiResultId, 0, provider);
+      } catch (err) {
+        threw = err;
+      }
+      assert(
+        !(threw instanceof DuplicateCheckCandidateNotFoundError),
+        "legacy candidate (no officialBasis): triggerDetectDuplicates does NOT throw DuplicateCheckCandidateNotFoundError"
+      );
+      assert(threw === null, "legacy candidate (no officialBasis): triggerDetectDuplicates completes without throwing at all");
     }
 
     // --- reviewed (approved) candidate: zero jobs, zero provider calls --

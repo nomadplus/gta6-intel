@@ -11,6 +11,23 @@
  *   or provenance record;
  * - a candidate cannot be reviewed twice.
  *
+ * Phase 6 PR-B adds a mutation-boundary proof: an officialBasis value
+ * sitting in a persisted extraction proposal cannot alter what gets
+ * written to `claims` (there is no such column), never overrides the
+ * human-submitted informationType, and has no effect on approval
+ * outcome regardless of its value. This does not invoke extractClaims()
+ * or any AI provider -- it only proves what the mutation layer does with
+ * a fixture ai_results row already shaped as if extractClaims had
+ * produced it.
+ *
+ * It also adds a direct backward-compatibility proof: a candidate
+ * persisted with NO officialBasis key at all (the genuine pre-PR-B
+ * shape) remains fully ACTIONABLE -- approve, reject, AND link-to-
+ * existing-claim all succeed via getExtractionCandidate()'s tolerant
+ * buildPersistedExtractClaimsOutputSchema, not merely displayable via
+ * the admin list query. See detectDuplicatesOrchestration.check.ts for
+ * the equivalent proof on the detect_duplicates trigger path.
+ *
  * Run with: npx tsx --conditions=react-server src/checks/claimProposalReview.check.ts
  * Requires the local-only check environment documented in README.md.
  */
@@ -403,6 +420,232 @@ async function main() {
 
       const reviewRowsAfter = await db.select().from(claimProposalReviews).where(and(eq(claimProposalReviews.aiResultId, aiResultId), eq(claimProposalReviews.candidateIndex, 0)));
       assert(reviewRowsAfter.length === 1, "forced failure: only the ORIGINAL forced review row exists -- resolveProposalAsExistingClaim's own attempted review row was rolled back, not left as a second row");
+    }
+    // =====================================================================
+    // Phase 6 PR-B: officialBasis mutation-boundary proof
+    // =====================================================================
+    // Focused on MUTATION semantics only -- this does not invoke extractClaims()
+    // or any AI provider. It proves that an advisory officialBasis value sitting
+    // in a persisted extraction proposal (1) has no persistence path into
+    // `claims` (there is no such column, and approveClaimProposalSchema has no
+    // such field), (2) never overrides the human-submitted informationType, and
+    // (3) has no effect on approval outcome regardless of its value.
+    console.log("\n=== officialBasis mutation-boundary proof (Phase 6 PR-B) ===\n");
+
+    /** One extract_claims-shaped ai_results row carrying officialBasis, for the mutation-boundary proof below. */
+    async function createProposalWithOfficialBasis(officialBasis: string, aiInformationType: string) {
+      const url = `https://example.test/pr-b-official-basis-${randomUUID()}`;
+      const [proposalSourceItem] = await db
+        .insert(sourceItems)
+        .values({ sourceId: 1, itemTypeId: 1, url, normalizedUrl: url, title: "PR-B officialBasis fixture", excerpt: "Rockstar Games confirmed a new gameplay feature." })
+        .returning();
+      const [proposalJob] = await db
+        .insert(aiJobs)
+        .values({ operation: "extract_claims", provider: "fake", model: "test-model", status: "succeeded", sourceItemId: proposalSourceItem.id, completedAt: new Date() })
+        .returning();
+      const [proposalResult] = await db
+        .insert(aiResults)
+        .values({
+          aiJobId: proposalJob.id,
+          structuredOutput: {
+            claims: [
+              {
+                statement: "Rockstar Games confirmed a new gameplay feature.",
+                informationType: aiInformationType,
+                supportingExcerpt: "Rockstar Games confirmed a new gameplay feature.",
+                confidence: 0.8,
+                reasoning: "fixture",
+                officialBasis,
+              },
+            ],
+          },
+        })
+        .returning();
+      return { aiResultId: proposalResult.id };
+    }
+
+    // --- human-submitted informationType persists to claims; the AI's own
+    //     informationType and officialBasis do not override it -----------
+    {
+      const { aiResultId } = await createProposalWithOfficialBasis("reported_official_material", "report");
+      const approvedWithOverride = await approveClaimProposal({
+        aiResultId,
+        candidateIndex: 0,
+        projectId: 1,
+        // Deliberately DIFFERENT from the AI's proposed "report" above --
+        // this is the human reviewer's edit, exactly as CandidateDetail.tsx's
+        // form allows (defaultValue pre-filled from the AI, but submitted
+        // value is whatever the human left in the field).
+        statement: "Rockstar Games officially confirmed a new gameplay feature.",
+        slug: `pr-b-official-basis-override-${suffix}`,
+        informationType: "official",
+        topicIds: [],
+        initialInvestigationStatus: "confirmed",
+        initialDevelopmentOutcome: "not_applicable",
+        reason: "Human reviewer upgraded informationType from the AI's proposed 'report' to 'official' after independently verifying the source.",
+      });
+
+      assert(
+        approvedWithOverride.claim.informationType === "official",
+        "mutation boundary: the HUMAN-submitted informationType ('official') is what gets persisted, not the AI's proposed value ('report')"
+      );
+
+      const [claimRow] = await db.select().from(claims).where(eq(claims.id, approvedWithOverride.claim.id));
+      assert(claimRow?.informationType === "official", "mutation boundary: the persisted claims row itself carries the human-submitted informationType");
+      assert(
+        !("officialBasis" in (claimRow as Record<string, unknown>)),
+        "mutation boundary: the persisted claims row has no officialBasis column/property at all -- there is no such column in the schema"
+      );
+
+      const [persistedResult] = await db.select().from(aiResults).where(eq(aiResults.id, aiResultId));
+      const persistedStructured = persistedResult?.structuredOutput as { claims: { officialBasis?: string }[] } | undefined;
+      assert(
+        persistedStructured?.claims[0]?.officialBasis === "reported_official_material",
+        "mutation boundary: officialBasis remains exactly as originally proposed in ai_results.structured_output -- untouched by approval, not consumed or cleared"
+      );
+    }
+
+    // --- officialBasis's VALUE has no causal effect on approval outcome:
+    //     two otherwise-identical proposals, differing ONLY in officialBasis,
+    //     approved with the SAME human-submitted informationType, produce
+    //     identical persisted informationType -----------------------------
+    {
+      const proposalA = await createProposalWithOfficialBasis("direct_official_material", "official");
+      const proposalB = await createProposalWithOfficialBasis("not_applicable_or_unclear", "official");
+
+      const claimA = await approveClaimProposal({
+        aiResultId: proposalA.aiResultId,
+        candidateIndex: 0,
+        projectId: 1,
+        statement: "Rockstar Games officially confirmed a new gameplay feature (A).",
+        slug: `pr-b-official-basis-a-${suffix}`,
+        informationType: "official",
+        topicIds: [],
+        initialInvestigationStatus: "confirmed",
+        initialDevelopmentOutcome: "not_applicable",
+        reason: "Approving candidate A for the officialBasis-has-no-effect proof.",
+      });
+      const claimB = await approveClaimProposal({
+        aiResultId: proposalB.aiResultId,
+        candidateIndex: 0,
+        projectId: 1,
+        statement: "Rockstar Games officially confirmed a new gameplay feature (B).",
+        slug: `pr-b-official-basis-b-${suffix}`,
+        informationType: "official",
+        topicIds: [],
+        initialInvestigationStatus: "confirmed",
+        initialDevelopmentOutcome: "not_applicable",
+        reason: "Approving candidate B for the officialBasis-has-no-effect proof.",
+      });
+
+      assert(
+        claimA.claim.informationType === claimB.claim.informationType,
+        "mutation boundary: candidates differing ONLY in officialBasis ('direct_official_material' vs 'not_applicable_or_unclear'), approved with the same human informationType, persist identical informationType -- officialBasis's value has zero causal effect on approval"
+      );
+    }
+
+    // =====================================================================
+    // Phase 6 PR-B: legacy (pre-PR-B) candidates remain ACTIONABLE, not
+    // merely displayable, through getExtractionCandidate()
+    // =====================================================================
+    // Direct regression proof for the buildPersistedExtractClaimsOutputSchema
+    // fix: a candidate persisted BEFORE officialBasis existed (no such key
+    // anywhere in structured_output -- the genuine historical shape, not a
+    // deliberately-blanked field) must still be resolvable by
+    // getExtractionCandidate() and therefore fully actionable -- approve,
+    // reject, AND link-to-existing-claim -- not silently treated as "not
+    // found" merely because a field that didn't exist yet at write time is
+    // now required for a NEW extraction. Each action below uses its own
+    // isolated candidate so the append-only "one review per candidate"
+    // constraint can't make these three proofs interfere with each other.
+    console.log("\n=== legacy (pre-PR-B) candidate actionability (Phase 6 PR-B) ===\n");
+
+    /**
+     * One extract_claims-shaped ai_results row with NO officialBasis key
+     * anywhere -- the genuine pre-PR-B historical shape, not this PR's
+     * new field merely left undefined by a test author's oversight.
+     */
+    async function createLegacyExtractionCandidate(statement: string) {
+      const url = `https://example.test/pr-b-legacy-${randomUUID()}`;
+      const [legacySourceItem] = await db
+        .insert(sourceItems)
+        .values({ sourceId: 1, itemTypeId: 1, url, normalizedUrl: url, title: "PR-B legacy-row fixture", excerpt: statement })
+        .returning();
+      const [legacyJob] = await db
+        .insert(aiJobs)
+        .values({ operation: "extract_claims", provider: "fake", model: "test-model", status: "succeeded", sourceItemId: legacySourceItem.id, completedAt: new Date() })
+        .returning();
+      const [legacyResult] = await db
+        .insert(aiResults)
+        .values({
+          aiJobId: legacyJob.id,
+          structuredOutput: {
+            claims: [
+              {
+                statement,
+                informationType: "report",
+                supportingExcerpt: statement,
+                confidence: 0.85,
+                reasoning: "legacy fixture, pre-PR-B shape",
+                // officialBasis deliberately absent entirely -- not present,
+                // not null, not undefined-as-a-value -- the key itself does
+                // not exist, exactly like a row written before this PR.
+              },
+            ],
+          },
+        })
+        .returning();
+      return { aiResultId: legacyResult.id, sourceItemId: legacySourceItem.id };
+    }
+
+    // --- legacy candidate: approveClaimProposal() succeeds ------------------
+    {
+      const { aiResultId } = await createLegacyExtractionCandidate("Legacy candidate A: GTA VI includes an in-game radio station parody.");
+      const approvedLegacy = await approveClaimProposal({
+        aiResultId,
+        candidateIndex: 0,
+        projectId: 1,
+        statement: "GTA VI includes an in-game radio station parody.",
+        slug: `pr-b-legacy-approve-${suffix}`,
+        informationType: "report",
+        topicIds: [],
+        initialInvestigationStatus: "unverified",
+        initialDevelopmentOutcome: "unknown",
+        reason: "Approving a legacy (no officialBasis) candidate to prove it is actionable, not just displayable.",
+      });
+      assert(approvedLegacy.claim.id > 0, "legacy candidate: approveClaimProposal() succeeds and creates a real claim");
+    }
+
+    // --- legacy candidate: rejectClaimProposal() succeeds -------------------
+    {
+      const { aiResultId } = await createLegacyExtractionCandidate("Legacy candidate B: GTA VI includes a working ferry system.");
+      const rejectedLegacy = await rejectClaimProposal({
+        aiResultId,
+        candidateIndex: 0,
+        notes: "Rejecting a legacy (no officialBasis) candidate to prove it is actionable, not just displayable.",
+      });
+      assert(rejectedLegacy.review.materializedClaimId === null, "legacy candidate: rejectClaimProposal() succeeds with no materialized claim");
+    }
+
+    // --- legacy candidate: resolveProposalAsExistingClaim() succeeds -------
+    {
+      const existingClaimId = await createFixtureClaim("GTA VI includes a functioning tram network.");
+      // Reuses the pre-existing Phase 5 PR 6 helper directly -- its fixture
+      // was ALREADY legacy-shaped (no officialBasis) before this PR-B
+      // session touched anything, which is exactly the historical shape
+      // this proof needs; no separate helper is required here.
+      const { aiResultId } = await createCandidateWithDuplicateMatch("Legacy candidate C: the game has a working tram/rail network.", existingClaimId);
+
+      const resolvedLegacy = await resolveProposalAsExistingClaim({
+        aiResultId,
+        candidateIndex: 0,
+        existingClaimId,
+        reason: "Resolving a legacy (no officialBasis) candidate to an existing claim to prove it is actionable, not just displayable.",
+      });
+      assert(
+        resolvedLegacy.review.materializedClaimId === existingClaimId,
+        "legacy candidate: resolveProposalAsExistingClaim() succeeds and links to the existing claim"
+      );
     }
   } finally {
     await pool.end();

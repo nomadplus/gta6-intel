@@ -523,10 +523,30 @@ export async function listSourceItemClassificationStatus(limit = 50) {
  * avoid an unrelated refactor of an existing, working, differently-named
  * function (Section 2).
  */
+/**
+ * Phase 6 PR-B: extended with a read-only join to `sources` so
+ * extractClaims can classify officialBasis against the source's own
+ * CURATED identity (sources.name/homepageUrl -- admin-entered via
+ * createSource/updateSource, requireAdmin("editor")-gated) rather than
+ * inferring first-party-vs-third-party solely from this item's own raw
+ * URL string, which is a weaker signal. This is a read, not a mutation:
+ * no schema change, no new column, no write-path change. sourceName/
+ * sourceHomepageUrl are passed through purely as classification context
+ * -- see extractClaims.ts's ExtractableSourceItem doc comment for why
+ * this must never be treated as a provenance conclusion.
+ */
 export async function getSourceItemForClaimExtraction(sourceItemId: number) {
   const rows = await adminDb
-    .select({ id: sourceItems.id, url: sourceItems.url, title: sourceItems.title, excerpt: sourceItems.excerpt })
+    .select({
+      id: sourceItems.id,
+      url: sourceItems.url,
+      title: sourceItems.title,
+      excerpt: sourceItems.excerpt,
+      sourceName: sources.name,
+      sourceHomepageUrl: sources.homepageUrl,
+    })
     .from(sourceItems)
+    .innerJoin(sources, eq(sources.id, sourceItems.sourceId))
     .where(eq(sourceItems.id, sourceItemId))
     .limit(1);
   return rows[0] ?? null;
@@ -591,6 +611,14 @@ export interface ExtractedClaimCandidate {
   supportingExcerpt: string;
   confidence: number;
   reasoning: string;
+  /**
+   * Phase 6 PR-B, advisory-only. Optional because historical ai_results
+   * rows written before this PR lack the key entirely -- absence is a
+   * normal, valid state (pre-PR-B row), not a data error. Never treat
+   * this as a provenance/originality/independence conclusion, and never
+   * pass it to any claim mutation -- see extractClaims.ts.
+   */
+  officialBasis?: "direct_official_material" | "reported_official_material" | "not_applicable_or_unclear";
   review: {
     action: "approve" | "reject" | "link_existing_claim";
     notes: string | null;
@@ -725,6 +753,19 @@ export async function listSourceItemExtractionStatus(limit = 50) {
             return [];
           }
           const review = row.ai_result_id === null ? undefined : reviewsByCandidate.get(`${row.ai_result_id}:${candidateIndex}`);
+          // Phase 6 PR-B: officialBasis is read defensively and optionally --
+          // absent entirely on any ai_results row written before this PR,
+          // and its presence/shape here never re-validates a value's
+          // membership in the enum (the same "display-only, not a
+          // schema re-check" precedent already used for the other fields
+          // in this block).
+          const rawOfficialBasis = (c as { officialBasis?: unknown }).officialBasis;
+          const officialBasis =
+            rawOfficialBasis === "direct_official_material" ||
+            rawOfficialBasis === "reported_official_material" ||
+            rawOfficialBasis === "not_applicable_or_unclear"
+              ? rawOfficialBasis
+              : undefined;
           return [{
             candidateIndex,
             statement: (c as { statement: string }).statement,
@@ -732,6 +773,7 @@ export async function listSourceItemExtractionStatus(limit = 50) {
             supportingExcerpt: (c as { supportingExcerpt: string }).supportingExcerpt,
             confidence: (c as { confidence: number }).confidence,
             reasoning: (c as { reasoning: string }).reasoning,
+            officialBasis,
             review: review && (review.action === "approve" || review.action === "reject" || review.action === "link_existing_claim")
               ? { action: review.action, notes: review.notes, materializedClaimId: review.materializedClaimId }
               : null,

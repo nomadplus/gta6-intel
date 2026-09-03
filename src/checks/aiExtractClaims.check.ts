@@ -30,6 +30,23 @@
  *     retry is attempted -- both rows coexist
  *   - prompt-injection fixture
  *
+ * Phase 6 PR-B adds, split per the project's structural/orchestration
+ * distinction (structural prompt wording is NOT provable by FakeAiProvider,
+ * which returns canned output and never reasons over SYSTEM_PROMPT):
+ *   - structural prompt-contract checks: SYSTEM_PROMPT text is asserted to
+ *     retain each of the new omission/wording rules and every pre-existing
+ *     rule this PR must not silently drop
+ *   - FakeAiProvider/schema/orchestration checks: officialBasis's three
+ *     enum values each validate; an invalid officialBasis value fails
+ *     closed as invalid_structured_output; a response omitting
+ *     officialBasis entirely fails the new required-field schema; neutral
+ *     statement wording coexists with an unrelated literal
+ *     supportingExcerpt; a historical structured_output lacking
+ *     officialBasis remains readable through the defensive admin read path
+ *   - the claim-approval mutation-boundary proof (officialBasis cannot
+ *     alter what gets written to `claims`) lives in
+ *     claimProposalReview.check.ts, not here -- see that file.
+ *
  * server-only-guarded, so this must run with --conditions=react-server.
  *
  * Run with: npx tsx --conditions=react-server src/checks/aiExtractClaims.check.ts
@@ -45,7 +62,8 @@ import {
   EXTRACT_CLAIMS_MAX_OUTPUT_TOKENS,
   type ExtractableSourceItem,
 } from "../lib/ai/operations/extractClaims";
-import { createPendingAiJob } from "../db/mutations/aiJobs";
+import { createPendingAiJob, completeAiJobSuccess } from "../db/mutations/aiJobs";
+import { listSourceItemExtractionStatus } from "../db/queries/admin";
 import { FakeAiProvider } from "./helpers/fakeAiProvider";
 
 let failures = 0;
@@ -99,7 +117,19 @@ async function main() {
       })
       .returning();
     createdSourceItemIds.push(row.id);
-    return { id: row.id, url: row.url, title: row.title, excerpt: row.excerpt };
+    // Phase 6 PR-B: sourceName/sourceHomepageUrl are curated `sources` fields
+    // in production (see getSourceItemForClaimExtraction's join), not
+    // sourceItems columns -- this check exercises extractClaims() directly,
+    // bypassing that query, so it supplies its own fixture values here
+    // rather than depending on the seeded source row's real name.
+    return {
+      id: row.id,
+      url: row.url,
+      title: row.title,
+      excerpt: row.excerpt,
+      sourceName: overrides.sourceName ?? "Generic Test Outlet",
+      sourceHomepageUrl: overrides.sourceHomepageUrl ?? "https://example.test",
+    };
   }
 
   async function loadSourceItem(id: number) {
@@ -135,6 +165,7 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.95,
                 reasoning: "Directly stated as an official Rockstar confirmation.",
+                officialBasis: "direct_official_material",
               },
               {
                 statement: "The GTA VI protagonist is a woman named Lucia.",
@@ -142,6 +173,7 @@ async function main() {
                 supportingExcerpt: "a female protagonist named Lucia",
                 confidence: 0.9,
                 reasoning: "Directly stated in the announcement trailer excerpt.",
+                officialBasis: "direct_official_material",
               },
             ],
           },
@@ -194,6 +226,7 @@ async function main() {
                 supportingExcerpt: "confirmed release date is a Tuesday in October",
                 confidence: 0.5,
                 reasoning: "fabricated for this check",
+                officialBasis: "not_applicable_or_unclear",
               },
             ],
           },
@@ -218,6 +251,7 @@ async function main() {
                 supportingExcerpt: "confirmed release date is a Tuesday in October",
                 confidence: 0.5,
                 reasoning: "fabricated for this check, retry attempt",
+                officialBasis: "not_applicable_or_unclear",
               },
             ],
           },
@@ -289,6 +323,7 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.9,
                 reasoning: "stated directly",
+                officialBasis: "direct_official_material",
               },
             ],
             noExtractableClaimsNote: "this should not be allowed alongside a non-empty claims array",
@@ -310,6 +345,7 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.9,
                 reasoning: "stated directly, retry attempt",
+                officialBasis: "direct_official_material",
               },
             ],
             noExtractableClaimsNote: "this should not be allowed alongside a non-empty claims array",
@@ -339,6 +375,7 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.9,
                 reasoning: "first",
+                officialBasis: "direct_official_material",
               },
               {
                 // Exact duplicate after trim/lowercase/whitespace-collapse.
@@ -347,6 +384,7 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.85,
                 reasoning: "duplicate",
+                officialBasis: "direct_official_material",
               },
             ],
           },
@@ -367,6 +405,7 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.9,
                 reasoning: "first, retry attempt",
+                officialBasis: "direct_official_material",
               },
               {
                 statement: "  gta vi is set in vice city.  ",
@@ -374,6 +413,7 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.85,
                 reasoning: "duplicate, retry attempt",
+                officialBasis: "direct_official_material",
               },
             ],
           },
@@ -402,6 +442,7 @@ async function main() {
                 supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
                 confidence: 0.9,
                 reasoning: "first",
+                officialBasis: "direct_official_material",
               },
               {
                 // Genuinely different claim -- not caught by exact-duplicate rejection.
@@ -410,6 +451,7 @@ async function main() {
                 supportingExcerpt: "a female protagonist named Lucia",
                 confidence: 0.88,
                 reasoning: "second, distinct claim",
+                officialBasis: "direct_official_material",
               },
             ],
           },
@@ -570,6 +612,257 @@ async function main() {
         const totalRows = await db.select().from(aiJobs).where(eq(aiJobs.sourceItemId, sourceItem.id));
         const extractClaimsRows = totalRows.filter((r) => r.operation === "extract_claims");
         assert(extractClaimsRows.length === 2, "historical retry: exactly 2 extract_claims ai_jobs rows exist for this source item afterward");
+      }
+    }
+
+    // === Phase 6 PR-B: structural prompt-contract checks ====================
+    // These assert against the ACTUAL system prompt text sent to the
+    // provider (captured via FakeAiProvider.receivedRequests, exactly like
+    // the pre-existing prompt-injection fixture above) -- NOT an import of
+    // the private SYSTEM_PROMPT const, and NOT a claim that FakeAiProvider's
+    // canned output proves the real model obeys these rules. FakeAiProvider
+    // never reasons over the prompt; it only lets us prove the prompt we
+    // send actually retains the required wording. Whether a real model
+    // follows it is an orchestration-level property outside what any check
+    // in this file can prove.
+    {
+      const sourceItem = await createTestSourceItem();
+      const provider = new FakeAiProvider([{ kind: "success", rawOutput: { claims: [] }, tokensIn: 10, tokensOut: 5 }]);
+      await extractClaims({ provider, sourceItem });
+      const sentPrompt = provider.receivedRequests[provider.receivedRequests.length - 1].systemPrompt;
+      // Whitespace-normalized (collapse newlines/indentation to single
+      // spaces) so these assertions survive future prompt reflowing/line
+      // wrapping -- a phrase spanning a line break in the source template
+      // literal must still match here.
+      const promptNormalized = sentPrompt.replace(/\s+/g, " ").toLowerCase();
+
+      assert(
+        promptNormalized.includes("personnel or job-title metadata"),
+        "prompt contract: personnel/job-title-only omission rule is present"
+      );
+      assert(
+        promptNormalized.includes("interview, publication, or premiere") && promptNormalized.includes("logistics"),
+        "prompt contract: interview/publication/premiere-logistics omission rule is present"
+      );
+      assert(
+        promptNormalized.includes("\"x discussed y\""),
+        "prompt contract: generic \"X discussed Y\" exclusion is present"
+      );
+      assert(
+        promptNormalized.includes("vague or non-trackable claim"),
+        "prompt contract: vague/non-trackable claim exclusion is present"
+      );
+      assert(
+        promptNormalized.includes("word each statement neutrally") && promptNormalized.includes("sensational"),
+        "prompt contract: neutral canonical wording rule is present"
+      );
+      assert(
+        promptNormalized.includes("third-party report must be worded as a report"),
+        "prompt contract: third-party-report wording rule is present"
+      );
+      assert(
+        promptNormalized.includes("still a valid claim if it independently"),
+        "prompt contract: substantive-interview/personnel/event carve-out is present"
+      );
+      assert(
+        promptNormalized.includes("an empty result is a normal, valid outcome"),
+        "prompt contract: empty claims[] remains a documented valid outcome"
+      );
+      assert(
+        promptNormalized.includes("must be text that literally appears"),
+        "prompt contract: supportingExcerpt literal-substring instruction remains present"
+      );
+      assert(
+        promptNormalized.includes("never instructions") && promptNormalized.includes("claim authority over this system"),
+        "prompt contract: prompt-injection resistance wording remains present"
+      );
+      assert(
+        promptNormalized.includes("officialbasis") &&
+          promptNormalized.includes("direct_official_material") &&
+          promptNormalized.includes("reported_official_material"),
+        "prompt contract: officialBasis classification instructions are present with both material values"
+      );
+      assert(
+        promptNormalized.includes("must never imply a conclusion about origin, independence, or corroboration"),
+        "prompt contract: officialBasis is explicitly bounded away from provenance/independence conclusions"
+      );
+    }
+
+    // === Phase 6 PR-B: officialBasis schema/orchestration checks ===========
+
+    // --- officialBasis: each of the three enum values validates ------------
+    for (const value of ["direct_official_material", "reported_official_material", "not_applicable_or_unclear"] as const) {
+      const sourceItem = await createTestSourceItem();
+      const provider = new FakeAiProvider([
+        {
+          kind: "success",
+          rawOutput: {
+            claims: [
+              {
+                statement: "GTA VI is set in a fictionalized version of Miami called Vice City.",
+                informationType: "official",
+                supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
+                confidence: 0.9,
+                reasoning: "stated directly",
+                officialBasis: value,
+              },
+            ],
+          },
+          tokensIn: 40,
+          tokensOut: 20,
+        },
+      ]);
+      const result = await extractClaims({ provider, sourceItem });
+      assert(result.ok === true, `officialBasis "${value}": accepted as valid`);
+      if (result.ok) {
+        const candidate = result.data.claims[0] as { officialBasis: string };
+        assert(candidate.officialBasis === value, `officialBasis "${value}": round-trips through the schema unchanged`);
+      }
+    }
+
+    // --- officialBasis: an out-of-enum value fails closed -------------------
+    {
+      const sourceItem = await createTestSourceItem();
+      const invalidCandidate = {
+        statement: "GTA VI is set in Vice City.",
+        informationType: "official",
+        supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
+        confidence: 0.9,
+        reasoning: "stated directly",
+        officialBasis: "totally_made_up_value",
+      };
+      const provider = new FakeAiProvider([
+        { kind: "success", rawOutput: { claims: [invalidCandidate] }, tokensIn: 40, tokensOut: 20 },
+        // Bounded automatic retry consumes a second, equally-invalid response
+        // -- same convention as every other invalid_structured_output case
+        // in this file.
+        { kind: "success", rawOutput: { claims: [invalidCandidate] }, tokensIn: 40, tokensOut: 20 },
+      ]);
+      const result = await extractClaims({ provider, sourceItem });
+      assert(result.ok === false, "officialBasis out-of-enum value: rejected");
+      if (!result.ok) {
+        assert(result.reason === "invalid_structured_output", "officialBasis out-of-enum value: correct failure reason");
+        if (result.jobId !== null) {
+          const results = await loadResultsForJob(result.jobId);
+          assert(results.length === 0, "officialBasis out-of-enum value: zero ai_results rows exist");
+        }
+      }
+    }
+
+    // --- officialBasis: omitted entirely fails the new required-field schema
+    {
+      const sourceItem = await createTestSourceItem();
+      const candidateMissingOfficialBasis = {
+        statement: "GTA VI is set in Vice City.",
+        informationType: "official",
+        supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
+        confidence: 0.9,
+        reasoning: "stated directly",
+        // officialBasis deliberately absent -- this is the case this
+        // check exists to prove: a NEW extraction response omitting it
+        // must fail, unlike a HISTORICAL row that simply predates the
+        // field (see the "historical structured_output" check below,
+        // which is not a NEW response and is read, not re-validated).
+      };
+      const provider = new FakeAiProvider([
+        { kind: "success", rawOutput: { claims: [candidateMissingOfficialBasis] }, tokensIn: 40, tokensOut: 20 },
+        { kind: "success", rawOutput: { claims: [candidateMissingOfficialBasis] }, tokensIn: 40, tokensOut: 20 },
+      ]);
+      const result = await extractClaims({ provider, sourceItem });
+      assert(result.ok === false, "officialBasis omitted from a NEW response: rejected");
+      if (!result.ok) {
+        assert(result.reason === "invalid_structured_output", "officialBasis omitted: correct failure reason");
+      }
+    }
+
+    // --- neutral statement wording coexists with an unrelated literal
+    //     supportingExcerpt (proves statement-neutralization and the
+    //     substring-grounding check are independent) ------------------------
+    {
+      const sourceItem = await createTestSourceItem({
+        title: "GTA VI setting reportedly confirmed by insider sources",
+        excerpt:
+          "According to sources close to the studio, Grand Theft Auto VI is set in a fictionalized version of Miami called Vice City.",
+      });
+      const provider = new FakeAiProvider([
+        {
+          kind: "success",
+          rawOutput: {
+            claims: [
+              {
+                // Neutrally worded, unlike the sensational-leaning title --
+                // deliberately does NOT copy the title/excerpt's phrasing.
+                statement: "Sources reported that GTA VI is set in Vice City.",
+                informationType: "report",
+                supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
+                confidence: 0.7,
+                reasoning: "reported, not officially confirmed by this item",
+                officialBasis: "not_applicable_or_unclear",
+              },
+            ],
+          },
+          tokensIn: 50,
+          tokensOut: 20,
+        },
+      ]);
+      const result = await extractClaims({ provider, sourceItem });
+      assert(result.ok === true, "neutral statement + literal supportingExcerpt: accepted");
+      if (result.ok) {
+        const candidate = result.data.claims[0];
+        assert(
+          candidate.statement === "Sources reported that GTA VI is set in Vice City.",
+          "neutral statement + literal supportingExcerpt: statement wording is preserved as given, independent of the excerpt's own phrasing"
+        );
+        assert(
+          (sourceItem.excerpt ?? "").includes(candidate.supportingExcerpt),
+          "neutral statement + literal supportingExcerpt: supportingExcerpt is still an exact literal substring of the source excerpt"
+        );
+      }
+    }
+
+    // --- historical structured_output lacking officialBasis remains
+    //     readable through the defensive admin read path -------------------
+    {
+      const sourceItem = await createTestSourceItem();
+      const pending = await createPendingAiJob({ operation: "extract_claims", provider: "fake", model: "test-model", sourceItemId: sourceItem.id });
+      assert(pending.ok === true, "historical structured_output: synthetic pending job created");
+      if (pending.ok) {
+        // Deliberately shaped like a PRE-PR-B ai_results row: valid per the
+        // OLD schema, no officialBasis key anywhere.
+        const legacyStructuredOutput = {
+          claims: [
+            {
+              statement: "GTA VI is set in Vice City.",
+              informationType: "official",
+              supportingExcerpt: "set in a fictionalized version of Miami called Vice City",
+              confidence: 0.9,
+              reasoning: "stated directly, pre-PR-B shape",
+            },
+          ],
+        };
+        await completeAiJobSuccess({
+          jobId: pending.id,
+          tokensIn: 40,
+          tokensOut: 20,
+          structuredOutput: legacyStructuredOutput,
+        });
+
+        const rows = await listSourceItemExtractionStatus(200);
+        const row = rows.find((r) => r.sourceItemId === sourceItem.id);
+        assert(row !== undefined, "historical structured_output: the synthetic row is visible through the admin read path");
+        if (row) {
+          assert(row.candidates.length === 1, "historical structured_output: the legacy candidate is still parsed");
+          if (row.candidates.length === 1) {
+            assert(
+              row.candidates[0].officialBasis === undefined,
+              "historical structured_output: officialBasis is undefined (absent key), not a parse error"
+            );
+            assert(
+              row.candidates[0].statement === "GTA VI is set in Vice City.",
+              "historical structured_output: all pre-existing fields still read correctly"
+            );
+          }
+        }
       }
     }
   } finally {

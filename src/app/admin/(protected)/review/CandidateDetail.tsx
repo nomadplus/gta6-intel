@@ -43,6 +43,15 @@ export interface CandidateDetailData {
   supportingExcerpt: string;
   confidence: number;
   reasoning: string;
+  /**
+   * Phase 6 PR-B, advisory-only AI note -- never provenance, never
+   * persisted to claims, has no effect on review controls below.
+   * Undefined for any candidate extracted before this PR shipped; that
+   * is a normal, valid state (see extractClaims.ts / db/queries/admin),
+   * not a data error, and must render normally (i.e. simply omit the
+   * note) rather than as an error or placeholder.
+   */
+  officialBasis?: "direct_official_material" | "reported_official_material" | "not_applicable_or_unclear";
   workflowState: CandidateWorkflowState;
   review: {
     action: "approve" | "reject" | "link_existing_claim";
@@ -87,6 +96,20 @@ const DUPLICATE_STATUS_CLASS: Record<DuplicateCheckDisplayState, string> = {
 const reviewInputClass = "w-full border border-hairline bg-bg-void px-2 py-1 text-xs text-ink-100 focus-visible:border-accent-brass";
 const reviewApproveClass = "border border-signal-confirmed px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-signal-confirmed hover:bg-signal-confirmed hover:text-bg-void";
 const reviewRejectClass = "mt-2 border border-signal-disproven px-3 py-1 font-mono text-[10px] uppercase tracking-wide text-signal-disproven hover:bg-signal-disproven hover:text-bg-void";
+
+// Phase 6 PR-B. Colocated here rather than in statusDisplay.ts
+// deliberately: statusDisplay.ts holds labels for PERSISTED claim-level
+// enums only (informationType, investigationStatus, developmentOutcome).
+// officialBasis is never persisted to claims and has exactly one
+// consumer (this component), so it does not belong in that shared,
+// claim-status-only file. "not_applicable_or_unclear" has no entry --
+// it renders no note at all (see the JSX below), since a positive
+// "not applicable" label offers the reviewer nothing an absent line
+// doesn't already say more plainly.
+const officialBasisLabel: Partial<Record<NonNullable<CandidateDetailData["officialBasis"]>, string>> = {
+  direct_official_material: "Direct official material",
+  reported_official_material: "Third-party report of official material",
+};
 
 function ReviewField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -162,6 +185,11 @@ export function CandidateDetail({
       <p className="mt-1 font-mono text-[10px] uppercase tracking-wide text-ink-600">
         {candidate.informationType} · confidence {candidate.confidence.toFixed(2)}
       </p>
+      {candidate.officialBasis && officialBasisLabel[candidate.officialBasis] && (
+        <p className="mt-1 font-mono text-[10px] uppercase tracking-wide text-ink-600">
+          Official basis (AI note, not provenance): {officialBasisLabel[candidate.officialBasis]}
+        </p>
+      )}
       <p className="mt-2 text-xs text-ink-400">"{candidate.supportingExcerpt}"</p>
       <p className="mt-1 text-xs text-ink-600">{candidate.reasoning}</p>
 

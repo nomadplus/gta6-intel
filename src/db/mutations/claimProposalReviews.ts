@@ -13,7 +13,7 @@ import {
   sourceItems,
 } from "@/db/schema";
 import { adminDb } from "@/db/adminClient";
-import { buildExtractClaimsOutputSchema, type ExtractClaimsOutput } from "@/lib/ai/operations/extractClaims";
+import { buildPersistedExtractClaimsOutputSchema, type PersistedExtractClaimsOutput } from "@/lib/ai/operations/extractClaims";
 import { approveClaimProposalSchema, rejectClaimProposalSchema, resolveAsExistingClaimSchema } from "@/lib/validation/adminSchemas";
 import { requireAdmin } from "@/lib/auth/requireAdmin";
 import { isProposalReviewed, getLatestDetectDuplicatesMatches, getClaimByIdForResolution } from "@/db/queries/admin";
@@ -55,7 +55,7 @@ export type ProposalContext = {
   aiResultId: number;
   candidateIndex: number;
   sourceItemId: number;
-  candidate: ExtractClaimsOutput["claims"][number];
+  candidate: PersistedExtractClaimsOutput["claims"][number];
 };
 
 /**
@@ -68,17 +68,31 @@ export type ProposalContext = {
  *
  * Deliberately NEUTRAL -- returns null rather than throwing when the
  * candidate cannot be resolved. This function needs extract_claims' own
- * Zod schema (buildExtractClaimsOutputSchema) to parse the candidate out
- * of stored JSON, which is why it lives here rather than in the generic
- * query layer (src/db/queries/admin/index.ts) -- that module deliberately
- * imports nothing from src/lib/ai, so a helper that needs an AI
- * operation's own schema does not belong there. Both this file's own
- * mutations below AND src/lib/ai/operations/detectDuplicatesTrigger.ts
- * import this function directly and each throw their OWN domain error on
- * a null result (ClaimProposalNotFoundError here; a duplicate-check-
- * specific error there) -- one implementation, two error translations,
- * exactly the "orchestration/mutation layers own domain errors, this
- * function owns the read" split.
+ * Zod schema to parse the candidate out of stored JSON, which is why it
+ * lives here rather than in the generic query layer
+ * (src/db/queries/admin/index.ts) -- that module deliberately imports
+ * nothing from src/lib/ai, so a helper that needs an AI operation's own
+ * schema does not belong there. Both this file's own mutations below AND
+ * src/lib/ai/operations/detectDuplicatesTrigger.ts import this function
+ * directly and each throw their OWN domain error on a null result
+ * (ClaimProposalNotFoundError here; a duplicate-check-specific error
+ * there) -- one implementation, two error translations, exactly the
+ * "orchestration/mutation layers own domain errors, this function owns
+ * the read" split.
+ *
+ * Phase 6 PR-B: this re-validates PERSISTED output, not a fresh provider
+ * response, so it deliberately uses buildPersistedExtractClaimsOutputSchema
+ * (officialBasis optional) rather than the strict write-time
+ * buildExtractClaimsOutputSchema (officialBasis required). A pre-PR-B
+ * row genuinely has no officialBasis key -- using the strict schema here
+ * would fail EVERY historical row's validation, which would make
+ * approve/reject/link/duplicate-check all treat a perfectly legitimate,
+ * still-unreviewed historical candidate as "not found." Every other
+ * validation rule (supportingExcerpt literal-substring grounding,
+ * exact-duplicate rejection, claims[] max length, informationType,
+ * every field's length/range limits) is identical between the two
+ * schemas -- see buildExtractClaimsSchemaInternal in extractClaims.ts --
+ * so nothing else about historical-row validation is loosened.
  *
  * Accepts a DbExecutor so it can run either as a standalone read (plain
  * adminDb, e.g. detectDuplicatesTrigger.ts's eligibility check) or as
@@ -108,11 +122,20 @@ export async function getExtractionCandidate(
   const row = rows[0];
   if (!row) return null;
 
-  const parsed = buildExtractClaimsOutputSchema({
+  const parsed = buildPersistedExtractClaimsOutputSchema({
     id: row.sourceItemId,
     url: "",
     title: row.sourceTitle,
     excerpt: row.sourceExcerpt,
+    // buildPersistedExtractClaimsOutputSchema, like the strict schema it
+    // is built alongside, only ever reads title/excerpt (for the
+    // supportingExcerpt literal-substring check) -- same reasoning as
+    // the pre-existing url: "" placeholder above. sourceName/
+    // sourceHomepageUrl are structurally required by ExtractableSourceItem
+    // (they matter to buildUserPrompt(), which this re-validation path
+    // never calls) but are never read here.
+    sourceName: "",
+    sourceHomepageUrl: null,
   }).safeParse(row.structuredOutput);
   const candidate = parsed.success ? parsed.data.claims[candidateIndex] : undefined;
   if (!candidate) return null;

@@ -155,6 +155,7 @@ export default async function AdminReviewPage({
         statement: candidate.statement,
         candidateStatementPreview: candidate.statement,
         informationType: candidate.informationType,
+        officialBasis: candidate.officialBasis,
         supportingExcerpt: candidate.supportingExcerpt,
         confidence: candidate.confidence,
         reasoning: candidate.reasoning,

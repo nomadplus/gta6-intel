@@ -737,6 +737,158 @@ exactly `'relevant'` — checked before any `ai_jobs` row is created or
 provider call made, a hard backend gate, not just a UI convenience (the
 review page also hides the action, but that's belt-and-braces).
 
+### Extraction quality tightening and officialBasis (Phase 6 PR-B)
+
+Production review of Phase 5 PR 4 extraction surfaced four recurring
+low-value proposal patterns: personnel/job-title metadata offered as if
+it were a claim, interview/publication/premiere logistics with no
+substantive GTA VI assertion, generic "X discussed Y" statements, and
+vague/non-trackable propositions (e.g. "there is a technical issue
+affecting GTA VI" with no named system or problem). `SYSTEM_PROMPT` now
+carries explicit omission rules for each pattern, a specificity/
+trackability floor, and a neutral-canonical-wording rule (avoid
+sensational language, unsupported causality, and certainty stronger than
+`informationType` supports; word third-party reports as reports). Every
+omission rule is paired with an explicit substantive-content carve-out —
+a claim revealed through an interview, tied to a personnel change, or
+connected to an event remains valid if it independently asserts a
+specific, trackable GTA VI proposition — so the tightening filters
+low-value context without suppressing genuinely unusual but significant
+claims. None of this touches the programmatically-enforced constraints
+(`supportingExcerpt` literal-substring grounding, exact-duplicate
+rejection, empty-`claims[]`-is-valid) — those are unchanged, and are
+independent of `statement`'s wording: neutralizing `statement` cannot
+weaken `supportingExcerpt`'s grounding check, since the two fields serve
+different jobs (canonical wording vs. evidence pointer).
+
+**`officialBasis` — proposal-only advisory metadata, not provenance.**
+Each candidate now also carries `officialBasis`, one of
+`"direct_official_material"`, `"reported_official_material"`, or
+`"not_applicable_or_unclear"`. This exists to help a human reviewer
+notice when a candidate's underlying material appears to be official
+Rockstar/Take-Two content, and — critically — whether *this one source
+item* appears to BE that material or merely be reporting/relaying it:
+
+- `direct_official_material` — the source item itself is first-party
+  material (an official Rockstar Newswire post, an official Rockstar/
+  Take-Two account post, a Take-Two investor release/filing, an
+  official press release hosted by the first party). Reproducing,
+  embedding, or quoting official material does **not** itself qualify —
+  the item must BE first-party material, not merely contain some.
+- `reported_official_material` — the source item is third-party
+  material that reports, summarizes, embeds, quotes, reproduces, or
+  otherwise relays first-party material (an outlet reporting on a
+  Rockstar announcement, quoting an official statement, embedding an
+  official trailer, summarizing a filing).
+- `not_applicable_or_unclear` — not based on official material at all,
+  or the given source identity/text don't allow a safe distinction. The
+  model is explicitly told to prefer this value over guessing.
+
+This is **advisory only**, exactly like every other candidate field:
+
+- There is **no `claims` column for it** — `officialBasis` lives
+  exclusively inside `ai_results.structured_output` JSON, never
+  materialized onto the `claims` table. `approveClaimProposalSchema`
+  has no `officialBasis` field, and `approveClaimProposal`'s `claims`
+  insert has no path that could write it even accidentally.
+- It is **not a provenance conclusion**. It describes only what this
+  one source item's own identity/wording suggests about itself — never
+  an origin/independence/corroboration judgment across multiple source
+  items, which remains exclusively `source_relationships`/
+  `analyse_provenance`'s job (see "Provenance: `source_relationships`"
+  above). `extract_claims` sees exactly one source item at a time and
+  has no cross-source visibility to support a stronger claim than that;
+  the prompt explicitly tells the model never to imply an origin/
+  independence/corroboration conclusion.
+- It has **no effect on approval, status, or duplicate-detection
+  semantics**. A `claimProposalReview.check.ts` mutation-boundary check
+  proves this directly: two otherwise-identical proposals differing
+  only in `officialBasis`, approved with the same human-submitted
+  `informationType`, produce identical persisted claims; a human
+  reviewer's `informationType` submission always wins over the AI's own
+  proposed value, exactly as it already did before this PR.
+- The admin review UI (`CandidateDetail.tsx`) surfaces it as a small,
+  clearly-labeled note ("Official basis (AI note, not provenance): …")
+  next to the existing `informationType` tag, never merged with it.
+
+**Source-identity input (query change, no schema/migration impact).**
+Classifying `officialBasis` well needs to know what the source item
+*is*, not just infer it from the item's own raw URL text. `sources.name`
+and `sources.homepageUrl` already exist and are admin-curated
+(`createSource`/`updateSource`, `requireAdmin("editor")`-gated) — a more
+trustworthy identity signal than scraped URL text. `extractClaimsTrigger`'s
+query, `getSourceItemForClaimExtraction()`, now does a read-only join
+from `source_items` to `sources` and passes `sourceName`/
+`sourceHomepageUrl` through to `ExtractableSourceItem` and into the user
+prompt as explicit, clearly-labeled classification context ("Source
+identity … NOT a provenance/originality/independence conclusion"). This
+is a read-only query change: no new column, no migration, no mutation
+change. The item's own `url`/`title`/`excerpt` are still passed
+unchanged alongside it.
+
+**Backward compatibility.** `officialBasis` is required on every *new*
+extraction response (the model must make the call, including the
+explicit non-answer `not_applicable_or_unclear`) but is read as
+*optional* everywhere `ai_results.structured_output` is read back
+(`ExtractedClaimCandidate`, `listSourceItemExtractionStatus`'s defensive
+shape-check). `structured_output` is `jsonb NOT NULL` with no DB-enforced
+shape, so a historical row written before this PR simply lacks the key
+entirely — a normal, valid state, not a data or parse error. A
+regression check (`aiExtractClaims.check.ts`) constructs a synthetic
+pre-PR-B-shaped row directly (bypassing `extractClaims()`) and proves
+the admin read path still returns it correctly with `officialBasis`
+undefined.
+
+**Display-only tolerance was not enough — a second, dedicated fix was
+needed for the review/action path.** `getExtractionCandidate()`
+(`claimProposalReviews.ts`) — the single shared read used by
+`approveClaimProposal`, `rejectClaimProposal`,
+`resolveProposalAsExistingClaim`, and `detectDuplicatesTrigger.ts`'s
+`triggerDetectDuplicates` — re-validates a candidate's *persisted*
+`structured_output` using extract_claims' own Zod schema before any of
+those actions can proceed. Pointing that re-validation at the same
+strict schema used for fresh provider output would reject every
+historical candidate's `officialBasis`-less shape outright, collapsing
+`parsed.success` to `false` and making `getExtractionCandidate()` return
+`null` — indistinguishable from "this aiResultId/candidateIndex doesn't
+exist." A pre-PR-B unresolved candidate would still *display* normally
+in the review list (that query never used this schema), but every
+actual action on it — approve, reject, link-to-existing-claim, and
+triggering a duplicate check — would fail as if it had vanished, with no
+indication that `officialBasis` was the cause.
+
+The fix: `extractClaims.ts` factors its schema construction into one
+shared internal builder parameterized by whether `officialBasis` is
+required, so the strict and tolerant variants cannot drift apart on
+anything else. `buildExtractClaimsOutputSchema` (unchanged name/
+behavior) stays strict — required `officialBasis`, used exclusively to
+validate a fresh provider response, in `extractClaims()`/
+`anthropicProvider.ts`. A new `buildPersistedExtractClaimsOutputSchema` —
+identical in every other respect (`supportingExcerpt`'s literal-substring
+grounding, exact-duplicate rejection, `claims[]`'s max length,
+`noExtractableClaimsNote`'s constraint, every field's own length/range
+limits) — makes `officialBasis` optional, and is used exclusively by
+`getExtractionCandidate()` to re-validate already-persisted output. A
+missing `officialBasis` is tolerated; an invalid (present-but-out-of-
+enum) value is still rejected by both schemas identically — the
+tolerance is specifically for legacy *absence*, not for genuinely
+malformed data. `ProposalContext.candidate`'s type follows the same
+split (`PersistedExtractClaimsOutput` in place of `ExtractClaimsOutput`);
+none of `getExtractionCandidate()`'s four callers read `.officialBasis`
+from the parsed candidate at all (only `.statement`/`.supportingExcerpt`
+for provenance and duplicate-retrieval purposes), so this carries no new
+authority or behavior change downstream. Regression checks in
+`claimProposalReview.check.ts` and `detectDuplicatesOrchestration.check.ts`
+construct genuinely legacy-shaped fixtures (no `officialBasis` key at
+all, not merely `undefined`) and prove all four actions succeed against
+them, not merely that they display.
+
+The output-token bound (`EXTRACT_CLAIMS_MAX_OUTPUT_TOKENS`) moved from
+3,584 to 3,840, recomputed from the schema's new worst case with
+`officialBasis` included — see the constant's own doc comment in
+`extractClaims.ts` for the full arithmetic. Still below the platform's
+flat 4,096 default.
+
 ### Extracted-claim review (Phase 5 PR 5)
 
 `extract_claims` produces one immutable `ai_results.structured_output`
