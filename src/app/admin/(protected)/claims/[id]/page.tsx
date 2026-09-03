@@ -16,7 +16,11 @@ import {
   getLatestSuccessfulProvenanceAnalysisResult,
   listSourceRelationshipReviewsForResult,
   listSourceItemsByIds,
+  getAttachedSourceItemIdsForClaim,
+  getClaimScopedSourceRelationships,
+  getInClusterLinksForCluster,
 } from "@/db/queries/admin";
+import { computeClaimProvenanceSummary } from "@/lib/provenanceSummary";
 import { PROVENANCE_CLUSTER_HARD_CAP } from "@/lib/ai/operations/analyseProvenance";
 import { computeClusterFingerprint, type ClusterItemPayload } from "@/lib/ai/provenanceClusterFingerprint";
 import { getClaimTimeline, getClaimSources, getClaimEvidence, getRelatedClaims } from "@/db/queries/claimDetail";
@@ -183,6 +187,22 @@ export default async function AdminClaimDetailPage({ params, searchParams }: Pro
   }));
   const currentClusterFingerprint = currentClusterItems.length > 0 ? computeClusterFingerprint(currentClusterItems) : null;
 
+  // Phase 6 PR-C (SHOULD HAVE): the same resolved in-cluster outbound-link
+  // observations analyseProvenanceTrigger.ts already forwards to the model
+  // -- surfaced here, per proposed edge, in BOTH directions, so an admin
+  // reviewing an edge can see the exact link evidence (if any) the AI saw.
+  // Advisory only: presence of a link is not proof of dependency, and its
+  // absence is not proof of independence (see the note rendered below).
+  const clusterItemIdsForLinkEvidence = provenanceCluster.map((item) => item.id);
+  const inClusterLinksForDisplay =
+    clusterItemIdsForLinkEvidence.length > 0 ? await getInClusterLinksForCluster(adminDb, clusterItemIdsForLinkEvidence) : [];
+  function linkEvidenceForPair(fromSourceItemId: number, toSourceItemId: number) {
+    return {
+      forward: inClusterLinksForDisplay.filter((l) => l.fromSourceItemId === fromSourceItemId && l.toSourceItemId === toSourceItemId),
+      backward: inClusterLinksForDisplay.filter((l) => l.fromSourceItemId === toSourceItemId && l.toSourceItemId === fromSourceItemId),
+    };
+  }
+
   const provenanceAnalysisState: ProvenanceAnalysisDisplayState = computeProvenanceAnalysisDisplayState(
     provenanceCluster.length > 1,
     latestProvenanceAnalysisJob,
@@ -196,6 +216,26 @@ export default async function AdminClaimDetailPage({ params, searchParams }: Pro
   const provenanceClusterItemIds = latestProvenanceResult ? latestProvenanceResult.edges.flatMap((e) => [e.fromSourceItemId, e.toSourceItemId]) : [];
   const provenanceClusterItems = provenanceClusterItemIds.length > 0 ? await listSourceItemsByIds(adminDb, provenanceClusterItemIds) : [];
   const provenanceItemById = new Map(provenanceClusterItems.map((si) => [si.id, si]));
+
+  // Phase 6 PR-C: the deterministic, claim-scoped provenance summary --
+  // entirely derived from human-reviewed durable data (claim_sources +
+  // source_relationships, BOTH endpoints attached to this exact claim).
+  // No AI call. Deliberately uses the claim's FULL attached source set,
+  // not the AI-input-bounded provenanceCluster above (which is capped at
+  // PROVENANCE_CLUSTER_HARD_CAP for model input reasons only).
+  const attachedSourceItemIdsForSummary = await getAttachedSourceItemIdsForClaim(adminDb, claimId);
+  const claimScopedRelationships = await getClaimScopedSourceRelationships(adminDb, attachedSourceItemIdsForSummary);
+  const provenanceSummary = computeClaimProvenanceSummary(claimId, attachedSourceItemIdsForSummary, claimScopedRelationships);
+
+  const provenanceSummaryReferencedIds = [
+    ...provenanceSummary.reviewedGraphRootIds,
+    ...provenanceSummary.independentSourceIds,
+    ...provenanceSummary.conflictedPairs.flatMap((p) => [p.sourceItemIdX, p.sourceItemIdY]),
+  ];
+  const provenanceSummaryItems =
+    provenanceSummaryReferencedIds.length > 0 ? await listSourceItemsByIds(adminDb, provenanceSummaryReferencedIds) : [];
+  const provenanceSummaryItemById = new Map(provenanceSummaryItems.map((si) => [si.id, si]));
+  const provenanceSummaryLabel = (id: number) => provenanceSummaryItemById.get(id)?.title ?? provenanceSummaryItemById.get(id)?.url ?? `#${id}`;
 
   return (
     <div className="max-w-4xl space-y-12">
@@ -345,6 +385,70 @@ export default async function AdminClaimDetailPage({ params, searchParams }: Pro
       </Section>
 
       <Section
+        title="Provenance intelligence"
+        note="Derived entirely from human-reviewed relationships (no AI call). A source appearing in reviewed relationships is not the same as every possible pair having been checked -- see the note on each figure below."
+      >
+        <dl className="grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-3">
+          <ProvenanceStat label="Attached sources" value={provenanceSummary.totalAttachedSources} />
+          <ProvenanceStat
+            label="Sources in a reviewed relationship"
+            value={provenanceSummary.sourcesWithReviewedInternalRelationship}
+            note="Participation only -- not every pair among these sources has necessarily been compared."
+          />
+          <ProvenanceStat
+            label="Sources with no reviewed relationship"
+            value={provenanceSummary.sourcesWithoutReviewedInternalRelationship}
+          />
+          <ProvenanceStat
+            label="Reviewed internal pairs"
+            value={provenanceSummary.reviewedInternalPairCount}
+            note={`out of ${provenanceSummary.possibleInternalPairCount} possible pairs -- most pairs are expected to stay unreviewed; this is not a completion metric.`}
+          />
+          <ProvenanceStat label="Dependency connections" value={provenanceSummary.dependencySemanticEdgeCount} />
+          <ProvenanceStat label="Independent reviewed pairs" value={provenanceSummary.independentPairCount} />
+          <ProvenanceStat label="Sources in an independent pair" value={provenanceSummary.independentSourceIds.length} />
+          <ProvenanceStat label="Unknown-classification pairs" value={provenanceSummary.unknownPairCount} />
+          <ProvenanceStat label="Connected components" value={provenanceSummary.connectedComponentCount} />
+        </dl>
+
+        {provenanceSummary.reviewedGraphRootIds.length > 0 && (
+          <p className="mt-4 text-xs text-ink-400">
+            <span className="font-mono uppercase tracking-wide text-ink-600">Reviewed-graph roots</span> (source of the
+            currently reviewed dependency chain -- not a claim of proven real-world origin):{" "}
+            {provenanceSummary.reviewedGraphRootIds.map((id) => provenanceSummaryLabel(id)).join(", ")}
+          </p>
+        )}
+
+        {provenanceSummary.hasCycles && (
+          <p className="mt-3 border border-signal-disproven/50 px-3 py-2 text-sm text-signal-disproven">
+            Cycle warning: the reviewed dependency relationships for this claim contain a cycle (e.g. two sources each
+            recorded as depending on the other). Review the underlying relationships below.
+          </p>
+        )}
+
+        {provenanceSummary.conflictedPairCount > 0 && (
+          <div className="mt-3 border border-signal-disproven/50 px-3 py-2 text-sm text-signal-disproven">
+            <p className="font-mono text-xs uppercase tracking-wide">
+              {provenanceSummary.conflictedPairCount} conflicted relationship {provenanceSummary.conflictedPairCount === 1 ? "pair" : "pairs"} --
+              needs admin attention
+            </p>
+            <p className="mt-1 text-xs">
+              These source-item pairs have reviewed relationships that disagree with each other (e.g. one row says
+              dependent, another says independent, or unknown) and are excluded from every count above until resolved.
+            </p>
+            <ul className="mt-2 space-y-1">
+              {provenanceSummary.conflictedPairs.map((p) => (
+                <li key={`${p.sourceItemIdX}-${p.sourceItemIdY}`} className="text-xs">
+                  {provenanceSummaryLabel(p.sourceItemIdX)} &harr; {provenanceSummaryLabel(p.sourceItemIdY)} — recorded as:{" "}
+                  {p.categoriesPresent.join(" + ")}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </Section>
+
+      <Section
         title="Provenance analysis"
         note="AI-recommended relationships between this claim's linked source items (citation, repetition, derivative, aggregation, independent corroboration) -- advisory only. Nothing here changes the source-item graph until an admin explicitly approves it. Direction reads subject → object (e.g. 'cites', 'derives from')."
       >
@@ -393,6 +497,33 @@ export default async function AdminClaimDetailPage({ params, searchParams }: Pro
                   {edge.distinctEvidenceSummary && (
                     <p className="mt-1 text-xs text-ink-400">Distinct evidence: {edge.distinctEvidenceSummary}</p>
                   )}
+
+                  {(() => {
+                    const { forward, backward } = linkEvidenceForPair(edge.fromSourceItemId, edge.toSourceItemId);
+                    if (forward.length === 0 && backward.length === 0) return null;
+                    return (
+                      <div className="mt-2 border-t border-hairline pt-2 text-xs text-ink-600">
+                        <p className="font-mono uppercase tracking-wide">
+                          Known outbound links (mechanical observations -- not proof of dependency; their absence is not
+                          proof of independence)
+                        </p>
+                        {forward.map((l, i) => (
+                          <p key={`fwd-${i}`} className="mt-1">
+                            #{edge.fromSourceItemId} → #{edge.toSourceItemId}: {l.placement}
+                            {l.isSameSite ? ", same-site" : ", cross-site"}
+                            {l.anchorText ? `, anchor "${l.anchorText}"` : ""}
+                          </p>
+                        ))}
+                        {backward.map((l, i) => (
+                          <p key={`bwd-${i}`} className="mt-1">
+                            #{edge.toSourceItemId} → #{edge.fromSourceItemId}: {l.placement}
+                            {l.isSameSite ? ", same-site" : ", cross-site"}
+                            {l.anchorText ? `, anchor "${l.anchorText}"` : ""}
+                          </p>
+                        ))}
+                      </div>
+                    );
+                  })()}
 
                   {review ? (
                     <p className="mt-2 font-mono text-[10px] uppercase tracking-wide text-ink-600">
@@ -664,6 +795,20 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
     <div className="min-w-[180px] flex-1">
       <label className="mb-1 block font-mono text-[10px] uppercase tracking-wide text-ink-600">{label}</label>
       {children}
+    </div>
+  );
+}
+
+/** Phase 6 PR-C: one compact stat in the read-only provenance-intelligence
+ * summary. `note`, when given, is the caveat that keeps the figure from
+ * being read as a stronger claim than the reviewed data actually supports
+ * (see docs/architecture.md's Provenance Intelligence section). */
+function ProvenanceStat({ label, value, note }: { label: string; value: number; note?: string }) {
+  return (
+    <div>
+      <dt className="font-mono text-[10px] uppercase tracking-wide text-ink-600">{label}</dt>
+      <dd className="text-lg text-ink-100">{value}</dd>
+      {note && <p className="mt-0.5 text-xs text-ink-600">{note}</p>}
     </div>
   );
 }

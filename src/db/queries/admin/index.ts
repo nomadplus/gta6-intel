@@ -20,6 +20,7 @@ import {
   claimRelationships,
   claimComparisonReviews,
   claimSources,
+  sourceRelationships,
   sourceRelationshipReviews,
   aiJobs,
   ingestionJobs,
@@ -27,6 +28,7 @@ import {
   discoveryFeeds,
   sourceItemLinks,
 } from "@/db/schema";
+import type { ClaimScopedSourceRelationshipRow } from "@/lib/provenanceSummary";
 
 export async function listClaimsForAdmin() {
   return adminDb
@@ -1296,6 +1298,56 @@ export async function getProvenanceClusterForClaim(
     .where(eq(claimSources.claimId, claimId))
     .orderBy(sourceItems.id)
     .limit(limit);
+}
+
+/**
+ * Phase 6 PR-C: every source item id attached to this claim via
+ * claim_sources -- deliberately UNCAPPED, unlike getProvenanceClusterForClaim
+ * above (whose PROVENANCE_CLUSTER_HARD_CAP exists only to bound what is
+ * sent to the AI model). The claim-level provenance summary must reflect
+ * the claim's FULL attached source set: a claim with more than 15
+ * attached sources must not silently receive a truncated, misleadingly
+ * incomplete structural summary.
+ */
+export async function getAttachedSourceItemIdsForClaim(db: DbExecutor, claimId: number): Promise<number[]> {
+  const rows = await db.select({ id: claimSources.sourceItemId }).from(claimSources).where(eq(claimSources.claimId, claimId));
+  return rows.map((r) => r.id);
+}
+
+/**
+ * Phase 6 PR-C: source_relationships rows eligible to affect claim
+ * `attachedSourceItemIds`'s deterministic provenance summary -- BOTH
+ * `sourceItemIdA` and `sourceItemIdB` must be in the caller-supplied
+ * attached-source-item-id set for this exact claim (the locked PR-C scope
+ * rule). This is DELIBERATELY STRICTER than getClaimProvenanceChain
+ * (src/db/queries/claimDetail.ts), which matches on EITHER endpoint for
+ * the existing public reader's own, separately decided purpose --
+ * getClaimProvenanceChain and ProvenanceChain.tsx are both untouched by
+ * PR-C; whether the public reader should also become strictly
+ * claim-internal is deferred to PR-D.
+ *
+ * A source item can legitimately be attached to more than one claim
+ * (claim_sources is unique only per claim+item, not per item alone), so
+ * this query must never let a relationship whose OTHER endpoint belongs
+ * only to a different claim leak into this claim's own summary -- see
+ * the DB-backed regression check (provenanceSummaryScope.check.ts) for
+ * the exact fixture proving this.
+ */
+export async function getClaimScopedSourceRelationships(
+  db: DbExecutor,
+  attachedSourceItemIds: number[]
+): Promise<ClaimScopedSourceRelationshipRow[]> {
+  if (attachedSourceItemIds.length === 0) return [];
+  return db
+    .select({
+      sourceItemIdA: sourceRelationships.sourceItemIdA,
+      sourceItemIdB: sourceRelationships.sourceItemIdB,
+      relationshipType: sourceRelationships.relationshipType,
+    })
+    .from(sourceRelationships)
+    .where(
+      and(inArray(sourceRelationships.sourceItemIdA, attachedSourceItemIds), inArray(sourceRelationships.sourceItemIdB, attachedSourceItemIds))
+    );
 }
 
 export interface InClusterLinkRow {

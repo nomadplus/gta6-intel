@@ -1458,6 +1458,136 @@ The earlier `revalidatePath` call before the `fresh_in_flight` early-exit
 branch (no mutation follows it in that branch) was already correctly
 ordered and is unchanged.
 
+### Provenance intelligence: claim-level summary (Phase 6 PR-C)
+
+A pure, deterministic derivation of a claim-level provenance summary from
+already human-reviewed durable data (`claim_sources` + `source_relationships`).
+**No AI call.** Everything below is computed only from rows a human already
+approved, edited, or manually created via the existing `analyse_provenance`
+review workflow or the manual provenance form — see
+`src/lib/provenanceSummary.ts` (pure, no DB) and the claim-scoped query
+functions `getAttachedSourceItemIdsForClaim` / `getClaimScopedSourceRelationships`
+in `src/db/queries/admin/index.ts`.
+
+**Why this exists, and why the vocabulary is deliberately guarded.**
+`analyse_provenance` is positive-edge-only — the AI never asserts "these two
+sources are unrelated," only "here is a relationship I found a basis for."
+Combined with the fact that only a handful of edges are ever reviewed for a
+given claim, a MISSING relationship row between two attached sources means
+NOTHING: not independence, not "checked and found empty," just absence of
+data. Every field name and doc comment in `provenanceSummary.ts` is written to
+make that distinction impossible to lose sight of — in particular:
+
+- `reviewedGraphRootIds` means only *"root of the dependency graph as
+  currently reviewed"* — never *"proven real-world original source."*
+- `internalGraphTouchState` describes only whether every attached SOURCE has
+  been touched by at least one reviewed relationship. It is explicitly NOT a
+  claim that every POSSIBLE PAIR has been reviewed, and
+  `"all_sources_touched"` is fully compatible with `connectedComponentCount >
+  1` — e.g. two internally well-reviewed clusters that were never compared
+  against each other at all (`A-B` reviewed, `C-D` reviewed, `A/B` vs `C/D`
+  never touched).
+- `possibleInternalPairCount` (`C(totalAttachedSources, 2)`) is informational
+  only. It must never be used to compute or display a "review completion
+  percentage" — the schema has no way to assert "these two sources are
+  confirmed unrelated," so most possible pairs are expected to stay
+  unreviewed forever without that being a defect.
+
+**Normalization (the one place `original`'s inverted orientation is
+handled).** Every raw `source_relationships` row is bucketed into exactly one
+semantic category by `relationshipType` alone: `dependency` (`original`,
+`citation`, `repetition`, `derivative`, `aggregation`), `independent`
+(`independent_corroboration`), or `unknown`. `dependency` rows are then
+normalized into a directed `origin -> dependent` edge:
+
+```
+(A, B, citation)    "A cites B"                      => B -> A
+(A, B, repetition)  "A repeats B"                     => B -> A
+(A, B, derivative)  "A derives from B"                => B -> A
+(A, B, aggregation) "A aggregates B"                   => B -> A
+(A, B, original)    "A is the original source for B"  => A -> B
+```
+
+Every downstream algorithm (roots, cycle detection, connected components)
+operates only on these normalized edges and never re-examines
+`relationshipType` again except for the raw diagnostic tally
+(`rawDependencyRelationshipTypeCounts`).
+
+**Conflict semantics.** For each UNORDERED pair with ≥1 in-scope row, look at
+the SET of semantic categories present (not the set of raw relationship
+types):
+
+- Exactly one category → not conflicted. Multiple `dependency` rows in the
+  SAME normalized direction merge into one semantic edge (raw type counts
+  still tallied diagnostically); OPPOSING normalized directions both enter
+  the graph as separate edges — a real 2-node cycle, never a conflict, and
+  neither direction is silently preferred. Both raw storage directions of
+  `independent_corroboration` collapse into one unordered pair.
+- Two or more categories present → **conflicted**. Excluded from the
+  dependency graph, from `independentPairCount`/`independentSourceIds`, from
+  `unknownPairCount`, and from connected-component edges. Still counted in
+  `reviewedInternalPairCount`, in `sourcesWithReviewedInternalRelationship`
+  participation, in `conflictedPairCount`/`conflictedPairs`, and in the raw
+  diagnostic type tally for any `dependency`-category row involved. No
+  precedence is ever guessed between conflicting rows.
+
+**Graph shape.** The node set for both root/cycle detection and
+connected-component analysis is always every source item attached to the
+claim — an attached source with zero reviewed relationships is its own
+singleton component and can never be a root. Connected-component edges are
+valid (non-conflicted) dependency semantic edges (treated as undirected for
+this purpose only), valid independent pairs, and valid unknown pairs.
+**Conflicted pairs are excluded from connectivity** — once a pair's reviewed
+state is self-contradictory it must not silently re-enter a structural
+conclusion through component connectivity, unlike a valid `unknown` pair,
+which is one coherent (if inconclusive) reviewed classification. Cycle
+detection runs only over the valid directed dependency graph, post
+conflict-exclusion.
+
+**Claim scope (deliberately stricter than the existing public reader).** The
+new query `getClaimScopedSourceRelationships` only returns a row when BOTH
+`sourceItemIdA` and `sourceItemIdB` are attached to the exact claim being
+summarized. This is stricter than `getClaimProvenanceChain`
+(`src/db/queries/claimDetail.ts`), which matches on EITHER endpoint for its
+own, separately decided purpose — `getClaimProvenanceChain` and
+`ProvenanceChain.tsx` are both **untouched** by PR-C; whether the public
+reader should also become strictly claim-internal is deferred to a future
+PR-D decision. A source item can legitimately be attached to more than one
+claim (`claim_sources` is unique only per claim+item, not per item alone), so
+this strict both-endpoints rule is what prevents a relationship whose other
+endpoint belongs only to a different claim from leaking into this claim's
+summary — proven directly in `provenanceSummaryScope.check.ts`.
+
+The claim's full attached-source-item set is fetched **uncapped** via
+`getAttachedSourceItemIdsForClaim` — deliberately not reusing
+`getProvenanceClusterForClaim`'s `PROVENANCE_CLUSTER_HARD_CAP` (15), which
+exists only to bound what is sent to the AI model. A claim with more than 15
+attached sources must still receive a summary reflecting its true full
+source set, not a silently truncated one.
+
+**Admin display.** A compact, read-only "Provenance intelligence" section on
+the existing claim admin page (`src/app/admin/(protected)/claims/[id]/page.tsx`)
+renders the summary using deliberately factual labels (e.g. "Sources in a
+reviewed relationship," "Reviewed-graph roots") and never renders
+authority-inflating language such as "fully reviewed," "confirmed origin," or
+"N independent sources prove this." A conflicted-pair count above zero
+renders a visible warning banner naming the affected pairs.
+
+**Outbound-link evidence (SHOULD HAVE, included).** The same resolved
+in-cluster outbound-link observations `analyseProvenanceTrigger.ts` already
+forwards to the model are surfaced, per proposed edge, in the existing
+provenance-analysis review list — in BOTH directions, clearly labelled, so an
+admin can judge whether the AI's proposed direction is actually the one the
+link evidence supports. This reuses the existing `getInClusterLinksForCluster`
+query verbatim; no new table or extraction logic. As always: presence of a
+link is not proof of dependency, and its absence is not proof of
+independence.
+
+**No schema changes.** Every field is derived at read time from
+`claim_sources` and `source_relationships` as they already exist. Conflict
+detection is a pure read-time computation (`GROUP BY` the unordered pair,
+inspect the category set) — no new column, constraint, or migration.
+
 ### Outbound link observations: `source_item_links` (Phase 6 prerequisite)
 
 Before Phase 6's autonomous discovery providers are built, this PR closes
