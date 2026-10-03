@@ -1,0 +1,56 @@
+name: Black Monday Native Web
+
+on:
+  push:
+    branches:
+      - black-monday-native-web
+    paths:
+      - 'public/black-monday-native/**'
+      - 'black-monday-native/**'
+      - '.github/workflows/black-monday-native-web.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: black-monday-native-web
+  cancel-in-progress: true
+
+jobs:
+  validate-native-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate JavaScript syntax
+        run: |
+          node --check public/black-monday-native/bootstrap.js
+          node --check public/black-monday-native/engine.js
+
+      - name: Validate asset contract
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const p = 'public/black-monday-native/asset-manifest.json';
+          const m = JSON.parse(fs.readFileSync(p, 'utf8'));
+          if (m.schemaVersion !== 1) throw new Error('schemaVersion');
+          if (m.runtime?.renderer !== 'webgl2') throw new Error('renderer');
+          if (m.runtime?.simulationHz !== 60) throw new Error('simulationHz');
+          if (m.verticalSlice?.mission !== 315) throw new Error('Mission 315 contract');
+          if (!Array.isArray(m.verticalSlice?.requirements) || m.verticalSlice.requirements.length < 8) throw new Error('vertical slice requirements');
+          if (m.source?.mediaIncludedInRepo !== false) throw new Error('retail media must not be committed');
+          console.log('Native asset contract OK');
+          NODE
+
+      - name: Guard against PS2 emulator dependency
+        run: |
+          ! grep -R -n -E 'Play\.wasm|Play\.js|initVm\(|bootDiscImage' public/black-monday-native black-monday-native
+
+      - name: Static-site smoke test
+        run: |
+          python3 -m http.server 4173 --directory public >/tmp/bm-native-http.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID || true' EXIT
+          sleep 1
+          curl -fsS http://127.0.0.1:4173/black-monday-native/ | grep -q 'BLACK MONDAY NATIVE'
+          curl -fsS http://127.0.0.1:4173/black-monday-native/asset-manifest.json | grep -q '"mission": 315'
+          curl -fsS http://127.0.0.1:4173/black-monday-native/bootstrap.js | grep -q 'loadManifest'
