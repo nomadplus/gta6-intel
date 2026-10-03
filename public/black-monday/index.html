@@ -17,15 +17,27 @@
   <main id="app">
     <section id="bootPanel" class="panel">
       <div class="brand">BLACK MONDAY <span>WEB</span></div>
-      <p id="status">Runtime not initialised.</p>
-      <label class="fileButton">
-        <input id="discInput" type="file" accept=".iso" />
-        Select original Black Monday ISO from Files
+      <p id="status">Checking browser runtime…</p>
+      <p id="setupNote" class="setupNote">First time only: select your Black Monday .7z archive. The game will be installed privately on this iPhone, then future launches will start automatically.</p>
+
+      <label class="fileButton primaryInstall">
+        <input id="archiveInput" type="file" multiple />
+        Install Black Monday from 7-Zip archive
       </label>
-      <label id="installOption" class="installOption hidden">
-        <input id="installDisc" type="checkbox" />
-        Keep a local PWA copy on this device (~4.0 GiB)
-      </label>
+      <progress id="archiveProgress" class="archiveProgress hidden" max="1" value="0">0%</progress>
+
+      <details class="advancedSetup">
+        <summary>Already have the extracted ISO?</summary>
+        <label class="fileButton">
+          <input id="discInput" type="file" accept=".iso" />
+          Select original Black Monday ISO from Files
+        </label>
+        <label id="installOption" class="installOption hidden">
+          <input id="installDisc" type="checkbox" checked />
+          Install this ISO for automatic future launches (~4.0 GiB)
+        </label>
+      </details>
+
       <button id="installedBoot" class="fileButton hidden" type="button">Start installed Black Monday</button>
       <div class="utilityRow">
         <button id="saveExport" class="smallButton" type="button">Export saves</button>
