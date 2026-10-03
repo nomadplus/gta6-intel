@@ -141,12 +141,16 @@ jobs:
           python3 /tmp/apply_patches.py /tmp/play
           python3 /tmp/apply_renderer_patch.py /tmp/play
           python3 /tmp/apply_savestate_patch.py /tmp/play
+          python3 black-monday-perf/apply_runtime_stats_patch.py /tmp/play
+          python3 black-monday-perf/apply_cpp_disc_cache_patch.py /tmp/play
           git -C /tmp/play diff --check
           grep -q 'setPadValue' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'pauseVm' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'setGsResolutionFactor' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'beginLoadState' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'pollLoadState' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'getEeUsagePercent' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'CACHE_BYTES' /tmp/play/Source/Js_DiscImageDeviceStream.h
 
       - name: Configure Play WebAssembly
         working-directory: /tmp/play
