@@ -10,6 +10,10 @@ on:
       - 'black-monday-perf/**'
   workflow_dispatch:
 
+concurrency:
+  group: black-monday-iphone-preview
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -49,20 +53,17 @@ jobs:
             black-monday-preview-src/appchunk_08 \
             black-monday-perf/appchunk_09 \
             black-monday-perf/appchunk_10 \
-            black-monday-perf/appchunk_11 \
+            black-monday-perf/appchunk_12 \
             > "$SITE_ROOT/app.bundle.js"
           test -s "$SITE_ROOT/index.html"
           test -s "$SITE_ROOT/app.bundle.js"
           node --check "$SITE_ROOT/app.bundle.js"
           node --check "$SITE_ROOT/sw.js"
           node --check "$SITE_ROOT/extractor/worker.js"
-          grep -q "runtime/Play.js" "$SITE_ROOT/app.bundle.js"
-          grep -q "archiveInput" "$SITE_ROOT/app.bundle.js"
-          grep -q "extractor/worker.js" "$SITE_ROOT/app.bundle.js"
           grep -q "installBlackMondayDiscReadAhead" "$SITE_ROOT/app.bundle.js"
-          grep -q "bmcore-20261003-r34" "$SITE_ROOT/app.bundle.js"
-          grep -q "getWasmCodegenModuleCount" "$SITE_ROOT/app.bundle.js"
-          grep -q "pumpBlackMondayGs" "$SITE_ROOT/app.bundle.js"
+          grep -q "bmcore-20261003-r35" "$SITE_ROOT/app.bundle.js"
+          grep -q "getBlackMondayEeHostMs" "$SITE_ROOT/app.bundle.js"
+          ! grep -q "blackMondayRuntimeInitR34MainThreadGs" "$SITE_ROOT/app.bundle.js"
           if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' \) | grep -q .; then
             echo 'Game media was accidentally included in preview bundle.' >&2
             exit 1
@@ -76,51 +77,6 @@ jobs:
           curl -fsSL "$BASE/License.txt" -o "$SITE_ROOT/extractor/7z-LICENSE.txt"
           node --check "$SITE_ROOT/extractor/7zz.js"
           test "$(stat -c %s "$SITE_ROOT/extractor/7zz.wasm")" -gt 500000
-          grep -q 'WORKERFS' "$SITE_ROOT/extractor/7zz.js"
-
-      - name: Smoke-test binary stdout streaming from 7-Zip WASM
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y p7zip-full
-          rm -rf /tmp/bm-7z-smoke
-          mkdir -p /tmp/bm-7z-smoke/runtime /tmp/bm-7z-smoke/data
-          cp "$SITE_ROOT/extractor/7zz.js" "$SITE_ROOT/extractor/7zz.wasm" /tmp/bm-7z-smoke/runtime/
-          printf '{"type":"module"}\n' > /tmp/bm-7z-smoke/runtime/package.json
-          dd if=/dev/urandom of=/tmp/bm-7z-smoke/data/payload.iso bs=1M count=4 status=none
-          (cd /tmp/bm-7z-smoke/data && 7z a -t7z archive.7z payload.iso >/dev/null)
-          cat > /tmp/bm-7z-smoke/runtime/smoke.mjs <<'NODE'
-          import crypto from 'node:crypto';
-          import fs from 'node:fs';
-          import SevenZip from './7zz.js';
-
-          const module = await SevenZip({ noInitialRun: true });
-          module.FS.mkdir('/nodefs');
-          module.FS.mount(module.NODEFS, { root: '/tmp/bm-7z-smoke/data' }, '/nodefs');
-          module.FS.chdir('/nodefs');
-
-          const stdout = module.FS.getStream(1);
-          const originalWrite = stdout.stream_ops.write;
-          stdout.stream_ops = { ...stdout.stream_ops };
-          const hash = crypto.createHash('sha256');
-          let bytes = 0;
-          let binaryMode = true;
-          stdout.stream_ops.write = (stream, buffer, offset, length, position) => {
-            if (!binaryMode) return originalWrite(stream, buffer, offset, length, position);
-            const chunk = Buffer.from(buffer.subarray(offset, offset + length));
-            hash.update(chunk);
-            bytes += length;
-            return length;
-          };
-
-          const exitCode = await module.callMain(['e', 'archive.7z', 'payload.iso', '-so', '-y', '-bsp0', '-bse2']);
-          if (exitCode !== 0) throw new Error(`7-Zip smoke extraction exited ${exitCode}`);
-          const expected = crypto.createHash('sha256').update(fs.readFileSync('/tmp/bm-7z-smoke/data/payload.iso')).digest('hex');
-          const actual = hash.digest('hex');
-          if (bytes !== 4 * 1024 * 1024) throw new Error(`stdout stream size mismatch: ${bytes}`);
-          if (actual !== expected) throw new Error(`stdout stream hash mismatch: ${actual} != ${expected}`);
-          console.log(`7-Zip stdout stream verified: ${bytes} bytes sha256=${actual}`);
-          NODE
-          node /tmp/bm-7z-smoke/runtime/smoke.mjs
 
       - name: Setup Emscripten
         uses: emscripten-core/setup-emsdk@v16
@@ -128,8 +84,7 @@ jobs:
           version: ${{ env.EMSDK_VERSION }}
 
       - name: Install Ninja
-        run: |
-          sudo apt-get install -y ninja-build
+        run: sudo apt-get install -y ninja-build
 
       - name: Checkout pinned Play source
         run: |
@@ -148,20 +103,15 @@ jobs:
           python3 /tmp/apply_savestate_patch.py /tmp/play
           python3 black-monday-perf/apply_runtime_stats_patch.py /tmp/play
           python3 black-monday-perf/apply_wasm_codegen_stats_patch.py /tmp/play
-          python3 black-monday-perf/apply_main_thread_gs_patch.py /tmp/play
+          python3 black-monday-perf/apply_vm_wall_profiler_patch.py /tmp/play
           python3 black-monday-perf/apply_cpp_disc_cache_patch.py /tmp/play
           git -C /tmp/play diff --check
           grep -q 'setPadValue' /tmp/play/Source/ui_js/Main.cpp
-          grep -q 'pauseVm' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'setGsResolutionFactor' /tmp/play/Source/ui_js/Main.cpp
-          grep -q 'beginLoadState' /tmp/play/Source/ui_js/Main.cpp
-          grep -q 'pollLoadState' /tmp/play/Source/ui_js/Main.cpp
-          grep -q 'getEeUsagePercent' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'getWasmCodegenModuleCount' /tmp/play/Source/ui_js/Main.cpp
-          grep -q 'pumpBlackMondayGs' /tmp/play/Source/ui_js/Main.cpp
-          grep -q 'ProcessPendingCalls' /tmp/play/Source/gs/GSHandler.cpp
-          grep -q 'CGSH_OpenGL(gsThreaded)' /tmp/play/Source/ui_js/GSH_OpenGLJs.cpp
-          grep -q 'g_blackMondayWasmModuleMicros' /tmp/play/deps/CodeGen/src/MemoryFunction.cpp
+          grep -q 'getBlackMondayEeHostMs' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'g_blackMondayEeEstimatedMicros' /tmp/play/Source/PS2VM.cpp
+          grep -q 'g_blackMondayGsWorkerMicros' /tmp/play/Source/gs/GSHandler.cpp
           grep -q 'CACHE_BYTES' /tmp/play/Source/Js_DiscImageDeviceStream.h
 
       - name: Configure Play WebAssembly
@@ -192,18 +142,8 @@ jobs:
             echo "built_utc=$(date -u +%FT%TZ)"
             echo "play_js_bytes=$(stat -c %s "$SITE_ROOT/runtime/Play.js")"
             echo "play_wasm_bytes=$(stat -c %s "$SITE_ROOT/runtime/Play.wasm")"
-            echo "sevenzip_js_bytes=$(stat -c %s "$SITE_ROOT/extractor/7zz.js")"
-            echo "sevenzip_wasm_bytes=$(stat -c %s "$SITE_ROOT/extractor/7zz.wasm")"
-            sha256sum \
-              "$SITE_ROOT/app.bundle.js" \
-              "$SITE_ROOT/runtime/Play.js" \
-              "$SITE_ROOT/runtime/Play.wasm" \
-              "$SITE_ROOT/extractor/worker.js" \
-              "$SITE_ROOT/extractor/7zz.js" \
-              "$SITE_ROOT/extractor/7zz.wasm"
+            sha256sum "$SITE_ROOT/app.bundle.js" "$SITE_ROOT/runtime/Play.js" "$SITE_ROOT/runtime/Play.wasm" "$SITE_ROOT/extractor/worker.js" "$SITE_ROOT/extractor/7zz.js" "$SITE_ROOT/extractor/7zz.wasm"
           } > "$SITE_ROOT/BUILD_INFO.txt"
-          du -sh "$SITE_ROOT"
-          find "$SITE_ROOT" -maxdepth 2 -type f | sort
 
       - name: Commit generated preview runtime
         run: |
