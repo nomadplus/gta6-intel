@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <meta name="theme-color" content="#050505" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Black Monday Native</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main id="app">
+    <canvas id="gameCanvas" aria-label="Black Monday native renderer"></canvas>
+    <div id="hud">
+      <strong>BLACK MONDAY NATIVE</strong>
+      <span id="status">initialising runtime…</span>
+      <span id="perf">-- fps</span>
+    </div>
+    <div id="touch" aria-label="Touch controls">
+      <div id="movePad" class="pad"><div class="nub"></div></div>
+      <div id="lookPad" class="lookPad"></div>
+      <button id="actionButton" class="actionButton" type="button">ACTION</button>
+    </div>
+  </main>
+  <script type="module" src="./engine.js"></script>
+</body>
+</html>
