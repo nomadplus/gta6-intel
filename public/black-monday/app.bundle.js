@@ -2107,37 +2107,37 @@ beginStats = function blackMondayBeginStatsR35SubsystemWall() {
 };
 
 
-// ---- Black Monday r38: controlled GS primitive-draw A/B ----
-// r35 already proved the dominant wall cost is the GS worker/synchronisation
-// path. r36/r37 fine-grained renderer instrumentation is intentionally removed.
-// This build uses Play!'s existing CGSHandler::SetDrawEnabled(false) only after
-// initVm succeeds. Primitive drawing kicks are suppressed while GS transfers,
-// flip/presentation, mailbox processing and synchronisation remain active.
-// Legacy CI text markers only: bmcore-20261003-r37 setBlackMondayGsBreakdownEnabled
-blackMondayRuntimeAssetUrl = function blackMondayRuntimeAssetUrlR38(name) {
+// ---- Black Monday r39: clean GS primitive-draw A/B control ----
+// r38 was invalid because CI still compiled the retired fine-grained GS profiler.
+// r39 removes that profiler from the WASM build and adds only a tiny embind bridge
+// to Play!'s existing CGSHandler::SetDrawEnabled API. No OpenGL/GS hot path is
+// instrumented or modified.
+blackMondayRuntimeAssetUrl = function blackMondayRuntimeAssetUrlR39(name) {
   const url = new URL(`./runtime/${name}`, import.meta.url);
-  url.searchParams.set('bmcore', 'bmcore-20261003-r38');
+  url.searchParams.set('bmcore', 'bmcore-20261003-r39');
   return url.href;
 };
 
-const __blackMondayRuntimeInitR35ForR38 = runtime.init.bind(runtime);
-runtime.init = async function blackMondayRuntimeInitR38DrawOff() {
-  const result = await __blackMondayRuntimeInitR35ForR38();
+const __blackMondayRuntimeInitR35ForR39 = runtime.init.bind(runtime);
+runtime.init = async function blackMondayRuntimeInitR39CleanDrawOff() {
+  if (setupNote) setupNote.textContent = 'r39 CLEAN CONTROL — creating PS2 VM…';
+  diagnostics.record('runtime.r39-control-loaded', { build: 'bmcore-20261003-r39' });
+  const result = await __blackMondayRuntimeInitR35ForR39();
   if (!this.module?.setBlackMondayGsDrawEnabled) {
-    throw new Error('r38 GS draw toggle bridge unavailable.');
+    throw new Error('r39 GS draw toggle bridge unavailable.');
   }
   this.module.setBlackMondayGsDrawEnabled(false);
   const drawEnabled = Boolean(this.module.getBlackMondayGsDrawEnabled?.());
   diagnostics.record('performance.gs-draw-ab', {
-    build: 'bmcore-20261003-r38',
+    build: 'bmcore-20261003-r39',
     phase: 'post-init-vm',
     drawEnabled,
   });
-  if (drawEnabled) throw new Error('r38 requested GS drawing OFF but renderer still reports drawing enabled.');
+  if (drawEnabled) throw new Error('r39 requested GS drawing OFF but renderer still reports drawing enabled.');
   return result;
 };
 
-beginStats = function blackMondayBeginStatsR38DrawOff() {
+beginStats = function blackMondayBeginStatsR39DrawOff() {
   clearInterval(statsTimer);
   runtime.clearStats();
   performanceMonitor.reset(runtime.getFrames());
@@ -2168,13 +2168,13 @@ beginStats = function blackMondayBeginStatsR38DrawOff() {
     const jitWallMs = cg.moduleMsPerSecond + cg.instanceMsPerSecond;
 
     hudStatus.textContent =
-      `r38 draw=${drawEnabled ? 'ON' : 'OFF'} frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${coreText ? ` ${coreText}` : ''} jit=${jitWallMs.toFixed(0)}ms/s ` +
+      `r39 draw=${drawEnabled ? 'ON' : 'OFF'} frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${coreText ? ` ${coreText}` : ''} jit=${jitWallMs.toFixed(0)}ms/s ` +
       `hEE=${hw.eeMsPerSecond.toFixed(0)} hIOP=${hw.iopMsPerSecond.toFixed(0)} gsw=${hw.gsWorkerMsPerSecond.toFixed(0)} sync=${hw.gsSyncMsPerSecond.toFixed(0)} lim=${hw.limiterMsPerSecond.toFixed(0)} spu=${hw.spuMsPerSecond.toFixed(0)}ms/s`;
 
     if ((++diagnosticSampleCounter % 5) === 0) {
       diagnostics.record('performance.sample', {
         ...sample,
-        build: 'bmcore-20261003-r38',
+        build: 'bmcore-20261003-r39',
         gsDrawEnabled: drawEnabled,
         discIo: io,
         core,
