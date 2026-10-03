@@ -62,8 +62,9 @@ jobs:
           node --check "$SITE_ROOT/sw.js"
           node --check "$SITE_ROOT/extractor/worker.js"
           grep -q "installBlackMondayDiscReadAhead" "$SITE_ROOT/app.bundle.js"
-          grep -q "bmcore-20261003-r37" "$SITE_ROOT/app.bundle.js"
-          grep -q "setBlackMondayGsBreakdownEnabled" "$SITE_ROOT/app.bundle.js"
+          grep -q "bmcore-20261003-r39" "$SITE_ROOT/app.bundle.js"
+          grep -q "setBlackMondayGsDrawEnabled" "$SITE_ROOT/app.bundle.js"
+          ! grep -q "setBlackMondayGsBreakdownEnabled" "$SITE_ROOT/app.bundle.js"
           ! grep -q "blackMondayRuntimeInitR34MainThreadGs" "$SITE_ROOT/app.bundle.js"
           if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' \) | grep -q .; then
             echo 'Game media was accidentally included in preview bundle.' >&2
@@ -105,15 +106,17 @@ jobs:
           python3 black-monday-perf/apply_runtime_stats_patch.py /tmp/play
           python3 black-monday-perf/apply_wasm_codegen_stats_patch.py /tmp/play
           python3 black-monday-perf/apply_vm_wall_profiler_patch.py /tmp/play
-          python3 black-monday-perf/apply_gs_breakdown_profiler.py /tmp/play
+          python3 black-monday-perf/apply_gs_draw_toggle_patch.py /tmp/play
           python3 black-monday-perf/apply_cpp_disc_cache_patch.py /tmp/play
           git -C /tmp/play diff --check
           grep -q 'setPadValue' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'setGsResolutionFactor' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'getWasmCodegenModuleCount' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'getBlackMondayEeHostMs' /tmp/play/Source/ui_js/Main.cpp
-          grep -q 'setBlackMondayGsBreakdownEnabled' /tmp/play/Source/ui_js/Main.cpp
-          grep -q 'BlackMonday_SetGsBreakdownEnabled' /tmp/play/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+          grep -q 'setBlackMondayGsDrawEnabled' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'getBlackMondayGsDrawEnabled' /tmp/play/Source/ui_js/Main.cpp
+          ! grep -q 'BlackMonday_SetGsBreakdownEnabled' /tmp/play/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+          test ! -e /tmp/play/Source/gs/GSH_OpenGL/BlackMondayGsBreakdown.h
           grep -q 'g_blackMondayEeEstimatedMicros' /tmp/play/Source/PS2VM.cpp
           grep -q 'g_blackMondayGsWorkerMicros' /tmp/play/Source/gs/GSHandler.cpp
           grep -q 'CACHE_BYTES' /tmp/play/Source/Js_DiscImageDeviceStream.h
