@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "folder": "BlackMondayParts",
+    "parts": 12,
+    "totalBytes": 2511062800,
+    "archivePattern": "BlackMonday.7z.partNNN",
+    "verified": "2026-10-03"
+  },
+  "facts": {
+    "worldTiles": {
+      "path": "bigfiles",
+      "range": "1.big..528.big",
+      "note": "tile number is not mission number"
+    },
+    "groups": {
+      "path": "bigfiles/groups.dat",
+      "bytes": 122770,
+      "role": "candidate world/tile grouping index; semantics unverified"
+    },
+    "textures": {
+      "path": "tegfiles",
+      "range": "1..2537.teg",
+      "approxBytes": 1180000000,
+      "note": "textures are not grouped by .big tile number"
+    },
+    "mission1": {
+      "label": "Tuesday",
+      "script": "missions/315.bin",
+      "logicPairs": 183
+    }
+  },
+  "pipeline": [
+    {
+      "stage": "archive",
+      "status": "verified",
+      "output": "retail extracted tree"
+    },
+    {
+      "stage": "inventory",
+      "status": "in_progress",
+      "output": "file index + hashes"
+    },
+    {
+      "stage": "world-index",
+      "status": "in_progress",
+      "input": "bigfiles/groups.dat",
+      "output": "tile dependency graph"
+    },
+    {
+      "stage": "geometry",
+      "status": "planned",
+      "input": "bigfiles/*.big",
+      "output": "mesh chunks"
+    },
+    {
+      "stage": "textures",
+      "status": "planned",
+      "input": "tegfiles/*.teg",
+      "output": "GPU-ready textures"
+    },
+    {
+      "stage": "missions",
+      "status": "planned",
+      "input": "missions/*.bin",
+      "output": "event graph"
+    },
+    {
+      "stage": "runtime-pack",
+      "status": "planned",
+      "output": "versioned native asset packs"
+    }
+  ]
+}
