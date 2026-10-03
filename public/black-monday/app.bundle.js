@@ -928,7 +928,7 @@ class PerformanceMonitor {
 
 
 class PlayRuntimeAdapter {
-  constructor({ runtimeUrl = './runtime/Play.js?v=kg-61fde43', canvasId = 'outputCanvas' } = {}) {
+  constructor({ runtimeUrl = './runtime/Play.js', canvasId = 'outputCanvas' } = {}) {
     this.runtimeUrl = runtimeUrl;
     this.canvasId = canvasId;
     this.module = null;
@@ -942,7 +942,7 @@ class PlayRuntimeAdapter {
     if (typeof Play !== 'function') throw new Error('Play.js did not export the expected Emscripten module factory.');
     const base = new URL('.', runtimeHref).href;
     this.module = await Play({
-      locateFile: path => new URL(path, base).href + '?v=kg-61fde43',
+      locateFile: path => new URL(path, base).href,
       mainScriptUrlOrBlob: runtimeHref,
       print: text => console.log(`[Play] ${text}`),
       printErr: text => console.error(`[Play] ${text}`),
@@ -1769,11 +1769,47 @@ runtime.setPerformanceProfile = function blackMondaySetPerformanceProfile(id = '
   return __blackMondayBaseSetPerformanceProfile(id);
 };
 
+// Safari can retain a previously fetched ES module and/or WASM response across
+// preview updates. Version both sides of the Play! runtime as a pair so a new
+// launcher can never initialise against a stale Play.js or Play.wasm.
+const BLACK_MONDAY_RUNTIME_BUILD = 'bmcore-20261003-r28';
+function blackMondayVersionRuntimeUrl(input) {
+  const url = new URL(input, globalThis.location?.href ?? import.meta.url);
+  url.searchParams.set('bmcore', BLACK_MONDAY_RUNTIME_BUILD);
+  return url.href;
+}
+runtime.runtimeUrl = blackMondayVersionRuntimeUrl(runtime.runtimeUrl);
+
 const __blackMondayBaseRuntimeInit = runtime.init.bind(runtime);
 runtime.init = async function blackMondayRuntimeInitWithReadAhead() {
-  const result = await __blackMondayBaseRuntimeInit();
-  installBlackMondayDiscReadAhead(this.module?.discImageDevice);
-  return result;
+  const originalFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = (input, init = {}) => {
+    try {
+      const raw = typeof input === 'string' || input instanceof URL ? String(input) : input?.url;
+      const url = new URL(raw, globalThis.location?.href ?? import.meta.url);
+      const isPlayRuntime = url.origin === globalThis.location?.origin
+        && (url.pathname.endsWith('/runtime/Play.js') || url.pathname.endsWith('/runtime/Play.wasm'));
+      if (isPlayRuntime) {
+        url.searchParams.set('bmcore', BLACK_MONDAY_RUNTIME_BUILD);
+        const reloadInit = { ...init, cache: 'reload' };
+        if (typeof Request !== 'undefined' && input instanceof Request) {
+          return originalFetch(new Request(url.href, input), reloadInit);
+        }
+        return originalFetch(url.href, reloadInit);
+      }
+    } catch {
+      // Fall through to the browser's normal fetch path.
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const result = await __blackMondayBaseRuntimeInit();
+    installBlackMondayDiscReadAhead(this.module?.discImageDevice);
+    return result;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 };
 
 function blackMondayCoreStats(sample) {
