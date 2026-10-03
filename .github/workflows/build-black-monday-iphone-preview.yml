@@ -1,0 +1,130 @@
+name: Build Black Monday iPhone Preview
+
+on:
+  push:
+    branches:
+      - black-monday-iphone-test
+    paths:
+      - '.github/workflows/build-black-monday-iphone-preview.yml'
+      - 'black-monday-preview/sitepart_*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PLAY_COMMIT: 83700b2c31e593bc94e845b4b31b797be84dda59
+      EMSDK_VERSION: 4.0.1
+      SITE_ROOT: public/black-monday
+    steps:
+      - name: Checkout isolated preview branch
+        uses: actions/checkout@v4
+        with:
+          ref: black-monday-iphone-test
+
+      - name: Expand iPhone PWA shell
+        run: |
+          rm -rf "$SITE_ROOT" /tmp/black-monday-shell
+          mkdir -p "$SITE_ROOT" /tmp/black-monday-shell
+          cat black-monday-preview/sitepart_* | base64 -d > /tmp/black-monday-site.tar.gz
+          tar -tzf /tmp/black-monday-site.tar.gz >/tmp/black-monday-site-files.txt
+          tar -xzf /tmp/black-monday-site.tar.gz -C /tmp/black-monday-shell
+          if [ -f /tmp/black-monday-shell/preview/index.html ]; then
+            cp -a /tmp/black-monday-shell/preview/. "$SITE_ROOT/"
+          elif [ -f /tmp/black-monday-shell/index.html ]; then
+            cp -a /tmp/black-monday-shell/. "$SITE_ROOT/"
+          else
+            echo 'Preview bundle did not contain index.html.' >&2
+            cat /tmp/black-monday-site-files.txt >&2
+            exit 1
+          fi
+          test -f "$SITE_ROOT/index.html"
+          test -f "$SITE_ROOT/app.js"
+          test -f "$SITE_ROOT/runtime/PlayRuntimeAdapter.js"
+          test ! -e "$SITE_ROOT/Getaway_The_Black_Monday_Europe.iso"
+          if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' -o -iname '*.bin' \) | grep -q .; then
+            echo 'Game media was accidentally included in preview bundle.' >&2
+            exit 1
+          fi
+          node --check "$SITE_ROOT/app.js"
+          node --check "$SITE_ROOT/runtime/PlayRuntimeAdapter.js"
+
+      - name: Setup Emscripten
+        uses: emscripten-core/setup-emsdk@v16
+        with:
+          version: ${{ env.EMSDK_VERSION }}
+
+      - name: Install Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Checkout pinned Play source
+        run: |
+          git clone --recurse-submodules https://github.com/jpd002/Play-.git /tmp/play
+          git -C /tmp/play checkout --force "$PLAY_COMMIT"
+          git -C /tmp/play submodule update --init --recursive --force
+          test "$(git -C /tmp/play rev-parse HEAD)" = "$PLAY_COMMIT"
+
+      - name: Apply verified BLACK_MONDAY_WEB transforms
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/nomadplus/stripe-success-page/black-monday-web-build/black-monday-build/apply_patches.py -o /tmp/apply_patches.py
+          curl -fsSL https://raw.githubusercontent.com/nomadplus/stripe-success-page/black-monday-web-build/black-monday-build/apply_renderer_patch.py -o /tmp/apply_renderer_patch.py
+          curl -fsSL https://raw.githubusercontent.com/nomadplus/stripe-success-page/black-monday-web-build/black-monday-build/apply_savestate_patch.py -o /tmp/apply_savestate_patch.py
+          python3 /tmp/apply_patches.py /tmp/play
+          python3 /tmp/apply_renderer_patch.py /tmp/play
+          python3 /tmp/apply_savestate_patch.py /tmp/play
+          git -C /tmp/play diff --check
+          grep -q 'setPadValue' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'pauseVm' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'setGsResolutionFactor' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'beginLoadState' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'pollLoadState' /tmp/play/Source/ui_js/Main.cpp
+
+      - name: Configure Play WebAssembly
+        working-directory: /tmp/play
+        run: |
+          emcc --version
+          emcmake cmake --preset wasm-ninja
+
+      - name: Build Play WebAssembly
+        working-directory: /tmp/play
+        run: cmake --build --preset wasm-ninja-release --parallel 2
+
+      - name: Stage runtime and verify preview
+        run: |
+          PLAY_JS="$(find /tmp/play/build_cmake/build/wasm-ninja -type f -path '*/Release/Play.js' -print -quit)"
+          PLAY_WASM="$(find /tmp/play/build_cmake/build/wasm-ninja -type f -path '*/Release/Play.wasm' -print -quit)"
+          test -n "$PLAY_JS" -a -f "$PLAY_JS"
+          test -n "$PLAY_WASM" -a -f "$PLAY_WASM"
+          cp "$PLAY_JS" "$SITE_ROOT/runtime/Play.js"
+          cp "$PLAY_WASM" "$SITE_ROOT/runtime/Play.wasm"
+          node --check "$SITE_ROOT/runtime/Play.js"
+          test "$(stat -c %s "$SITE_ROOT/runtime/Play.wasm")" -gt 1000000
+          {
+            echo "play_commit=$PLAY_COMMIT"
+            echo "emsdk_version=$EMSDK_VERSION"
+            echo "preview_source_commit=$GITHUB_SHA"
+            echo "built_utc=$(date -u +%FT%TZ)"
+            echo "play_js_bytes=$(stat -c %s "$SITE_ROOT/runtime/Play.js")"
+            echo "play_wasm_bytes=$(stat -c %s "$SITE_ROOT/runtime/Play.wasm")"
+            sha256sum "$SITE_ROOT/runtime/Play.js" "$SITE_ROOT/runtime/Play.wasm"
+          } > "$SITE_ROOT/BUILD_INFO.txt"
+          du -sh "$SITE_ROOT"
+          find "$SITE_ROOT" -maxdepth 2 -type f | sort
+
+      - name: Commit generated preview runtime
+        run: |
+          git config user.name 'black-monday-web-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add "$SITE_ROOT"
+          if git diff --cached --quiet; then
+            echo 'Preview assets unchanged.'
+            exit 0
+          fi
+          git commit -m 'Build Black Monday iPhone preview runtime [skip preview-build]'
+          git push origin HEAD:black-monday-iphone-test
