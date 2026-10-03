@@ -6,6 +6,12 @@ html, body, #app { margin: 0; width: 100%; height: 100%; overflow: hidden; backg
 .brand span { font-weight: 300; }
 .fileButton { display: inline-block; padding: 14px 18px; border: 1px solid #aaa; border-radius: 10px; cursor: pointer; }
 .fileButton input { display: none; }
+.primaryInstall { border-color: #fff; font-weight: 750; }
+.setupNote { max-width: 660px; margin: 0 auto; opacity: .82; font-size: 14px; line-height: 1.4; }
+.archiveProgress { width: min(560px, 80vw); height: 12px; margin: 0 auto; }
+.advancedSetup { max-width: 660px; margin: 0 auto; opacity: .82; }
+.advancedSetup summary { cursor: pointer; font-size: 13px; padding: 6px; }
+.advancedSetup[open] { display: grid; gap: 10px; }
 .probe { max-width: 720px; opacity: .75; font: 12px ui-monospace,SFMono-Regular,Menlo,monospace; white-space: pre-wrap; text-align: left; }
 .hidden { display: none !important; }
 #gameShell { position: fixed; inset: 0; background: #000; }
@@ -33,7 +39,7 @@ html, body, #app { margin: 0; width: 100%; height: 100%; overflow: hidden; backg
 
 .installOption { display:flex; align-items:center; justify-content:center; gap:8px; font-size:13px; opacity:.9; }
 .installOption input { width:18px; height:18px; }
-.installStatus { min-height:1.2em; font:12px ui-monospace,SFMono-Regular,Menlo,monospace; opacity:.78; }
+.installStatus { min-height:1.2em; max-width: 720px; margin: 0 auto; font:12px ui-monospace,SFMono-Regular,Menlo,monospace; opacity:.78; }
 button.fileButton { background:transparent; color:inherit; font:inherit; }
 
 .utilityRow { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; }
