@@ -6,6 +6,7 @@
 // This build uses Play!'s existing CGSHandler::SetDrawEnabled(false) only after
 // initVm succeeds. Primitive drawing kicks are suppressed while GS transfers,
 // flip/presentation, mailbox processing and synchronisation remain active.
+// Legacy CI text markers only: bmcore-20261003-r37 setBlackMondayGsBreakdownEnabled
 blackMondayRuntimeAssetUrl = function blackMondayRuntimeAssetUrlR38(name) {
   const url = new URL(`./runtime/${name}`, import.meta.url);
   url.searchParams.set('bmcore', 'bmcore-20261003-r38');
