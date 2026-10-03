@@ -1,0 +1,109 @@
+
+
+// ---- Black Monday r35: subsystem wall-time profiler ----
+// r34's non-threaded GS experiment is intentionally not part of this bundle.
+// Restore the known-booting r33 renderer topology and measure where Safari's
+// actual wall time goes before making another performance architecture change.
+blackMondayRuntimeAssetUrl = function blackMondayRuntimeAssetUrlR35(name) {
+  const url = new URL(`./runtime/${name}`, import.meta.url);
+  url.searchParams.set('bmcore', 'bmcore-20261003-r35');
+  return url.href;
+};
+
+function blackMondayHostWallTotalsR35() {
+  const module = runtime.module;
+  const value = name => {
+    const result = Number(module?.[name]?.());
+    return Number.isFinite(result) && result >= 0 ? result : 0;
+  };
+  return {
+    eeMs: value('getBlackMondayEeHostMs'),
+    iopMs: value('getBlackMondayIopHostMs'),
+    spuMs: value('getBlackMondaySpuHostMs'),
+    gsSyncMs: value('getBlackMondayGsSyncMs'),
+    limiterMs: value('getBlackMondayLimiterMs'),
+    gsWorkerMs: value('getBlackMondayGsWorkerMs'),
+    gsBursts: value('getBlackMondayGsWorkerBursts'),
+    gsCalls: value('getBlackMondayGsWorkerCalls'),
+  };
+}
+
+function blackMondayHostWallDeltaR35(current, previous, seconds) {
+  const elapsed = Math.max(0.001, seconds);
+  const rate = key => Math.max(0, current[key] - previous[key]) / elapsed;
+  return {
+    eeMsPerSecond: rate('eeMs'),
+    iopMsPerSecond: rate('iopMs'),
+    spuMsPerSecond: rate('spuMs'),
+    gsSyncMsPerSecond: rate('gsSyncMs'),
+    limiterMsPerSecond: rate('limiterMs'),
+    gsWorkerMsPerSecond: rate('gsWorkerMs'),
+    gsBurstsPerSecond: rate('gsBursts'),
+    gsCallsPerSecond: rate('gsCalls'),
+  };
+}
+
+beginStats = function blackMondayBeginStatsR35SubsystemWall() {
+  clearInterval(statsTimer);
+  runtime.clearStats();
+  performanceMonitor.reset(runtime.getFrames());
+  let diagnosticSampleCounter = 0;
+  let previousCodegen = blackMondayWasmCodegenTotals();
+  let previousHost = blackMondayHostWallTotalsR35();
+
+  statsTimer = window.setInterval(() => {
+    const sample = performanceMonitor.sample(runtime.getFrames());
+    const frameTime = sample.frameTimeMs == null ? '--' : sample.frameTimeMs.toFixed(1);
+    const io = runtime.module?.discImageDevice?.getBlackMondayIoStats?.() ?? null;
+    const core = blackMondayCoreStats(sample);
+    const codegen = blackMondayWasmCodegenTotals();
+    const cg = blackMondayDeltaCodegen(codegen, previousCodegen, sample.deltaMs / 1000);
+    previousCodegen = codegen;
+    const host = blackMondayHostWallTotalsR35();
+    const hw = blackMondayHostWallDeltaR35(host, previousHost, sample.deltaMs / 1000);
+    previousHost = host;
+
+    const ioText = io
+      ? ` io=${(io.hitRate * 100).toFixed(0)}%/${io.avgFetchMs.toFixed(1)}ms`
+      : '';
+    const coreText = [
+      core.eeUsage == null ? null : `ee=${core.eeUsage.toFixed(0)}%`,
+      core.iopUsage == null ? null : `iop=${core.iopUsage.toFixed(0)}%`,
+      core.drawCallsPerFrame == null ? null : `dc=${core.drawCallsPerFrame.toFixed(0)}`,
+    ].filter(Boolean).join(' ');
+    const jitWallMs = cg.moduleMsPerSecond + cg.instanceMsPerSecond;
+    const hostText = ` hEE=${hw.eeMsPerSecond.toFixed(0)} hIOP=${hw.iopMsPerSecond.toFixed(0)} gsw=${hw.gsWorkerMsPerSecond.toFixed(0)} sync=${hw.gsSyncMsPerSecond.toFixed(0)} lim=${hw.limiterMsPerSecond.toFixed(0)} spu=${hw.spuMsPerSecond.toFixed(0)}ms/s`;
+
+    hudStatus.textContent = `r35 frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${coreText ? ` ${coreText}` : ''} jit=${jitWallMs.toFixed(0)}ms/s${hostText}`;
+
+    if ((++diagnosticSampleCounter % 5) === 0) {
+      diagnostics.record('performance.sample', {
+        ...sample,
+        discIo: io,
+        core,
+        codegen,
+        codegenRate: cg,
+        hostWall: host,
+        hostWallRate: hw,
+      });
+    }
+    if ((diagnosticSampleCounter % 30) === 0) {
+      diagnostics.persist({
+        extra: {
+          phase: 'running',
+          build: 'bmcore-20261003-r35',
+          fps: sample.fps,
+          frameTimeMs: sample.frameTimeMs,
+          performanceProfile: activePerformanceProfile,
+          gsScale: activeGsScale,
+          discIo: io,
+          core,
+          codegen,
+          codegenRate: cg,
+          hostWall: host,
+          hostWallRate: hw,
+        },
+      });
+    }
+  }, 1000);
+};
