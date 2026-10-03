@@ -1,0 +1,90 @@
+nt: nav.userAgent ?? null,
+    platform: nav.platform ?? null,
+    wasm: typeof WebAssembly === 'object',
+    webgl2: gl2,
+    sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+    wasmSharedMemory: probeSharedWasmMemory(),
+    crossOriginIsolated: globalThis.crossOriginIsolated === true,
+    secureContext: globalThis.isSecureContext === true,
+    worker: typeof Worker !== 'undefined',
+    webAudio: typeof globalThis.AudioContext === 'function' || typeof globalThis.webkitAudioContext === 'function',
+    serviceWorker: Boolean(nav.serviceWorker),
+    indexedDb: typeof globalThis.indexedDB !== 'undefined',
+    opfs,
+    storagePersisted,
+    storageQuotaMiB: quota == null ? null : Math.round(quota / MIB),
+    storageUsageMiB: usage == null ? null : Math.round(usage / MIB),
+    storageAvailableMiB: available == null ? null : Math.round(available / MIB),
+    discInstallBytesRequired: installBytesRequired,
+    discInstallSpaceReady: available == null ? null : available >= installBytesRequired,
+    hardwareConcurrency: finiteNumber(nav.hardwareConcurrency),
+    deviceMemoryGiB: finiteNumber(nav.deviceMemory),
+    maxTouchPoints: finiteNumber(nav.maxTouchPoints) ?? 0,
+    visibilityApi: typeof doc?.visibilityState === 'string',
+    standalone: Boolean(globalThis.matchMedia?.('(display-mode: standalone)')?.matches || nav.standalone === true),
+  };
+
+  // The pinned Play! browser core is an Emscripten pthread/WebGL2 build. These are hard launch requirements.
+  report.playThreadedRuntimeReady = report.wasm
+    && report.webgl2
+    && report.sharedArrayBuffer
+    && report.wasmSharedMemory
+    && report.crossOriginIsolated
+    && report.worker;
+
+  report.missingRuntimeFeatures = [
+    !report.wasm && 'WebAssembly',
+    !report.webgl2 && 'WebGL2',
+    !report.sharedArrayBuffer && 'SharedArrayBuffer',
+    !report.wasmSharedMemory && 'WebAssembly shared memory',
+    !report.crossOriginIsolated && 'cross-origin isolation',
+    !report.worker && 'Web Workers',
+  ].filter(Boolean);
+
+  report.runtimeWarnings = [
+    !report.secureContext && 'not a secure context',
+    !report.webAudio && 'WebAudio unavailable',
+    !report.serviceWorker && 'service workers unavailable',
+    !report.indexedDb && 'IndexedDB unavailable',
+    report.hardwareConcurrency != null && report.hardwareConcurrency < 4 && `only ${report.hardwareConcurrency} logical CPU threads reported`,
+    report.discInstallSpaceReady === false && 'not enough browser storage to install a local ISO copy',
+    report.storagePersisted === false && 'browser storage is not marked persistent',
+  ].filter(Boolean);
+
+  return report;
+}
+
+
+// ---- app.js ----
+
+
+
+
+
+
+
+
+
+const $ = id => document.getElementById(id);
+const status = $('status');
+const probeEl = $('probe');
+const discInput = $('discInput');
+const bootPanel = $('bootPanel');
+const gameShell = $('gameShell');
+const hudStatus = $('hudStatus');
+const inputStatus = $('inputStatus');
+const canvas = $('outputCanvas');
+const installOption = $('installOption');
+const installDisc = $('installDisc');
+const installedBoot = $('installedBoot');
+const installStatus = $('installStatus');
+const saveExport = $('saveExport');
+const saveImport = $('saveImport');
+const diagExport = $('diagExport');
+const runtime = new PlayRuntimeAdapter();
+const diagnostics = new RuntimeDiagnostics();
+diagnostics.bindWindow(window);
+window.__blackMondayDiagnostics = diagnostics;
+const performanceMonitor = new PerformanceMonitor();
+installFirstGestureAudioUnlock(document);
+l
