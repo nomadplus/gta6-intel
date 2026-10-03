@@ -1,0 +1,168 @@
+group) this.setFallbackKey(code, next.has(code));
+  }
+
+  setFallbackKey(code, down) {
+    const already = this.heldKeys.has(code);
+    if (already === down) return;
+    if (down) this.heldKeys.add(code); else this.heldKeys.delete(code);
+    this.emitKey(code, down);
+  }
+
+  neutralizeAxes() {
+    if (!this.nativePadSink) return;
+    const neutral = axisToPs2Byte(0);
+    this.nativePadSink.setValue(PAD.ANALOG_LEFT_X, neutral);
+    this.nativePadSink.setValue(PAD.ANALOG_LEFT_Y, neutral);
+    this.nativePadSink.setValue(PAD.ANALOG_RIGHT_X, neutral);
+    this.nativePadSink.setValue(PAD.ANALOG_RIGHT_Y, neutral);
+  }
+
+  releaseAll() {
+    for (const code of [...this.heldKeys]) this.setFallbackKey(code, false);
+    this.nativePadSink?.clearAll?.();
+  }
+
+  dispatchKey(code, down) {
+    const event = new KeyboardEvent(down ? 'keydown' : 'keyup', { code, bubbles: true, cancelable: true });
+    this.canvas?.dispatchEvent(event);
+  }
+}
+
+const STANDARD_GAMEPAD_BUTTON_MAP = BUTTON_MAP;
+
+
+// ---- input/TouchController.js ----
+
+
+class TouchController {
+  constructor({ canvas, leftStick, lookZone, buttons, pauseButton, emitKey, onActivity = () => {} }) {
+    this.canvas = canvas;
+    this.leftStick = leftStick;
+    this.lookZone = lookZone;
+    this.buttons = buttons;
+    this.pauseButton = pauseButton;
+    this.emitKey = emitKey ?? ((code, down) => this.dispatchKey(code, down));
+    this.onActivity = onActivity;
+    this.nativePadSink = null;
+    this.held = new Set();
+    this.mode = 'onFootMitch';
+    this.leftPointer = null;
+    this.lookPointer = null;
+    this.lookLast = null;
+    this.lookNeutralTimer = null;
+  }
+
+  mount() {
+    this.renderButtons();
+    this.bindStick();
+    this.bindLook();
+    this.pauseButton.addEventListener('pointerdown', e => { e.preventDefault(); this.press(KEY.START, true); });
+    this.pauseButton.addEventListener('pointerup', e => { e.preventDefault(); this.press(KEY.START, false); });
+    window.addEventListener('blur', () => this.releaseAll());
+  }
+
+  attachNativePadSink({ setValue, clearValue, clearAll }) {
+    this.releaseAll();
+    this.nativePadSink = { setValue, clearValue, clearAll };
+    this.nativePadSink.clearAll?.();
+  }
+
+  setMode(mode) {
+    if (!CONTROL_PROFILES[mode]) throw new Error(`Unknown control mode: ${mode}`);
+    this.releaseAll();
+    this.mode = mode;
+    this.renderButtons();
+  }
+
+  renderButtons() {
+    this.buttons.replaceChildren();
+    CONTROL_PROFILES[this.mode].forEach(([label, code], slot) => {
+      const button = document.createElement('button');
+      button.className = 'touchButton';
+      button.dataset.slot = String(slot);
+      button.textContent = label;
+      const down = e => { e.preventDefault(); button.setPointerCapture?.(e.pointerId); button.classList.add('pressed'); this.press(code, true); };
+      const up = e => { e.preventDefault(); button.classList.remove('pressed'); this.press(code, false); };
+      button.addEventListener('pointerdown', down);
+      button.addEventListener('pointerup', up);
+      button.addEventListener('pointercancel', up);
+      this.buttons.append(button);
+    });
+  }
+
+  bindStick() {
+    const nub = this.leftStick.querySelector('.nub');
+    const radius = 62;
+    const update = e => {
+      const r = this.leftStick.getBoundingClientRect();
+      const n = normalizeStick(e.clientX - (r.left + r.width / 2), e.clientY - (r.top + r.height / 2), radius);
+      nub.style.transform = `translate(${n.x * radius}px, ${n.y * radius}px)`;
+      this.onActivity({ type: 'touch' });
+      if (this.nativePadSink) {
+        this.emitAxis(PAD.ANALOG_LEFT_X, n.x);
+        // Driving uses the left stick primarily for steering. Keep Y neutral so
+        // a steering gesture cannot accidentally become throttle/brake input.
+        this.emitAxis(PAD.ANALOG_LEFT_Y, this.mode === 'driving' ? 0 : n.y);
+      } else {
+        this.syncDirectional(vectorToDigitalKeys(n.x, n.y, { left: KEY.LEFT_LEFT, right: KEY.LEFT_RIGHT, up: KEY.LEFT_UP, down: KEY.LEFT_DOWN }));
+      }
+    };
+    this.leftStick.addEventListener('pointerdown', e => { e.preventDefault(); this.leftPointer = e.pointerId; this.leftStick.setPointerCapture(e.pointerId); update(e); });
+    this.leftStick.addEventListener('pointermove', e => { if (e.pointerId === this.leftPointer) update(e); });
+    const end = e => {
+      if (e.pointerId !== this.leftPointer) return;
+      this.leftPointer = null;
+      nub.style.transform = 'translate(0,0)';
+      if (this.nativePadSink) { this.clearAxis(PAD.ANALOG_LEFT_X); this.clearAxis(PAD.ANALOG_LEFT_Y); }
+      else this.syncDirectional(new Set());
+    };
+    this.leftStick.addEventListener('pointerup', end);
+    this.leftStick.addEventListener('pointercancel', end);
+  }
+
+  bindLook() {
+    const neutralLook = () => {
+      if (this.nativePadSink) { this.emitAxis(PAD.ANALOG_RIGHT_X, 0); this.emitAxis(PAD.ANALOG_RIGHT_Y, 0); }
+      else this.syncLook(new Set());
+    };
+    this.lookZone.addEventListener('pointerdown', e => {
+      e.preventDefault(); this.lookPointer = e.pointerId; this.lookLast = { x: e.clientX, y: e.clientY }; this.lookZone.setPointerCapture(e.pointerId);
+    });
+    this.lookZone.addEventListener('pointermove', e => {
+      if (e.pointerId !== this.lookPointer || !this.lookLast) return;
+      const dx = e.clientX - this.lookLast.x; const dy = e.clientY - this.lookLast.y;
+      this.lookLast = { x: e.clientX, y: e.clientY };
+      this.onActivity({ type: 'touch' });
+      if (this.nativePadSink) {
+        if (this.mode === 'driving') {
+          // Black Monday's driving look controls are L2/R2, not the right stick.
+          // A horizontal drag therefore becomes a short directional look hold.
+          const next = new Set();
+          if (dx < -2) next.add(KEY.L2);
+          if (dx > 2) next.add(KEY.R2);
+          this.syncGroup(next, [KEY.L2, KEY.R2]);
+          clearTimeout(this.lookNeutralTimer);
+          this.lookNeutralTimer = setTimeout(() => this.syncGroup(new Set(), [KEY.L2, KEY.R2]), 90);
+        } else {
+          this.emitAxis(PAD.ANALOG_RIGHT_X, clamp(dx / 18, -1, 1));
+          this.emitAxis(PAD.ANALOG_RIGHT_Y, clamp(dy / 18, -1, 1));
+          clearTimeout(this.lookNeutralTimer);
+          this.lookNeutralTimer = setTimeout(neutralLook, 55);
+        }
+      } else {
+        this.syncLook(vectorToDigitalKeys(dx / 18, dy / 18, { left: KEY.RIGHT_LEFT, right: KEY.RIGHT_RIGHT, up: KEY.RIGHT_UP, down: KEY.RIGHT_DOWN }, 0.15));
+      }
+    });
+    const end = e => {
+      if (e.pointerId !== this.lookPointer) return;
+      this.lookPointer = null; this.lookLast = null; clearTimeout(this.lookNeutralTimer);
+      if (this.nativePadSink) {
+        if (this.mode === 'driving') this.syncGroup(new Set(), [KEY.L2, KEY.R2]);
+        else { this.clearAxis(PAD.ANALOG_RIGHT_X); this.clearAxis(PAD.ANALOG_RIGHT_Y); }
+      } else neutralLook();
+    };
+    this.lookZone.addEventListener('pointerup', end);
+    this.lookZone.addEventListener('pointercancel', end);
+  }
+
+  emitAxis(button, 
