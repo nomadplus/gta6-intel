@@ -1,0 +1,153 @@
+udioReport = await unlockAudio();
+  if (!orientationAttempted) {
+    orientationAttempted = true;
+    try { await globalThis.screen?.orientation?.lock?.('landscape'); } catch { /* iOS Safari may reject; standalone manifest handles it */ }
+  }
+  if (audioReport.supported && !audioReport.unlocked) console.warn('Audio context is not yet unlocked', audioReport.state);
+  status.textContent = 'Checking original Black Monday disc…';
+  const discReport = await assertBlackMondayDisc(file);
+  let bootFile = file;
+  if (install && opfsAvailable()) {
+    installStatus.textContent = 'Preparing local PWA copy…';
+    const entry = await importDiscFile(file, {
+      onProgress: (written, total) => {
+        installStatus.textContent = `Installing ${((written / total) * 100).toFixed(1)}%`;
+      },
+    });
+    installedDiscName = entry.name;
+    bootFile = await loadInstalledDisc(entry.name);
+    installStatus.textContent = 'Local game copy installed.';
+  }
+  await ensureRuntime();
+  console.info('Black Monday disc verified', discReport);
+  diagnostics.record('disc.verified', discReport);
+  status.textContent = `Booting ${bootFile.name} (${(bootFile.size / 1073741824).toFixed(2)} GiB)…`;
+  bootPanel.classList.add('hidden');
+  gameShell.classList.remove('hidden');
+  canvas.focus();
+  runtime.bootDisc(bootFile);
+  diagnostics.record('runtime.boot_requested', { name: bootFile.name, size: bootFile.size });
+  diagnostics.persist({ extra: { phase: 'boot-requested' } });
+  hudStatus.textContent = 'BOOT REQUESTED';
+  beginStats();
+}
+
+discInput.addEventListener('change', async () => {
+  const file = discInput.files?.[0];
+  if (!file) return;
+  try {
+    await bootBlackMondayFile(file, { install: Boolean(installDisc.checked) });
+  } catch (error) {
+    console.error(error);
+    gameShell.classList.add('hidden');
+    bootPanel.classList.remove('hidden');
+    status.textContent = `Runtime blocked: ${error.message}`;
+  }
+});
+
+installedBoot.addEventListener('click', async () => {
+  if (!installedDiscName) return;
+  try {
+    await bootBlackMondayFile(await loadInstalledDisc(installedDiscName));
+  } catch (error) {
+    console.error(error);
+    status.textContent = `Installed copy blocked: ${error.message}`;
+  }
+});
+
+async function discoverInstalledDisc() {
+  if (!opfsAvailable()) return;
+  // Installing a 4.21 GB ISO is optional. Do not offer it when the browser reports
+  // insufficient quota; direct File/Blob playback remains the default iPhone path.
+  if (probe.discInstallSpaceReady !== false) installOption.classList.remove('hidden');
+  else installStatus.textContent = 'Local ISO install disabled: browser storage quota is too small. Playing directly from Files is supported.';
+  try {
+    const installed = (await listInstalledDiscs()).find(entry => entry.size === 4211343360);
+    if (!installed) return;
+    const file = await loadInstalledDisc(installed.name);
+    const report = await assertBlackMondayDisc(file);
+    if (!report.releaseMatches) return;
+    installedDiscName = installed.name;
+    installedBoot.classList.remove('hidden');
+    installStatus.textContent = 'Verified local Black Monday copy found.';
+  } catch (error) {
+    console.warn('Installed disc discovery failed', error);
+  }
+}
+
+discoverInstalledDisc();
+
+function downloadJson(filename, value) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+saveExport.addEventListener('click', async () => {
+  try {
+    await ensureRuntime();
+    await runtime.flushSaves();
+    const backup = runtime.exportSaveBackup();
+    downloadJson(`black-monday-saves-${new Date().toISOString().slice(0, 10)}.json`, backup);
+    installStatus.textContent = `Save backup exported (${backup.files.length} files).`;
+    diagnostics.record('saves.exported', { files: backup.files.length });
+  } catch (error) {
+    installStatus.textContent = `Save export failed: ${error.message}`;
+    diagnostics.record('saves.export_failed', { message: error.message });
+  }
+});
+
+saveImport.addEventListener('change', async () => {
+  const file = saveImport.files?.[0];
+  if (!file) return;
+  try {
+    const backup = JSON.parse(await file.text());
+    await ensureRuntime();
+    const result = await runtime.importSaveBackup(backup);
+    installStatus.textContent = `Save backup imported (${result.filesWritten} files).`;
+    diagnostics.record('saves.imported', result);
+  } catch (error) {
+    installStatus.textContent = `Save import failed: ${error.message}`;
+    diagnostics.record('saves.import_failed', { message: error.message });
+  } finally {
+    saveImport.value = '';
+  }
+});
+
+diagExport.addEventListener('click', () => {
+  diagnostics.persist({ extra: { phase: runtime.booted ? 'running' : 'shell' } });
+  downloadJson(`black-monday-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`, diagnostics.snapshot({ phase: runtime.booted ? 'running' : 'shell' }));
+});
+
+document.addEventListener('keydown', event => {
+  if (!runtimeReady || !inputRouter || event.metaKey || event.ctrlKey || event.altKey) return;
+  inputRouter.claim('keyboard');
+  inputStatus.textContent = 'KEYBOARD';
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!runtimeReady) return;
+  if (document.visibilityState === 'hidden') {
+    touch.releaseAll();
+    runtime.pause();
+    diagnostics.record('lifecycle.hidden');
+    diagnostics.persist({ extra: { phase: 'hidden' } });
+    runtime.flushSaves().catch(console.warn);
+  } else if (document.visibilityState === 'visible') {
+    runtime.resume();
+    diagnostics.record('lifecycle.visible');
+  }
+});
+window.addEventListener('pagehide', () => {
+  gamepad.stop();
+  touch.releaseAll();
+  runtime.pause();
+  if (runtimeReady) runtime.flushSaves().catch(console.warn);
+});
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(console.warn);
+
