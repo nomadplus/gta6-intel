@@ -1,0 +1,195 @@
+normalizedValue) {
+    if (this.nativePadSink) this.nativePadSink.setValue(button, axisToPs2Byte(normalizedValue));
+  }
+
+  clearAxis(button) { this.nativePadSink?.clearValue?.(button); }
+
+  syncDirectional(next) { this.syncGroup(next, [KEY.LEFT_LEFT, KEY.LEFT_RIGHT, KEY.LEFT_UP, KEY.LEFT_DOWN]); }
+  syncLook(next) { this.syncGroup(next, [KEY.RIGHT_LEFT, KEY.RIGHT_RIGHT, KEY.RIGHT_UP, KEY.RIGHT_DOWN]); }
+  syncGroup(next, group) { for (const code of group) this.press(code, next.has(code)); }
+
+  press(code, down) {
+    if (down) this.onActivity({ type: 'touch' });
+    const already = this.held.has(code);
+    if (down === already) return;
+    if (down) this.held.add(code); else this.held.delete(code);
+    const padButton = KEY_TO_PAD[code];
+    if (this.nativePadSink && padButton !== undefined) {
+      if (down) this.nativePadSink.setValue(padButton, 1);
+      else this.nativePadSink.clearValue(padButton);
+    } else this.emitKey(code, down);
+  }
+
+  dispatchKey(code, down) {
+    const event = new KeyboardEvent(down ? 'keydown' : 'keyup', { code, bubbles: true, cancelable: true });
+    this.canvas.dispatchEvent(event);
+  }
+
+  releaseAll() {
+    for (const code of [...this.held]) this.press(code, false);
+    this.nativePadSink?.clearAll?.();
+  }
+}
+
+
+// ---- runtime/DiscImageDevice.js ----
+class DiscImageDevice {
+  constructor(module) { this.module = module; this.doneFlag = false; this.file = null; this.lastError = null; }
+  read(dstPtr, offset, size) {
+    if (!this.file) throw new Error('No disc image selected.');
+    this.doneFlag = false; this.lastError = null;
+    this.file.slice(offset, offset + size).arrayBuffer()
+      .then(buffer => { this.module.HEAPU8.set(new Uint8Array(buffer), dstPtr); this.doneFlag = true; })
+      .catch(error => { this.lastError = error; this.doneFlag = true; });
+  }
+  getFileSize() { if (!this.file) throw new Error('No disc image selected.'); return this.file.size; }
+  isDone() { return this.doneFlag; }
+  setFile(file) { this.file = file; }
+}
+
+
+// ---- runtime/PersistentFs.js ----
+const PLAY_DATA_PATH = '/home/web_user/.local/share/Play Data Files';
+
+function mkdirTree(FS, path) {
+  if (typeof FS.mkdirTree === 'function') {
+    FS.mkdirTree(path);
+    return;
+  }
+  const parts = path.split('/').filter(Boolean);
+  let current = '';
+  for (const part of parts) {
+    current += `/${part}`;
+    try { FS.mkdir(current); }
+    catch (error) {
+      const message = String(error?.message ?? error);
+      if (!message.includes('File exists') && error?.errno !== 20) throw error;
+    }
+  }
+}
+
+function syncFs(FS, populate) {
+  return new Promise((resolve, reject) => {
+    FS.syncfs(populate, error => error ? reject(error) : resolve());
+  });
+}
+
+async function mountPersistentVfs(module, { mountPoint = PLAY_DATA_PATH, autoPersist = true } = {}) {
+  const FS = module?.FS;
+  if (!FS) throw new Error('Emscripten FS is unavailable.');
+  const IDBFS = FS.filesystems?.IDBFS;
+  if (!IDBFS) throw new Error('Play! was built without IDBFS. Rebuild with -lidbfs.js.');
+
+  // Play!'s DefaultAppConfig resolves its browser data root to:
+  // $HOME/.local/share/Play Data Files. Mount IDBFS there BEFORE initVm(),
+  // so config.xml, vfs/mc0, vfs/mc1 and state data are persistent.
+  const parent = mountPoint.slice(0, mountPoint.lastIndexOf('/')) || '/';
+  mkdirTree(FS, parent);
+  try { FS.mkdir(mountPoint); }
+  catch (error) {
+    const message = String(error?.message ?? error);
+    if (!message.includes('File exists') && error?.errno !== 20) throw error;
+  }
+  FS.mount(IDBFS, { autoPersist }, mountPoint);
+  await syncFs(FS, true);
+  return { mountPoint, autoPersist };
+}
+
+async function flushPersistentVfs(module) {
+  if (!module?.FS?.syncfs) return;
+  await syncFs(module.FS, false);
+}
+
+
+// ---- runtime/performanceProfiles.js ----
+const PERFORMANCE_PROFILES = Object.freeze({
+  compatibility: Object.freeze({
+    label: 'Compatibility', eeNumerator: 1, eeDenominator: 1,
+    experimental: false,
+    note: 'Default PS2 timing. Required baseline for correctness testing.',
+  }),
+  balanced: Object.freeze({
+    label: 'Balanced (experimental)', eeNumerator: 3, eeDenominator: 4,
+    experimental: true,
+    note: 'Reduces emulated EE work. Must be regression-tested for timing/audio/mission side effects.',
+  }),
+  lowPower: Object.freeze({
+    label: 'Low power (experimental)', eeNumerator: 1, eeDenominator: 2,
+    experimental: true,
+    note: 'Aggressive CPU reduction for thermal testing only; never the default.',
+  }),
+});
+
+function getPerformanceProfile(id = 'compatibility') {
+  const profile = PERFORMANCE_PROFILES[id];
+  if (!profile) throw new Error(`Unknown performance profile: ${id}`);
+  return profile;
+}
+
+
+// ---- runtime/SaveBackup.js ----
+
+const FORMAT = 'black-monday-web-vfs';
+const VERSION = 1;
+
+function toBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function fromBase64(text) {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function safeRelativePath(path) {
+  if (typeof path !== 'string' || path.startsWith('/') || path.includes('..')) throw new Error(`Unsafe backup path: ${path}`);
+  return path.split('/').filter(Boolean).join('/');
+}
+
+function walk(FS, root, rel, files) {
+  const current = rel ? `${root}/${rel}` : root;
+  for (const name of FS.readdir(current)) {
+    if (name === '.' || name === '..') continue;
+    const childRel = rel ? `${rel}/${name}` : name;
+    const full = `${root}/${childRel}`;
+    const stat = FS.stat(full);
+    if (FS.isDir(stat.mode)) walk(FS, root, childRel, files);
+    else files.push({ path: childRel, data: toBase64(FS.readFile(full, { encoding: 'binary' })) });
+  }
+}
+
+function exportVfsBackup(module, { root = `${PLAY_DATA_PATH}/vfs` } = {}) {
+  if (!module?.FS) throw new Error('Emscripten FS is unavailable.');
+  const files = [];
+  walk(module.FS, root.replace(/\/$/, ''), '', files);
+  return {
+    format: FORMAT,
+    version: VERSION,
+    createdAt: new Date().toISOString(),
+    files,
+  };
+}
+
+function importVfsBackup(module, backup, { root = `${PLAY_DATA_PATH}/vfs` } = {}) {
+  if (!module?.FS) throw new Error('Emscripten FS is unavailable.');
+  if (backup?.format !== FORMAT || backup?.version !== VERSION || !Array.isArray(backup.files)) throw new Error('Unsupported save backup format.');
+  const base = root.replace(/\/$/, '');
+  let bytesWritten = 0;
+  for (const entry of backup.files) {
+    const rel = safeRelativePath(entry.path);
+    if (!rel) continue;
+    const parts = rel.split('/');
+    const name = parts.pop();
+    let dir = base;
+    for (const part of parts) {
+      dir += `/${part}`;
+      try { module.FS.mkdir(dir); } catch (error) { if (!String(error).includes('File exists')) { try { module.FS.stat(dir); } catch { throw error; } } }
+    }
+    
