@@ -1,0 +1,9 @@
+play_commit=83700b2c31e593bc94e845b4b31b797be84dda59
+emsdk_version=4.0.1
+preview_source_commit=2d215b1e00ab3c84d3b4eeb03329c2a4e430c268
+built_utc=2026-10-03T06:13:46Z
+play_js_bytes=213440
+play_wasm_bytes=2693084
+efdf50d3b28f9bf72d5f78037856044140749168a9e78b3cdaa7b5a659f09c83  public/black-monday/app.bundle.js
+52df30d603ebb0558671ffbe1661f0488b86fd2ff265381d7a52bfef908e6e4b  public/black-monday/runtime/Play.js
+bee965d343124d248041ce73906eaa5829c4df9092fb608e890fc36754af3374  public/black-monday/runtime/Play.wasm

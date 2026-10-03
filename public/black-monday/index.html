@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <meta name="theme-color" content="#050505" />
+  <meta name="robots" content="noindex,nofollow,noarchive" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Black Monday" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="stylesheet" href="./styles.css" />
+  <title>Black Monday Web</title>
+</head>
+<body>
+  <main id="app">
+    <section id="bootPanel" class="panel">
+      <div class="brand">BLACK MONDAY <span>WEB</span></div>
+      <p id="status">Runtime not initialised.</p>
+      <label class="fileButton">
+        <input id="discInput" type="file" accept=".iso" />
+        Select original Black Monday ISO from Files
+      </label>
+      <label id="installOption" class="installOption hidden">
+        <input id="installDisc" type="checkbox" />
+        Keep a local PWA copy on this device (~4.0 GiB)
+      </label>
+      <button id="installedBoot" class="fileButton hidden" type="button">Start installed Black Monday</button>
+      <div class="utilityRow">
+        <button id="saveExport" class="smallButton" type="button">Export saves</button>
+        <label class="smallButton">
+          <input id="saveImport" type="file" accept="application/json,.json" />
+          Import saves
+        </label>
+        <button id="diagExport" class="smallButton" type="button">Export diagnostics</button>
+      </div>
+      <div id="installStatus" class="installStatus"></div>
+      <div id="probe" class="probe"></div>
+    </section>
+
+    <section id="gameShell" class="hidden" aria-label="Game display">
+      <canvas id="outputCanvas" width="640" height="480" tabindex="0"></canvas>
+      <div id="touchLayer" aria-label="Touch controls">
+        <div id="leftStick" class="stick"><div class="nub"></div></div>
+        <div id="lookZone" aria-label="Camera look area"></div>
+        <div id="buttons" class="buttons"></div>
+        <button id="pauseButton" class="utility">PAUSE</button>
+      </div>
+      <div id="hudStatus">SHELL</div>
+      <div id="inputStatus">TOUCH + KEYBOARD</div>
+    </section>
+  </main>
+  <script type="module" src="./app.bundle.js"></script>
+</body>
+</html>

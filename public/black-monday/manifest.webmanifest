@@ -1,0 +1,12 @@
+{
+  "name": "Black Monday Web",
+  "short_name": "Black Monday",
+  "description": "Private local-browser runtime shell for The Getaway: Black Monday.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#050505",
+  "theme_color": "#050505",
+  "id": "./"
+}
