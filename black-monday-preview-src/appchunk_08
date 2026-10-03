@@ -1,0 +1,176 @@
+
+// ---- iPhone one-time archive installer / automatic installed-game boot ----
+const archiveInput = $('archiveInput');
+const archiveProgress = $('archiveProgress');
+const setupNote = $('setupNote');
+const INSTALLER_ISO_SIZE = 4211343360;
+const INSTALLER_RESERVE = 384 * 1024 * 1024;
+let archiveInstallRunning = false;
+let installedAutoBootStarted = false;
+
+function installerId() {
+  try { return crypto.randomUUID(); }
+  catch { return `install-${Date.now()}-${Math.random().toString(16).slice(2)}`; }
+}
+
+function setArchiveProgress(processed = 0, total = INSTALLER_ISO_SIZE) {
+  if (!archiveProgress) return;
+  const value = total > 0 ? Math.max(0, Math.min(1, processed / total)) : 0;
+  archiveProgress.value = value;
+  archiveProgress.textContent = `${(value * 100).toFixed(1)}%`;
+}
+
+async function installBlackMondayArchive(files) {
+  if (archiveInstallRunning) return;
+  const selected = Array.from(files || []);
+  if (!selected.length) return;
+  if (!opfsAvailable()) throw new Error('This Safari version does not expose the private browser filesystem required for a one-time Black Monday install.');
+
+  archiveInstallRunning = true;
+  archiveInput.disabled = true;
+  setArchiveProgress(0);
+  archiveProgress?.classList.remove('hidden');
+  installStatus.textContent = 'Checking iPhone storage…';
+  status.textContent = 'Preparing one-time Black Monday installation…';
+
+  try {
+    await ensureSpace(INSTALLER_ISO_SIZE, INSTALLER_RESERVE);
+    await requestPersistentStorage().catch(() => false);
+
+    const id = installerId();
+    const workerUrl = new URL('./extractor/worker.js', import.meta.url);
+    const worker = new Worker(workerUrl, { type: 'module', name: 'black-monday-7z-installer' });
+
+    const result = await new Promise((resolve, reject) => {
+      const cleanup = () => worker.terminate();
+      worker.onmessage = event => {
+        const message = event.data || {};
+        if (message.id && message.id !== id) return;
+        if (message.type === 'archive-verified') {
+          installStatus.textContent = `Archive verified. Extracting ${message.isoPath} directly to private PWA storage…`;
+          diagnostics.record('installer.archive_verified', {
+            archiveName: message.archiveName,
+            isoPath: message.isoPath,
+            totalBytes: message.totalBytes,
+          });
+          return;
+        }
+        if (message.type === 'progress') {
+          setArchiveProgress(message.processedBytes, message.totalBytes);
+          const pct = message.totalBytes ? (message.processedBytes / message.totalBytes) * 100 : 0;
+          installStatus.textContent = `Installing Black Monday… ${pct.toFixed(1)}%`;
+          return;
+        }
+        if (message.type === 'done') {
+          cleanup();
+          resolve(message);
+          return;
+        }
+        if (message.type === 'error') {
+          cleanup();
+          reject(new Error(message.message || 'Archive extraction failed.'));
+        }
+      };
+      worker.onerror = event => {
+        cleanup();
+        reject(new Error(event.message || 'Black Monday installer worker crashed.'));
+      };
+      worker.postMessage({ type: 'install', id, files: selected });
+    });
+
+    installStatus.textContent = 'Extraction complete. Verifying installed Black Monday disc…';
+    const installedFile = await loadInstalledDisc(result.targetName);
+    const report = await assertBlackMondayDisc(installedFile);
+    installedDiscName = result.targetName;
+    setArchiveProgress(INSTALLER_ISO_SIZE);
+    diagnostics.record('installer.completed', {
+      targetName: result.targetName,
+      size: result.size,
+      archiveName: result.archiveName,
+      isoPath: result.isoPath,
+      disc: report,
+    });
+    diagnostics.persist({ extra: { phase: 'installed' } });
+    installStatus.textContent = 'Black Monday installed and verified. Starting…';
+    status.textContent = 'Installed Black Monday found. Starting automatically…';
+    await bootBlackMondayFile(installedFile);
+  } finally {
+    archiveInstallRunning = false;
+    archiveInput.disabled = false;
+    archiveInput.value = '';
+  }
+}
+
+archiveInput?.addEventListener('change', async () => {
+  try {
+    await installBlackMondayArchive(archiveInput.files);
+  } catch (error) {
+    console.error(error);
+    diagnostics.record('installer.failed', { message: error.message, stack: error.stack || null });
+    diagnostics.persist({ extra: { phase: 'installer-failed', error: error.message } });
+    archiveProgress?.classList.add('hidden');
+    gameShell.classList.add('hidden');
+    bootPanel.classList.remove('hidden');
+    status.textContent = `Installation blocked: ${error.message}`;
+    installStatus.textContent = 'Nothing was installed. You can retry after correcting the issue.';
+  }
+});
+
+async function findVerifiedInstalledBlackMonday() {
+  if (!opfsAvailable()) return null;
+  const candidates = await listInstalledDiscs();
+  for (const entry of candidates.filter(item => item.size === INSTALLER_ISO_SIZE)) {
+    try {
+      const file = await loadInstalledDisc(entry.name);
+      await assertBlackMondayDisc(file);
+      return { entry, file };
+    } catch (error) {
+      console.warn('Ignoring unverified installed disc', entry.name, error);
+    }
+  }
+  return null;
+}
+
+async function autoBootInstalledBlackMonday() {
+  if (installedAutoBootStarted || archiveInstallRunning) return;
+  if (new URLSearchParams(location.search).has('noautoboot')) return;
+  if (!probe.playThreadedRuntimeReady) return;
+  installedAutoBootStarted = true;
+  try {
+    const installed = await findVerifiedInstalledBlackMonday();
+    if (!installed) {
+      installedAutoBootStarted = false;
+      if (setupNote) setupNote.textContent = 'First time only: select your Black Monday .7z file (or every split .7z part). After installation, future launches start the game automatically.';
+      status.textContent = 'First-time setup: install Black Monday from your 7-Zip archive.';
+      return;
+    }
+    installedDiscName = installed.entry.name;
+    installedBoot.classList.add('hidden');
+    installOption.classList.add('hidden');
+    if (setupNote) setupNote.textContent = 'Installed Black Monday detected. Starting automatically…';
+    status.textContent = 'Installed Black Monday detected. Starting automatically…';
+    installStatus.textContent = 'Local verified game copy found.';
+    diagnostics.record('installer.autoboot_found', { name: installed.entry.name, size: installed.entry.size });
+    await bootBlackMondayFile(installed.file);
+  } catch (error) {
+    installedAutoBootStarted = false;
+    console.error('Installed Black Monday auto-boot failed', error);
+    diagnostics.record('installer.autoboot_failed', { message: error.message });
+    status.textContent = `Installed copy could not start automatically: ${error.message}`;
+  }
+}
+
+// Let the existing storage discovery finish first, then upgrade it to the
+// finished-app behaviour: a verified installed copy boots without a file picker.
+setTimeout(() => autoBootInstalledBlackMonday(), 120);
+
+window.__blackMondayWeb = Object.freeze({
+  installArchive: files => installBlackMondayArchive(files),
+  autoBoot: () => autoBootInstalledBlackMonday(),
+  bootInstalled: async () => {
+    const installed = await findVerifiedInstalledBlackMonday();
+    if (!installed) throw new Error('No verified installed Black Monday copy was found.');
+    installedDiscName = installed.entry.name;
+    return bootBlackMondayFile(installed.file);
+  },
+});
