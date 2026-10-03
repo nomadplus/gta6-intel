@@ -1,0 +1,41 @@
+:root { color-scheme: dark; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; touch-action: none; }
+html, body, #app { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050505; color: #f5f5f5; }
+.panel { min-height: 100%; display: grid; place-content: center; gap: 14px; padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left)); text-align: center; }
+.brand { font-size: clamp(30px, 7vw, 60px); font-weight: 900; letter-spacing: .08em; }
+.brand span { font-weight: 300; }
+.fileButton { display: inline-block; padding: 14px 18px; border: 1px solid #aaa; border-radius: 10px; cursor: pointer; }
+.fileButton input { display: none; }
+.probe { max-width: 720px; opacity: .75; font: 12px ui-monospace,SFMono-Regular,Menlo,monospace; white-space: pre-wrap; text-align: left; }
+.hidden { display: none !important; }
+#gameShell { position: fixed; inset: 0; background: #000; }
+#outputCanvas { width: 100%; height: 100%; object-fit: contain; display: block; outline: none; background: #000; }
+#touchLayer { position: absolute; inset: 0; pointer-events: none; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+.stick { position: absolute; left: max(28px, env(safe-area-inset-left)); bottom: max(28px, env(safe-area-inset-bottom)); width: 150px; height: 150px; border: 2px solid rgba(255,255,255,.26); border-radius: 50%; background: rgba(0,0,0,.18); pointer-events: auto; }
+.nub { position: absolute; left: 50%; top: 50%; width: 68px; height: 68px; margin: -34px; border-radius: 50%; background: rgba(255,255,255,.28); transform: translate(0,0); }
+#lookZone { position: absolute; right: 0; top: 0; width: 58%; height: 100%; pointer-events: auto; }
+.buttons { position: absolute; right: max(24px, env(safe-area-inset-right)); bottom: max(24px, env(safe-area-inset-bottom)); width: 310px; height: 230px; pointer-events: none; }
+.touchButton { position: absolute; min-width: 74px; min-height: 54px; border: 1px solid rgba(255,255,255,.35); border-radius: 24px; background: rgba(0,0,0,.42); color: white; font-weight: 750; font-size: 12px; padding: 8px 10px; pointer-events: auto; }
+.touchButton.pressed { background: rgba(255,255,255,.33); }
+.touchButton[data-slot="0"] { right: 0; bottom: 82px; }
+.touchButton[data-slot="1"] { right: 78px; bottom: 0; }
+.touchButton[data-slot="2"] { right: 78px; bottom: 164px; }
+.touchButton[data-slot="3"] { right: 156px; bottom: 82px; }
+.touchButton[data-slot="4"] { right: 0; bottom: 154px; }
+.touchButton[data-slot="5"] { right: 0; bottom: 10px; }
+.touchButton[data-slot="6"] { right: 170px; bottom: 150px; }
+.touchButton[data-slot="7"] { right: 170px; bottom: 14px; }
+.utility { position: absolute; top: max(12px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); padding: 8px 14px; border-radius: 18px; border: 1px solid rgba(255,255,255,.3); background: rgba(0,0,0,.4); color: white; pointer-events: auto; }
+#hudStatus { position: absolute; left: max(8px, env(safe-area-inset-left)); top: max(8px, env(safe-area-inset-top)); font: 11px ui-monospace,SFMono-Regular,Menlo,monospace; background: rgba(0,0,0,.5); padding: 5px 7px; border-radius: 6px; }
+@media (orientation: portrait) { #gameShell::before { content: "Rotate to landscape"; position: absolute; z-index: 99; inset: 0; display: grid; place-content: center; background: #050505; font-size: 22px; } }
+
+#inputStatus { position:absolute; right:max(8px, env(safe-area-inset-right)); top:max(8px, env(safe-area-inset-top)); font:11px ui-monospace,SFMono-Regular,Menlo,monospace; background:rgba(0,0,0,.5); padding:5px 7px; border-radius:6px; }
+
+.installOption { display:flex; align-items:center; justify-content:center; gap:8px; font-size:13px; opacity:.9; }
+.installOption input { width:18px; height:18px; }
+.installStatus { min-height:1.2em; font:12px ui-monospace,SFMono-Regular,Menlo,monospace; opacity:.78; }
+button.fileButton { background:transparent; color:inherit; font:inherit; }
+
+.utilityRow { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; }
+.smallButton { display:inline-block; padding:8px 11px; border:1px solid rgba(255,255,255,.3); border-radius:8px; background:transparent; color:inherit; font:12px inherit; cursor:pointer; }
+.smallButton input { display:none; }
