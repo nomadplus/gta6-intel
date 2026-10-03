@@ -1,0 +1,39 @@
+
+
+// ---- BLACK_MONDAY_WEB automated VM smoke-test hook ----
+// CI uses ?selftest=1&noautoboot=1 to verify that the exact generated
+// Play.js/Play.wasm pair can instantiate and return from initVm() without
+// requiring the retail game or touching OPFS. Keep this outside normal launches.
+const __blackMondaySelfTestParams = new URLSearchParams(location.search);
+if (__blackMondaySelfTestParams.get('selftest') === '1') {
+  window.__blackMondaySelfTest = {
+    state: 'starting',
+    stage: 'scheduled',
+    startedAt: performance.now(),
+  };
+
+  setTimeout(async () => {
+    const report = window.__blackMondaySelfTest;
+    try {
+      report.stage = 'ensure-runtime';
+      await ensureRuntime();
+      report.state = 'passed';
+      report.stage = 'initVm-returned';
+      report.elapsedMs = performance.now() - report.startedAt;
+      report.nativePad = runtime.hasNativePadInjection?.() ?? false;
+      report.lifecycle = runtime.hasLifecycleControl?.() ?? false;
+      report.playThreadedRuntimeReady = probe.playThreadedRuntimeReady;
+      document.documentElement.dataset.blackMondayVmSelfTest = 'passed';
+      status.textContent = `AUTOMATED VM SELF-TEST PASS (${report.elapsedMs.toFixed(0)} ms)`;
+      console.info('[BLACK_MONDAY_WEB] VM self-test PASS', report);
+    } catch (error) {
+      report.state = 'failed';
+      report.stage = 'initVm-failed';
+      report.elapsedMs = performance.now() - report.startedAt;
+      report.error = String(error?.stack || error?.message || error);
+      document.documentElement.dataset.blackMondayVmSelfTest = 'failed';
+      status.textContent = `AUTOMATED VM SELF-TEST FAIL: ${error?.message || error}`;
+      console.error('[BLACK_MONDAY_WEB] VM self-test FAIL', error);
+    }
+  }, 0);
+}
