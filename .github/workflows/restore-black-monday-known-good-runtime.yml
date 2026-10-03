@@ -1,0 +1,98 @@
+name: Restore Black Monday Known-Good Runtime
+
+on:
+  push:
+    branches:
+      - black-monday-iphone-test
+    paths:
+      - '.github/workflows/restore-black-monday-known-good-runtime.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  restore-known-good:
+    runs-on: ubuntu-latest
+    env:
+      KNOWN_GOOD_COMMIT: 61fde43bf6a189912d3817addb39ee14a68d7dd5
+      PLAY_JS_SHA256: 52df30d603ebb0558671ffbe1661f0488b86fd2ff265381d7a52bfef908e6e4b
+      PLAY_WASM_SHA256: bee965d343124d248041ce73906eaa5829c4df9092fb608e890fc36754af3374
+      SITE_ROOT: public/black-monday
+      CACHE_TAG: kg-61fde43
+    steps:
+      - name: Checkout iPhone branch
+        uses: actions/checkout@v4
+        with:
+          ref: black-monday-iphone-test
+
+      - name: Restore exact known-good Play runtime
+        run: |
+          mkdir -p "$SITE_ROOT/runtime"
+          BASE="https://raw.githubusercontent.com/nomadplus/gta6-intel/$KNOWN_GOOD_COMMIT/public/black-monday/runtime"
+          curl -fL "$BASE/Play.js" -o "$SITE_ROOT/runtime/Play.js"
+          curl -fL "$BASE/Play.wasm" -o "$SITE_ROOT/runtime/Play.wasm"
+          echo "$PLAY_JS_SHA256  $SITE_ROOT/runtime/Play.js" | sha256sum -c -
+          echo "$PLAY_WASM_SHA256  $SITE_ROOT/runtime/Play.wasm" | sha256sum -c -
+
+      - name: Force Safari onto restored runtime
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          root = Path(os.environ['SITE_ROOT'])
+          tag = os.environ['CACHE_TAG']
+
+          app = root / 'app.bundle.js'
+          text = app.read_text()
+          old_runtime = "constructor({ runtimeUrl = './runtime/Play.js', canvasId = 'outputCanvas' } = {})"
+          new_runtime = f"constructor({{ runtimeUrl = './runtime/Play.js?v={tag}', canvasId = 'outputCanvas' }} = {{}})"
+          if old_runtime not in text:
+              raise SystemExit('PlayRuntimeAdapter runtime URL marker not found')
+          text = text.replace(old_runtime, new_runtime, 1)
+          old_locate = "locateFile: path => new URL(path, base).href,"
+          new_locate = f"locateFile: path => new URL(path, base).href + '?v={tag}',"
+          if old_locate not in text:
+              raise SystemExit('Play locateFile marker not found')
+          text = text.replace(old_locate, new_locate, 1)
+          app.write_text(text)
+
+          index = root / 'index.html'
+          html = index.read_text()
+          old_script = 'src="/black-monday/app.bundle.js"'
+          new_script = f'src="/black-monday/app.bundle.js?v={tag}"'
+          if old_script not in html:
+              raise SystemExit('app.bundle script marker not found')
+          index.write_text(html.replace(old_script, new_script, 1))
+
+          sw = root / 'sw.js'
+          sw_text = sw.read_text()
+          sw_text = sw_text.replace("black-monday-web-iphone-preview-v0.4.1", f"black-monday-web-iphone-preview-{tag}")
+          sw_text = sw_text.replace("black-monday-web-runtime-v0.4.1", f"black-monday-web-runtime-{tag}")
+          sw_text = sw_text.replace("const response = await fetch(request);", "const response = await fetch(request, { cache: 'no-store' });")
+          sw.write_text(sw_text)
+          PY
+          node --check "$SITE_ROOT/app.bundle.js"
+          node --check "$SITE_ROOT/sw.js"
+          grep -q "Play.js?v=$CACHE_TAG" "$SITE_ROOT/app.bundle.js"
+          grep -q "Play.wasm" "$SITE_ROOT/runtime/Play.js"
+          grep -q "app.bundle.js?v=$CACHE_TAG" "$SITE_ROOT/index.html"
+
+      - name: Record recovery build
+        run: |
+          cat > "$SITE_ROOT/RUNTIME_RECOVERY.txt" <<EOF
+          recovery=known-good
+          known_good_commit=$KNOWN_GOOD_COMMIT
+          play_js_sha256=$PLAY_JS_SHA256
+          play_wasm_sha256=$PLAY_WASM_SHA256
+          cache_tag=$CACHE_TAG
+          restored_utc=$(date -u +%FT%TZ)
+          EOF
+
+      - name: Commit recovery runtime
+        run: |
+          git config user.name 'black-monday-web-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add "$SITE_ROOT"
+          git commit -m 'Restore exact known-good Black Monday iPhone runtime [skip preview-build]'
+          git push origin HEAD:black-monday-iphone-test
