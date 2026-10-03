@@ -928,7 +928,7 @@ class PerformanceMonitor {
 
 
 class PlayRuntimeAdapter {
-  constructor({ runtimeUrl = './runtime/Play.js', canvasId = 'outputCanvas' } = {}) {
+  constructor({ runtimeUrl = './runtime/Play.js?v=kg-61fde43', canvasId = 'outputCanvas' } = {}) {
     this.runtimeUrl = runtimeUrl;
     this.canvasId = canvasId;
     this.module = null;
@@ -942,7 +942,7 @@ class PlayRuntimeAdapter {
     if (typeof Play !== 'function') throw new Error('Play.js did not export the expected Emscripten module factory.');
     const base = new URL('.', runtimeHref).href;
     this.module = await Play({
-      locateFile: path => new URL(path, base).href,
+      locateFile: path => new URL(path, base).href + '?v=kg-61fde43',
       mainScriptUrlOrBlob: runtimeHref,
       print: text => console.log(`[Play] ${text}`),
       printErr: text => console.error(`[Play] ${text}`),

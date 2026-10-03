@@ -1,5 +1,5 @@
-const CACHE = 'black-monday-web-iphone-preview-v0.4.1';
-const RUNTIME_CACHE = 'black-monday-web-runtime-v0.4.1';
+const CACHE = 'black-monday-web-iphone-preview-kg-61fde43';
+const RUNTIME_CACHE = 'black-monday-web-runtime-kg-61fde43';
 const SHELL = ['./', './index.html', './styles.css', './app.bundle.js', './manifest.webmanifest'];
 
 self.addEventListener('install', event => {
@@ -16,7 +16,7 @@ self.addEventListener('activate', event => {
 
 async function networkFirst(request, cacheName) {
   try {
-    const response = await fetch(request);
+    const response = await fetch(request, { cache: 'no-store' });
     if (response.ok) (await caches.open(cacheName)).put(request, response.clone());
     return response;
   } catch (error) {
