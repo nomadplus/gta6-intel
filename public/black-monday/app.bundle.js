@@ -1996,3 +1996,221 @@ beginStats = function blackMondayBeginStatsWithDynarecProfiler() {
     }
   }, 1000);
 };
+
+
+// ---- Black Monday r34: iPhone main-thread GS/WebGL path ----
+// r33 proved runtime WebAssembly block compilation is negligible at the slow
+// Sony intro (~5fps / ~200ms per frame). The next high-confidence suspect is the
+// browser renderer architecture: Play! creates WebGL on the browser runtime
+// thread but normally executes GS work on a pthread. r34 keeps the same emulator,
+// disc, touch controls and native GS scale while draining the GS mailbox on the
+// browser runtime thread on iPhone, avoiding worker -> main WebGL proxy traffic.
+
+blackMondayRuntimeAssetUrl = function blackMondayRuntimeAssetUrlR34(name) {
+  const url = new URL(`./runtime/${name}`, import.meta.url);
+  url.searchParams.set('bmcore', 'bmcore-20261003-r34');
+  return url.href;
+};
+
+let blackMondayGsPumpRafR34 = 0;
+const blackMondayGsPumpStatsR34 = {
+  calls: 0,
+  activeMs: 0,
+  maxPumpMs: 0,
+  activePumps: 0,
+};
+
+function blackMondayGsPumpTotalsR34() {
+  return { ...blackMondayGsPumpStatsR34 };
+}
+
+function blackMondayGsPumpDeltaR34(current, previous, seconds) {
+  const elapsed = Math.max(0.001, seconds);
+  return {
+    callsPerSecond: Math.max(0, current.calls - previous.calls) / elapsed,
+    activeMsPerSecond: Math.max(0, current.activeMs - previous.activeMs) / elapsed,
+    activePumpsPerSecond: Math.max(0, current.activePumps - previous.activePumps) / elapsed,
+    maxPumpMs: current.maxPumpMs,
+  };
+}
+
+function startBlackMondayMainThreadGsPumpR34(adapter) {
+  if (blackMondayGsPumpRafR34) cancelAnimationFrame(blackMondayGsPumpRafR34);
+
+  const step = () => {
+    if (!adapter?.module || adapter.blackMondayGsMode !== 'main') {
+      blackMondayGsPumpRafR34 = 0;
+      return;
+    }
+
+    const started = performance.now();
+    let calls = 0;
+    let batches = 0;
+
+    // Give the GS a substantial slice of each display frame, but yield before it
+    // can monopolise Safari's UI thread. Each native call drains up to 64 queued
+    // GS mailbox jobs; most jobs batch many PS2 register writes internally.
+    while ((performance.now() - started) < 12 && batches < 32) {
+      const processed = Number(adapter.module.pumpBlackMondayGs?.(64) ?? 0);
+      if (!Number.isFinite(processed) || processed <= 0) break;
+      calls += processed;
+      batches += 1;
+      if (processed < 64) break;
+    }
+
+    const elapsed = performance.now() - started;
+    if (calls > 0) {
+      blackMondayGsPumpStatsR34.calls += calls;
+      blackMondayGsPumpStatsR34.activeMs += elapsed;
+      blackMondayGsPumpStatsR34.activePumps += 1;
+      blackMondayGsPumpStatsR34.maxPumpMs = Math.max(blackMondayGsPumpStatsR34.maxPumpMs, elapsed);
+    }
+
+    blackMondayGsPumpRafR34 = requestAnimationFrame(step);
+  };
+
+  blackMondayGsPumpRafR34 = requestAnimationFrame(step);
+}
+
+runtime.init = async function blackMondayRuntimeInitR34MainThreadGs() {
+  if (this.module) return this;
+
+  const playJsUrl = blackMondayRuntimeAssetUrl('Play.js');
+  const playWasmUrl = blackMondayRuntimeAssetUrl('Play.wasm');
+  const params = new URLSearchParams(location.search);
+  const isIphone = /iPhone|iPod/i.test(navigator.userAgent || '');
+  // Default to the new architecture only on iPhone. &gsworker=1 is an immediate
+  // fallback/A-B switch that keeps the old r33 GS pthread behaviour.
+  this.blackMondayGsMode = (isIphone && params.get('gsworker') !== '1') ? 'main' : 'worker';
+
+  status.textContent = 'Runtime 1/6: fetching Play.js…';
+  diagnostics.record('runtime.stage', { stage: 'fetch-play-js', build: 'bmcore-20261003-r34', gsMode: this.blackMondayGsMode });
+  const jsResponse = await blackMondayFetchRuntimeAsset(playJsUrl, 'js');
+  const jsSource = await jsResponse.text();
+  if (!jsSource.includes('export default Play')) throw new Error('Fetched Play.js did not contain the expected ES-module export.');
+
+  status.textContent = 'Runtime 2/6: loading Play module…';
+  diagnostics.record('runtime.stage', { stage: 'import-play-blob', jsBytes: jsSource.length });
+  const blobUrl = URL.createObjectURL(new Blob([jsSource], { type: 'text/javascript' }));
+  this.runtimeBlobUrl = blobUrl;
+  let imported;
+  try {
+    imported = await import(blobUrl);
+  } catch (error) {
+    throw new Error(`Local Play module import failed: ${error?.message || error}`);
+  }
+  const Play = imported?.default;
+  if (typeof Play !== 'function') throw new Error('Local Play module did not export the expected Emscripten factory.');
+
+  status.textContent = 'Runtime 3/6: fetching matching Play.wasm…';
+  diagnostics.record('runtime.stage', { stage: 'fetch-play-wasm' });
+  const wasmResponse = await blackMondayFetchRuntimeAsset(playWasmUrl, 'wasm');
+  const wasmBytes = new Uint8Array(await wasmResponse.arrayBuffer());
+  if (wasmBytes.byteLength < 1000000) throw new Error(`Play.wasm is unexpectedly small (${wasmBytes.byteLength} bytes).`);
+
+  status.textContent = 'Runtime 4/6: instantiating Play! WebAssembly…';
+  diagnostics.record('runtime.stage', { stage: 'instantiate-play', wasmBytes: wasmBytes.byteLength });
+  const runtimeBase = new URL('./runtime/', import.meta.url).href;
+  this.module = await Play({
+    wasmBinary: wasmBytes,
+    locateFile: path => path === 'Play.wasm' ? playWasmUrl : new URL(path, runtimeBase).href,
+    mainScriptUrlOrBlob: blobUrl,
+    print: text => console.log(`[Play] ${text}`),
+    printErr: text => console.error(`[Play] ${text}`),
+  });
+
+  status.textContent = `Runtime 5/6: creating PS2 VM (GS=${this.blackMondayGsMode})…`;
+  if (typeof this.module.setBlackMondayGsOnMainThread !== 'function' || typeof this.module.pumpBlackMondayGs !== 'function') {
+    throw new Error('r34 GS bridge is missing from the Play! runtime.');
+  }
+  this.module.setBlackMondayGsOnMainThread(this.blackMondayGsMode === 'main');
+
+  try { this.module.FS.mkdir('/work'); } catch (e) { if (!String(e).includes('File exists')) throw e; }
+  await mountPersistentVfs(this.module);
+  this.module.discImageDevice = new DiscImageDevice(this.module);
+  installBlackMondayDiscReadAhead(this.module.discImageDevice);
+  this.module.ccall('initVm', '', [], []);
+
+  status.textContent = 'Runtime 6/6: starting renderer scheduler…';
+  if (this.blackMondayGsMode === 'main') {
+    // Process queued GS InitializeImpl immediately on the browser runtime thread,
+    // before booting the disc. This makes the existing WebGL context current on
+    // the same thread that will execute every renderer command.
+    this.module.pumpBlackMondayGs(64);
+    startBlackMondayMainThreadGsPumpR34(this);
+  }
+
+  diagnostics.record('runtime.stage', { stage: 'ready', build: 'bmcore-20261003-r34', gsMode: this.blackMondayGsMode });
+  return this;
+};
+
+// Keep the r33 JIT counters in diagnostics, but make the visible HUD shorter so
+// the new GS scheduler measurements fit on an iPhone screenshot.
+beginStats = function blackMondayBeginStatsR34GsScheduler() {
+  clearInterval(statsTimer);
+  runtime.clearStats();
+  performanceMonitor.reset(runtime.getFrames());
+  let diagnosticSampleCounter = 0;
+  let previousCodegen = blackMondayWasmCodegenTotals();
+  let previousPump = blackMondayGsPumpTotalsR34();
+
+  statsTimer = window.setInterval(() => {
+    const sample = performanceMonitor.sample(runtime.getFrames());
+    const frameTime = sample.frameTimeMs == null ? '--' : sample.frameTimeMs.toFixed(1);
+    const io = runtime.module?.discImageDevice?.getBlackMondayIoStats?.() ?? null;
+    const core = blackMondayCoreStats(sample);
+    const codegen = blackMondayWasmCodegenTotals();
+    const cg = blackMondayDeltaCodegen(codegen, previousCodegen, sample.deltaMs / 1000);
+    previousCodegen = codegen;
+    const pump = blackMondayGsPumpTotalsR34();
+    const gp = blackMondayGsPumpDeltaR34(pump, previousPump, sample.deltaMs / 1000);
+    previousPump = pump;
+
+    const ioText = io
+      ? ` jsio=${io.reads} hit=${(io.hitRate * 100).toFixed(0)}% fetch=${io.avgFetchMs.toFixed(1)}ms`
+      : '';
+    const coreText = [
+      core.eeUsage == null ? null : `ee=${core.eeUsage.toFixed(0)}%`,
+      core.iopUsage == null ? null : `iop=${core.iopUsage.toFixed(0)}%`,
+      core.drawCallsPerFrame == null ? null : `dc=${core.drawCallsPerFrame.toFixed(0)}`,
+    ].filter(Boolean).join(' ');
+    const jitWallMs = cg.moduleMsPerSecond + cg.instanceMsPerSecond;
+    const gsMode = runtime.blackMondayGsMode || 'worker';
+    const pumpText = gsMode === 'main'
+      ? ` gsm=main gp=${gp.callsPerSecond.toFixed(0)}/s/${gp.activeMsPerSecond.toFixed(0)}ms max=${gp.maxPumpMs.toFixed(1)}ms`
+      : ' gsm=worker';
+
+    hudStatus.textContent = `frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${coreText ? ` ${coreText}` : ''} jit=${jitWallMs.toFixed(0)}ms/s${pumpText}`;
+
+    if ((++diagnosticSampleCounter % 5) === 0) {
+      diagnostics.record('performance.sample', {
+        ...sample,
+        discIo: io,
+        core,
+        codegen,
+        codegenRate: cg,
+        gsMode,
+        gsPump: pump,
+        gsPumpRate: gp,
+      });
+    }
+    if ((diagnosticSampleCounter % 30) === 0) {
+      diagnostics.persist({
+        extra: {
+          phase: 'running',
+          fps: sample.fps,
+          frameTimeMs: sample.frameTimeMs,
+          performanceProfile: activePerformanceProfile,
+          gsScale: activeGsScale,
+          discIo: io,
+          core,
+          codegen,
+          codegenRate: cg,
+          gsMode,
+          gsPump: pump,
+          gsPumpRate: gp,
+        },
+      });
+    }
+  }, 1000);
+};
