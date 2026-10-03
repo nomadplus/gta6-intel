@@ -132,13 +132,15 @@ runtime.init = async function blackMondayRuntimeInitWithReadAhead() {
 
 function blackMondayCoreStats(sample) {
   const module = runtime.module;
-  const ee = Number(module?.getEeUsagePercent?.());
-  const iop = Number(module?.getIopUsagePercent?.());
+  // These low-overhead hooks already exist in the base Black Monday core patch.
+  // Ratios are returned as 0..1, so convert to percentages for the HUD.
+  const eeRatio = Number(module?.getEeUsageRatio?.());
+  const iopRatio = Number(module?.getIopUsageRatio?.());
   const drawCalls = Number(module?.getDrawCalls?.());
   const frames = Math.max(0, Number(sample?.frames ?? 0));
   return {
-    eeUsage: Number.isFinite(ee) ? ee : null,
-    iopUsage: Number.isFinite(iop) ? iop : null,
+    eeUsage: Number.isFinite(eeRatio) && eeRatio >= 0 ? eeRatio * 100 : null,
+    iopUsage: Number.isFinite(iopRatio) && iopRatio >= 0 ? iopRatio * 100 : null,
     drawCalls: Number.isFinite(drawCalls) ? drawCalls : null,
     drawCallsPerFrame: Number.isFinite(drawCalls) && frames > 0 ? drawCalls / frames : null,
   };
