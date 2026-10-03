@@ -1775,9 +1775,9 @@ runtime.setPerformanceProfile = function blackMondaySetPerformanceProfile(id = '
 // import Play.js from a same-origin Blob module, and hand the matching WASM bytes
 // directly to Emscripten. Pthread workers then load the same Blob module, so the
 // JS and WASM pair cannot be mixed across deployments or HTTP caches.
-const BLACK_MONDAY_RUNTIME_BUILD = 'bmcore-20261003-r31';
+const BLACK_MONDAY_RUNTIME_BUILD = 'bmcore-20261003-r32';
 function blackMondayRuntimeAssetUrl(name) {
-  const url = new URL(`./runtime/${name}`, globalThis.location?.href ?? import.meta.url);
+  const url = new URL(`./runtime/${name}`, import.meta.url);
   url.searchParams.set('bmcore', BLACK_MONDAY_RUNTIME_BUILD);
   return url.href;
 }
@@ -1831,7 +1831,7 @@ runtime.init = async function blackMondayRuntimeInitAuthenticatedBlob() {
 
   status.textContent = 'Runtime 4/5: instantiating Play! WebAssembly…';
   diagnostics.record('runtime.stage', { stage: 'instantiate-play', wasmBytes: wasmBytes.byteLength });
-  const runtimeBase = new URL('./runtime/', globalThis.location?.href ?? import.meta.url).href;
+  const runtimeBase = new URL('./runtime/', import.meta.url).href;
   this.module = await Play({
     wasmBinary: wasmBytes,
     locateFile: path => path === 'Play.wasm' ? playWasmUrl : new URL(path, runtimeBase).href,
