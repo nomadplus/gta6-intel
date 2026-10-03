@@ -1,0 +1,40 @@
+name: Black Monday Retail Contract
+
+on:
+  push:
+    branches: [black-monday-native-web]
+    paths:
+      - 'black-monday-native/**'
+      - '.github/workflows/black-monday-retail-contract.yml'
+  workflow_dispatch:
+
+jobs:
+  verify-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate retail source contract
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const p = 'black-monday-native/retail-source-contract.json';
+          const x = JSON.parse(fs.readFileSync(p, 'utf8'));
+          const fail = m => { throw new Error(m); };
+          x.schemaVersion === 1 || fail('unexpected schemaVersion');
+          x.source.parts === 12 || fail('expected 12 archive parts');
+          x.source.totalBytes === 2511062800 || fail('unexpected archive byte total');
+          x.facts.worldTiles.range === '1.big..528.big' || fail('world tile range changed');
+          x.facts.groups.bytes === 122770 || fail('groups.dat size changed');
+          x.facts.mission1.script === 'missions/315.bin' || fail('Mission 1 script changed');
+          x.facts.mission1.logicPairs === 183 || fail('Mission 1 pair count changed');
+          const forbidden = JSON.stringify(x).includes('315.big is Mission');
+          if (forbidden) fail('mission/tile identity regression');
+          console.log('Retail source contract OK');
+          NODE
+      - name: Guard native runtime from retail payload commits
+        run: |
+          if find public/black-monday-native black-monday-native -type f \( -name '*.big' -o -name '*.teg' -o -name '*.bin' -o -name '*.7z*' \) | grep -q .; then
+            echo 'Retail payload accidentally committed to native branch'
+            exit 1
+          fi
+          echo 'No retail payload committed'
