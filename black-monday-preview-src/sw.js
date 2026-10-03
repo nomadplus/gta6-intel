@@ -1,5 +1,5 @@
-const CACHE = 'black-monday-web-iphone-preview-v0.4.2';
-const RUNTIME_CACHE = 'black-monday-web-runtime-v0.4.2';
+const CACHE = 'black-monday-web-iphone-preview-v0.4.3';
+const RUNTIME_CACHE = 'black-monday-web-runtime-v0.4.3';
 const SHELL = ['./', './index.html', './styles.css', './app.bundle.js', './manifest.webmanifest'];
 
 self.addEventListener('install', event => {
