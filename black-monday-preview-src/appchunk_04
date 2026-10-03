@@ -1,0 +1,182 @@
+if (!status.opfs) throw new Error('Origin Private File System is unavailable.');
+  if (status.quota > 0) {
+    const available = Math.max(0, status.quota - status.usage);
+    if (available < requiredBytes + reserveBytes) {
+      throw new Error(`Not enough browser storage: ${(available / 1073741824).toFixed(2)} GiB available; ${(requiredBytes / 1073741824).toFixed(2)} GiB game image plus reserve required.`);
+    }
+  }
+  return status;
+}
+
+async function importDiscFile(file, { onProgress = () => {}, directory = DEFAULT_DIR } = {}) {
+  if (!file?.slice || !Number.isFinite(file.size)) throw new Error('A File/Blob-compatible disc image is required.');
+  await ensureSpace(file.size);
+  await requestPersistentStorage().catch(() => false);
+  const dir = await discDirectory(directory);
+  const target = await dir.getFileHandle(file.name, { create: true });
+  const writer = await target.createWritable();
+  let written = 0;
+  try {
+    while (written < file.size) {
+      const end = Math.min(written + IMPORT_CHUNK_BYTES, file.size);
+      await writer.write(file.slice(written, end));
+      written = end;
+      onProgress(written, file.size);
+    }
+    await writer.close();
+  } catch (error) {
+    try { await writer.abort?.(); } catch { /* ignore abort cleanup */ }
+    throw error;
+  }
+  return { name: file.name, size: file.size };
+}
+
+async function listInstalledDiscs({ directory = DEFAULT_DIR } = {}) {
+  if (!opfsAvailable()) return [];
+  const dir = await discDirectory(directory);
+  const result = [];
+  for await (const [name, handle] of dir.entries()) {
+    if (handle.kind !== 'file') continue;
+    try {
+      const file = await handle.getFile();
+      result.push({ name, size: file.size, lastModified: file.lastModified ?? 0 });
+    } catch {
+      result.push({ name, size: 0, lastModified: 0 });
+    }
+  }
+  return result.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function loadInstalledDisc(name, { directory = DEFAULT_DIR } = {}) {
+  const dir = await discDirectory(directory);
+  const handle = await dir.getFileHandle(name);
+  return handle.getFile();
+}
+
+async function removeInstalledDisc(name, { directory = DEFAULT_DIR } = {}) {
+  const dir = await discDirectory(directory);
+  await dir.removeEntry(name);
+}
+
+
+// ---- runtime/AudioUnlock.js ----
+let context = null;
+let unlocked = false;
+
+function audioContextCtor() {
+  return globalThis.AudioContext || globalThis.webkitAudioContext || null;
+}
+
+function audioUnlockSupported() {
+  return Boolean(audioContextCtor());
+}
+
+function isAudioUnlocked() {
+  return unlocked;
+}
+
+async function unlockAudio() {
+  const Ctor = audioContextCtor();
+  if (!Ctor) return { supported: false, unlocked: false, state: 'unsupported' };
+  if (!context) context = new Ctor();
+  try {
+    if (context.state === 'suspended' && typeof context.resume === 'function') await context.resume();
+    // Safari can leave a context suspended unless audio is actually touched from a gesture.
+    if (typeof context.createBuffer === 'function' && typeof context.createBufferSource === 'function') {
+      const buffer = context.createBuffer(1, 1, Math.max(8000, context.sampleRate || 44100));
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      if (context.destination && typeof source.connect === 'function') source.connect(context.destination);
+      if (typeof source.start === 'function') source.start(0);
+    }
+    unlocked = context.state !== 'suspended';
+    return { supported: true, unlocked, state: context.state };
+  } catch (error) {
+    return { supported: true, unlocked: false, state: context?.state ?? 'error', error };
+  }
+}
+
+function installFirstGestureAudioUnlock(target = document) {
+  const handler = () => { unlockAudio().catch(() => {}); };
+  target.addEventListener('pointerdown', handler, { once: true, capture: true, passive: true });
+  target.addEventListener('touchstart', handler, { once: true, capture: true, passive: true });
+  target.addEventListener('keydown', handler, { once: true, capture: true });
+  return handler;
+}
+
+
+// ---- runtime/RuntimeDiagnostics.js ----
+class RuntimeDiagnostics {
+  constructor({ limit = 1000 } = {}) {
+    this.limit = limit;
+    this.events = [];
+    this.startedAt = new Date().toISOString();
+    this.bound = false;
+  }
+  record(type, detail = {}) {
+    const event = { t: Math.round(performance.now()), type, detail };
+    this.events.push(event);
+    if (this.events.length > this.limit) this.events.splice(0, this.events.length - this.limit);
+    return event;
+  }
+  bindWindow(target = window) {
+    if (this.bound) return;
+    this.bound = true;
+    target.addEventListener('error', event => this.record('window.error', { message: event.message, filename: event.filename, line: event.lineno, column: event.colno }));
+    target.addEventListener('unhandledrejection', event => this.record('window.unhandledrejection', { reason: String(event.reason?.stack || event.reason) }));
+  }
+  sampleRuntime(runtime) {
+    const frames = runtime?.getFrames?.() ?? 0;
+    const heap = performance?.memory ? { used: performance.memory.usedJSHeapSize, total: performance.memory.totalJSHeapSize, limit: performance.memory.jsHeapSizeLimit } : null;
+    return this.record('runtime.sample', { frames, heap });
+  }
+  snapshot(extra = {}) {
+    return { schema: 1, startedAt: this.startedAt, capturedAt: new Date().toISOString(), userAgent: globalThis.navigator?.userAgent ?? null, ...extra, events: [...this.events] };
+  }
+  persist({ storage = globalThis.localStorage, key = 'black-monday-web:last-diagnostics', extra = {} } = {}) {
+    if (!storage?.setItem) return false;
+    try { storage.setItem(key, JSON.stringify(this.snapshot(extra))); return true; }
+    catch { return false; }
+  }
+  static loadPersisted({ storage = globalThis.localStorage, key = 'black-monday-web:last-diagnostics' } = {}) {
+    if (!storage?.getItem) return null;
+    try { const raw = storage.getItem(key); return raw ? JSON.parse(raw) : null; }
+    catch { return null; }
+  }
+}
+
+
+// ---- runtime/PerformanceMonitor.js ----
+class PerformanceMonitor {
+  constructor({ now = () => performance.now() } = {}) {
+    this.now = now;
+    this.reset(0);
+  }
+  reset(frames = 0) {
+    this.lastFrames = frames;
+    this.lastTime = this.now();
+  }
+  sample(frames) {
+    const t = this.now();
+    const deltaMs = Math.max(0.001, t - this.lastTime);
+    const deltaFrames = Math.max(0, frames - this.lastFrames);
+    const fps = deltaFrames * 1000 / deltaMs;
+    const frameTimeMs = deltaFrames > 0 ? deltaMs / deltaFrames : null;
+    this.lastFrames = frames;
+    this.lastTime = t;
+    const memory = performance?.memory ? {
+      usedJSHeapMiB: performance.memory.usedJSHeapSize / 1048576,
+      totalJSHeapMiB: performance.memory.totalJSHeapSize / 1048576,
+      heapLimitMiB: performance.memory.jsHeapSizeLimit / 1048576,
+    } : null;
+    return { t, frames, deltaFrames, deltaMs, fps, frameTimeMs, memory };
+  }
+}
+
+
+// ---- runtime/PlayRuntimeAdapter.js ----
+
+
+
+
+class PlayRun
