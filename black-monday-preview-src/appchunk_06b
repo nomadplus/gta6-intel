@@ -1,0 +1,87 @@
+et runtimeReady = false;
+let statsTimer = 0;
+let inputRouter = null;
+let installedDiscName = null;
+let orientationAttempted = false;
+
+const probe = await probeSystem();
+diagnostics.record('system.probe', probe);
+diagnostics.persist({ extra: { phase: 'shell' } });
+probeEl.textContent = Object.entries(probe).map(([k,v]) => `${k}: ${v}`).join('\n');
+if (!probe.playThreadedRuntimeReady) {
+  status.textContent = `Play! WebAssembly runtime prerequisites missing: ${probe.missingRuntimeFeatures.join(', ')}.`;
+  discInput.disabled = true;
+} else {
+  status.textContent = 'Browser runtime ready. Select your original Black Monday ISO from Files.';
+}
+
+const touch = new TouchController({
+  canvas,
+  leftStick: $('leftStick'),
+  lookZone: $('lookZone'),
+  buttons: $('buttons'),
+  pauseButton: $('pauseButton'),
+  onActivity: () => {
+    inputRouter?.claim('touch');
+    inputStatus.textContent = 'TOUCH';
+  },
+});
+touch.mount();
+
+const gamepad = new GamepadController({
+  canvas,
+  onActivity: info => {
+    inputRouter?.claim('gamepad');
+    inputStatus.textContent = `GAMEPAD ${info.index + 1}`;
+  },
+});
+gamepad.start();
+
+function attachNativeInputIfAvailable() {
+  if (!runtime.hasNativePadInjection()) return false;
+  inputRouter = new PadInputRouter({
+    setValue: (button, value) => runtime.setPadValue(button, value),
+    clearValue: button => runtime.clearPadValue(button),
+    clearAll: () => runtime.clearPadValues(),
+    initialSource: 'keyboard',
+  });
+  touch.attachNativePadSink(inputRouter.sinkFor('touch'));
+  gamepad.attachNativePadSink(inputRouter.sinkFor('gamepad'));
+  inputStatus.textContent = 'TOUCH + GAMEPAD + KEYBOARD / NATIVE PAD';
+  return true;
+}
+
+async function ensureRuntime() {
+  if (runtimeReady) return;
+  status.textContent = 'Initialising Play! WebAssembly runtime…';
+  const started = performance.now();
+  await requestPersistentStorage().catch(() => false);
+  await runtime.init();
+  runtimeReady = true;
+  diagnostics.record('runtime.initialized', { elapsedMs: performance.now() - started, nativePad: runtime.hasNativePadInjection(), lifecycle: runtime.hasLifecycleControl() });
+  diagnostics.persist({ extra: { phase: 'runtime-ready' } });
+  const nativeInput = attachNativeInputIfAvailable();
+  status.textContent = nativeInput
+    ? 'Runtime ready with native analogue injection. Select the original Black Monday disc image.'
+    : 'Runtime ready in compatibility-input mode. Select the original Black Monday disc image.';
+}
+
+function beginStats() {
+  clearInterval(statsTimer);
+  runtime.clearStats();
+  performanceMonitor.reset(runtime.getFrames());
+  let diagnosticSampleCounter = 0;
+  statsTimer = window.setInterval(() => {
+    const sample = performanceMonitor.sample(runtime.getFrames());
+    const frameTime = sample.frameTimeMs == null ? '--' : sample.frameTimeMs.toFixed(1);
+    const memory = sample.memory ? ` heap=${sample.memory.usedJSHeapMiB.toFixed(0)}MiB` : '';
+    hudStatus.textContent = `frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms${memory}`;
+    diagnostics.record('performance.sample', sample);
+    if ((++diagnosticSampleCounter % 5) === 0) diagnostics.persist({ extra: { phase: 'running', fps: sample.fps, frameTimeMs: sample.frameTimeMs } });
+  }, 1000);
+}
+
+async function bootBlackMondayFile(file, { install = false } = {}) {
+  // Keep these before any long async work: iOS Safari requires media/orientation requests
+  // to originate from a user gesture. PWA manifest orientation remains the fallback.
+  const a
