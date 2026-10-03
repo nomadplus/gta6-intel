@@ -2105,3 +2105,114 @@ beginStats = function blackMondayBeginStatsR35SubsystemWall() {
     }
   }, 1000);
 };
+
+
+// ---- Black Monday r36: GS renderer breakdown profiler ----
+// r35 localized the performance collapse to the GS worker / GS synchronization
+// path. r36 keeps rendering behaviour unchanged and breaks that worker cost into
+// draw/flush, texture preparation, VRAM transfer, flip/present and shader work.
+blackMondayRuntimeAssetUrl = function blackMondayRuntimeAssetUrlR36(name) {
+  const url = new URL(`./runtime/${name}`, import.meta.url);
+  url.searchParams.set('bmcore', 'bmcore-20261003-r36');
+  return url.href;
+};
+
+function blackMondayGsBreakdownTotalsR36() {
+  const module = runtime.module;
+  const value = name => {
+    const result = Number(module?.[name]?.());
+    return Number.isFinite(result) && result >= 0 ? result : 0;
+  };
+  return {
+    drawMs: value('getBlackMondayGsDrawMs'),
+    textureMs: value('getBlackMondayGsTextureMs'),
+    transferMs: value('getBlackMondayGsTransferMs'),
+    flipMs: value('getBlackMondayGsFlipMs'),
+    shaderMs: value('getBlackMondayGsShaderMs'),
+  };
+}
+
+function blackMondayGsBreakdownDeltaR36(current, previous, seconds) {
+  const elapsed = Math.max(0.001, seconds);
+  const rate = key => Math.max(0, current[key] - previous[key]) / elapsed;
+  return {
+    drawMsPerSecond: rate('drawMs'),
+    textureMsPerSecond: rate('textureMs'),
+    transferMsPerSecond: rate('transferMs'),
+    flipMsPerSecond: rate('flipMs'),
+    shaderMsPerSecond: rate('shaderMs'),
+  };
+}
+
+beginStats = function blackMondayBeginStatsR36GsBreakdown() {
+  clearInterval(statsTimer);
+  runtime.clearStats();
+  performanceMonitor.reset(runtime.getFrames());
+  let diagnosticSampleCounter = 0;
+  let previousCodegen = blackMondayWasmCodegenTotals();
+  let previousHost = blackMondayHostWallTotalsR35();
+  let previousGs = blackMondayGsBreakdownTotalsR36();
+
+  statsTimer = window.setInterval(() => {
+    const sample = performanceMonitor.sample(runtime.getFrames());
+    const seconds = sample.deltaMs / 1000;
+    const frameTime = sample.frameTimeMs == null ? '--' : sample.frameTimeMs.toFixed(1);
+    const io = runtime.module?.discImageDevice?.getBlackMondayIoStats?.() ?? null;
+    const core = blackMondayCoreStats(sample);
+    const codegen = blackMondayWasmCodegenTotals();
+    const cg = blackMondayDeltaCodegen(codegen, previousCodegen, seconds);
+    previousCodegen = codegen;
+    const host = blackMondayHostWallTotalsR35();
+    const hw = blackMondayHostWallDeltaR35(host, previousHost, seconds);
+    previousHost = host;
+    const gs = blackMondayGsBreakdownTotalsR36();
+    const gb = blackMondayGsBreakdownDeltaR36(gs, previousGs, seconds);
+    previousGs = gs;
+
+    const ioText = io ? ` io=${(io.hitRate * 100).toFixed(0)}%/${io.avgFetchMs.toFixed(1)}ms` : '';
+    const coreText = [
+      core.eeUsage == null ? null : `ee=${core.eeUsage.toFixed(0)}%`,
+      core.iopUsage == null ? null : `iop=${core.iopUsage.toFixed(0)}%`,
+      core.drawCallsPerFrame == null ? null : `dc=${core.drawCallsPerFrame.toFixed(0)}`,
+    ].filter(Boolean).join(' ');
+    const jitWallMs = cg.moduleMsPerSecond + cg.instanceMsPerSecond;
+
+    hudStatus.textContent =
+      `r36 frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${coreText ? ` ${coreText}` : ''} jit=${jitWallMs.toFixed(0)}ms/s hEE=${hw.eeMsPerSecond.toFixed(0)} hIOP=${hw.iopMsPerSecond.toFixed(0)} gsw=${hw.gsWorkerMsPerSecond.toFixed(0)} sync=${hw.gsSyncMsPerSecond.toFixed(0)}\n` +
+      `draw=${gb.drawMsPerSecond.toFixed(0)} tex=${gb.textureMsPerSecond.toFixed(0)} xfer=${gb.transferMsPerSecond.toFixed(0)} flip=${gb.flipMsPerSecond.toFixed(0)} shader=${gb.shaderMsPerSecond.toFixed(0)} lim=${hw.limiterMsPerSecond.toFixed(0)} spu=${hw.spuMsPerSecond.toFixed(0)}ms/s`;
+
+    if ((++diagnosticSampleCounter % 5) === 0) {
+      diagnostics.record('performance.sample', {
+        ...sample,
+        discIo: io,
+        core,
+        codegen,
+        codegenRate: cg,
+        hostWall: host,
+        hostWallRate: hw,
+        gsBreakdown: gs,
+        gsBreakdownRate: gb,
+      });
+    }
+    if ((diagnosticSampleCounter % 30) === 0) {
+      diagnostics.persist({
+        extra: {
+          phase: 'running',
+          build: 'bmcore-20261003-r36',
+          fps: sample.fps,
+          frameTimeMs: sample.frameTimeMs,
+          performanceProfile: activePerformanceProfile,
+          gsScale: activeGsScale,
+          discIo: io,
+          core,
+          codegen,
+          codegenRate: cg,
+          hostWall: host,
+          hostWallRate: hw,
+          gsBreakdown: gs,
+          gsBreakdownRate: gb,
+        },
+      });
+    }
+  }, 1000);
+};
