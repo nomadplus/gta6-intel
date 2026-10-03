@@ -1,0 +1,196 @@
+const data = fromBase64(entry.data);
+    module.FS.writeFile(`${dir}/${name}`, data);
+    bytesWritten += data.length;
+  }
+  return { filesWritten: backup.files.length, bytesWritten };
+}
+
+const SAVE_BACKUP_FORMAT = Object.freeze({ format: FORMAT, version: VERSION });
+
+
+// ---- runtime/PadInputRouter.js ----
+// Arbitrates direct PS2 pad overrides between touch and browser Gamepad input.
+// Keyboard remains handled by Play!'s upstream bindings; claiming keyboard clears
+// every direct override so the upstream keyboard state becomes authoritative again.
+class PadInputRouter {
+  constructor({ setValue, clearValue, clearAll, initialSource = 'keyboard', onSourceChange = () => {} }) {
+    this.setValue = setValue;
+    this.clearValue = clearValue;
+    this.clearAll = clearAll;
+    this.activeSource = initialSource;
+    this.onSourceChange = onSourceChange;
+  }
+
+  claim(source) {
+    if (!source || source === this.activeSource) return;
+    this.clearAll?.();
+    this.activeSource = source;
+    this.onSourceChange(source);
+  }
+
+  sinkFor(source) {
+    return {
+      setValue: (button, value) => {
+        if (this.activeSource === source) this.setValue?.(button, value);
+      },
+      clearValue: button => {
+        if (this.activeSource === source) this.clearValue?.(button);
+      },
+      clearAll: () => {
+        if (this.activeSource === source) this.clearAll?.();
+      },
+    };
+  }
+}
+
+
+// ---- runtime/BlackMondayDisc.js ----
+const SECTOR = 2048;
+const PVD_SECTOR = 16;
+const EXPECTED_VOLUME_ID = 'TGBM';
+const EXPECTED_EXECUTABLE = 'SCES_527.58';
+const EXPECTED_ISO_SIZE = 4211343360;
+
+function ascii(bytes, start, length) {
+  return new TextDecoder('ascii').decode(bytes.subarray(start, start + length)).replace(/\0/g, '').trim();
+}
+
+function u32le(bytes, offset) {
+  return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+}
+
+async function readBlob(blob, offset, size) {
+  const chunk = blob.slice(offset, offset + size);
+  return new Uint8Array(await chunk.arrayBuffer());
+}
+
+function normalizeIsoName(name) {
+  return name.replace(/;\d+$/, '').toUpperCase();
+}
+
+function parseDirectory(bytes) {
+  const entries = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    const length = bytes[offset];
+    if (length === 0) {
+      offset = Math.ceil((offset + 1) / SECTOR) * SECTOR;
+      continue;
+    }
+    if (offset + length > bytes.length || length < 34) break;
+    const extent = u32le(bytes, offset + 2);
+    const size = u32le(bytes, offset + 10);
+    const flags = bytes[offset + 25];
+    const nameLength = bytes[offset + 32];
+    const rawName = new TextDecoder('ascii').decode(bytes.subarray(offset + 33, offset + 33 + nameLength));
+    if (rawName !== '\x00' && rawName !== '\x01') {
+      entries.push({ name: normalizeIsoName(rawName), rawName, extent, size, directory: Boolean(flags & 0x02) });
+    }
+    offset += length;
+  }
+  return entries;
+}
+
+async function inspectBlackMondayDisc(file) {
+  if (!file?.slice || !Number.isFinite(file.size)) throw new Error('A File/Blob-compatible disc image is required.');
+  if (file.size < (PVD_SECTOR + 1) * SECTOR) throw new Error('Disc image is too small to contain an ISO9660 volume descriptor.');
+
+  const pvd = await readBlob(file, PVD_SECTOR * SECTOR, SECTOR);
+  const descriptorType = pvd[0];
+  const standardId = ascii(pvd, 1, 5);
+  if (descriptorType !== 1 || standardId !== 'CD001') throw new Error('Selected image is not a supported ISO9660 PS2 disc image.');
+
+  const volumeId = ascii(pvd, 40, 32);
+  const rootRecordLength = pvd[156];
+  if (rootRecordLength < 34) throw new Error('ISO9660 root directory record is invalid.');
+  const rootExtent = u32le(pvd, 158);
+  const rootSize = u32le(pvd, 166);
+  if (!rootExtent || !rootSize || rootSize > 16 * 1024 * 1024) throw new Error('ISO9660 root directory bounds are invalid.');
+
+  const root = await readBlob(file, rootExtent * SECTOR, rootSize);
+  const entries = parseDirectory(root);
+  const system = entries.find(entry => entry.name === 'SYSTEM.CNF');
+  const executable = entries.find(entry => entry.name === EXPECTED_EXECUTABLE);
+
+  let systemCnf = '';
+  if (system && !system.directory) {
+    const bytes = await readBlob(file, system.extent * SECTOR, Math.min(system.size, 4096));
+    systemCnf = new TextDecoder('ascii').decode(bytes).replace(/\0+$/g, '').trim();
+  }
+  const bootMatches = /BOOT2\s*=\s*cdrom0:\\SCES_527\.58;1/i.test(systemCnf);
+  const exactSize = file.size === EXPECTED_ISO_SIZE;
+  const releaseMatches = volumeId === EXPECTED_VOLUME_ID && Boolean(system) && Boolean(executable) && bootMatches;
+
+  return {
+    releaseMatches,
+    exactSize,
+    fileSize: file.size,
+    expectedSize: EXPECTED_ISO_SIZE,
+    volumeId,
+    hasSystemCnf: Boolean(system),
+    hasExecutable: Boolean(executable),
+    executable: EXPECTED_EXECUTABLE,
+    systemCnf,
+    rootEntryCount: entries.length,
+  };
+}
+
+async function assertBlackMondayDisc(file, { requireExactSize = true } = {}) {
+  const report = await inspectBlackMondayDisc(file);
+  if (!report.releaseMatches) {
+    throw new Error(`This does not match the PAL Black Monday disc layout (volume=${report.volumeId || 'unknown'}, executable=${report.hasExecutable ? 'present' : 'missing'}).`);
+  }
+  if (requireExactSize && !report.exactSize) {
+    throw new Error(`Black Monday disc layout matched, but image size is ${report.fileSize} bytes; expected ${report.expectedSize}.`);
+  }
+  return report;
+}
+
+const BLACK_MONDAY_DISC = Object.freeze({
+  volumeId: EXPECTED_VOLUME_ID,
+  executable: EXPECTED_EXECUTABLE,
+  isoSize: EXPECTED_ISO_SIZE,
+});
+
+
+// ---- runtime/DiscStore.js ----
+const DEFAULT_DIR = 'black-monday-discs';
+const IMPORT_CHUNK_BYTES = 64 * 1024 * 1024;
+
+function storageManager() {
+  return globalThis.navigator?.storage ?? null;
+}
+
+function opfsAvailable() {
+  return typeof storageManager()?.getDirectory === 'function';
+}
+
+async function discDirectory(name = DEFAULT_DIR) {
+  const storage = storageManager();
+  if (!storage?.getDirectory) throw new Error('Origin Private File System is unavailable in this browser.');
+  const root = await storage.getDirectory();
+  return root.getDirectoryHandle(name, { create: true });
+}
+
+async function getStorageStatus() {
+  const storage = storageManager();
+  if (!storage) return { opfs: false, persisted: false, usage: 0, quota: 0 };
+  const estimate = typeof storage.estimate === 'function' ? await storage.estimate() : {};
+  const persisted = typeof storage.persisted === 'function' ? await storage.persisted() : false;
+  return {
+    opfs: opfsAvailable(),
+    persisted: Boolean(persisted),
+    usage: Number(estimate.usage ?? 0),
+    quota: Number(estimate.quota ?? 0),
+  };
+}
+
+async function requestPersistentStorage() {
+  const storage = storageManager();
+  if (!storage?.persist) return false;
+  return Boolean(await storage.persist());
+}
+
+async function ensureSpace(requiredBytes, reserveBytes = 256 * 1024 * 1024) {
+  const status = await getStorageStatus();
+  
