@@ -63,8 +63,9 @@ jobs:
       - name: Vendor pinned browser 7-Zip runtime
         run: |
           BASE="https://raw.githubusercontent.com/use-strict/7z-wasm/$SEVENZIP_WASM_COMMIT"
-          curl -fsSL "$BASE/7zz.js" -o "$SITE_ROOT/extractor/7zz.js"
+          curl -fsSL "$BASE/7zz.es6.js" -o "$SITE_ROOT/extractor/7zz.js"
           curl -fsSL "$BASE/7zz.wasm" -o "$SITE_ROOT/extractor/7zz.wasm"
+          curl -fsSL "$BASE/License.txt" -o "$SITE_ROOT/extractor/7z-LICENSE.txt"
           node --check "$SITE_ROOT/extractor/7zz.js"
           test "$(stat -c %s "$SITE_ROOT/extractor/7zz.wasm")" -gt 500000
           grep -q 'WORKERFS' "$SITE_ROOT/extractor/7zz.js"
