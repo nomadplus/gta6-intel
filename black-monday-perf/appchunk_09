@@ -130,10 +130,24 @@ runtime.init = async function blackMondayRuntimeInitWithReadAhead() {
   return result;
 };
 
-// Replace the lightweight HUD sampler with one that also exposes optical-media
-// behaviour. This lets the physical iPhone tell us whether the 3fps crawl is
-// dominated by Safari file I/O or by the emulator core itself.
-beginStats = function blackMondayBeginStatsWithIo() {
+function blackMondayCoreStats(sample) {
+  const module = runtime.module;
+  const ee = Number(module?.getEeUsagePercent?.());
+  const iop = Number(module?.getIopUsagePercent?.());
+  const drawCalls = Number(module?.getDrawCalls?.());
+  const frames = Math.max(0, Number(sample?.frames ?? 0));
+  return {
+    eeUsage: Number.isFinite(ee) ? ee : null,
+    iopUsage: Number.isFinite(iop) ? iop : null,
+    drawCalls: Number.isFinite(drawCalls) ? drawCalls : null,
+    drawCallsPerFrame: Number.isFinite(drawCalls) && frames > 0 ? drawCalls / frames : null,
+  };
+}
+
+// Replace the lightweight HUD sampler with one that exposes optical-media and
+// emulator-core behaviour. This lets the physical iPhone distinguish browser
+// file I/O from EE/IOP/GS pressure instead of guessing from FPS alone.
+beginStats = function blackMondayBeginStatsWithCoreDiagnostics() {
   clearInterval(statsTimer);
   runtime.clearStats();
   performanceMonitor.reset(runtime.getFrames());
@@ -142,13 +156,19 @@ beginStats = function blackMondayBeginStatsWithIo() {
     const sample = performanceMonitor.sample(runtime.getFrames());
     const frameTime = sample.frameTimeMs == null ? '--' : sample.frameTimeMs.toFixed(1);
     const io = runtime.module?.discImageDevice?.getBlackMondayIoStats?.() ?? null;
+    const core = blackMondayCoreStats(sample);
     const ioText = io
-      ? ` io=${(io.hitRate * 100).toFixed(0)}% miss=${io.misses} read=${io.avgFetchMs.toFixed(1)}ms`
+      ? ` jsio=${io.reads} hit=${(io.hitRate * 100).toFixed(0)}% fetch=${io.avgFetchMs.toFixed(1)}ms`
       : '';
+    const coreText = [
+      core.eeUsage == null ? null : `ee=${core.eeUsage.toFixed(0)}%`,
+      core.iopUsage == null ? null : `iop=${core.iopUsage.toFixed(0)}%`,
+      core.drawCallsPerFrame == null ? null : `dc=${core.drawCallsPerFrame.toFixed(0)}`,
+    ].filter(Boolean).join(' ');
     const memory = sample.memory ? ` heap=${sample.memory.usedJSHeapMiB.toFixed(0)}MiB` : '';
-    hudStatus.textContent = `frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${memory}`;
+    hudStatus.textContent = `frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${coreText ? ` ${coreText}` : ''}${memory}`;
     if ((++diagnosticSampleCounter % 5) === 0) {
-      diagnostics.record('performance.sample', { ...sample, discIo: io });
+      diagnostics.record('performance.sample', { ...sample, discIo: io, core });
     }
     if ((diagnosticSampleCounter % 30) === 0) {
       diagnostics.persist({
@@ -159,6 +179,7 @@ beginStats = function blackMondayBeginStatsWithIo() {
           performanceProfile: activePerformanceProfile,
           gsScale: activeGsScale,
           discIo: io,
+          core,
         },
       });
     }
