@@ -92,6 +92,8 @@ let statsTimer = 0;
 let inputRouter = null;
 let installedDiscName = null;
 let orientationAttempted = false;
+let activePerformanceProfile = 'compatibility';
+let activeGsScale = 1;
 
 const probe = await probeSystem();
 diagnostics.record('system.probe', probe);
@@ -146,13 +148,42 @@ async function ensureRuntime() {
   const started = performance.now();
   await requestPersistentStorage().catch(() => false);
   await runtime.init();
+
+  // First physical-iPhone run showed ~3fps even on the intro. Force the
+  // timing-neutral native GS scale and reduce EE work for the mobile test.
+  // Full 1:1 timing remains available with ?perf=compatibility.
+  const params = new URLSearchParams(location.search);
+  const isIphone = /iPhone|iPod/i.test(navigator.userAgent || '');
+  activePerformanceProfile = params.get('perf') || (isIphone ? 'lowPower' : 'compatibility');
+  try {
+    runtime.setPerformanceProfile(activePerformanceProfile);
+  } catch (error) {
+    console.warn('Performance profile unavailable, using compatibility timing.', error);
+    activePerformanceProfile = 'compatibility';
+    runtime.setPerformanceProfile('compatibility');
+  }
+  try {
+    if (runtime.hasGsResolutionFactor()) {
+      activeGsScale = 1;
+      runtime.setGsResolutionFactor(activeGsScale);
+    }
+  } catch (error) {
+    console.warn('Unable to force native GS scale.', error);
+  }
+
   runtimeReady = true;
-  diagnostics.record('runtime.initialized', { elapsedMs: performance.now() - started, nativePad: runtime.hasNativePadInjection(), lifecycle: runtime.hasLifecycleControl() });
-  diagnostics.persist({ extra: { phase: 'runtime-ready' } });
+  diagnostics.record('runtime.initialized', {
+    elapsedMs: performance.now() - started,
+    nativePad: runtime.hasNativePadInjection(),
+    lifecycle: runtime.hasLifecycleControl(),
+    performanceProfile: activePerformanceProfile,
+    gsScale: activeGsScale,
+  });
+  diagnostics.persist({ extra: { phase: 'runtime-ready', performanceProfile: activePerformanceProfile, gsScale: activeGsScale } });
   const nativeInput = attachNativeInputIfAvailable();
   status.textContent = nativeInput
-    ? 'Runtime ready with native analogue injection. Select the original Black Monday disc image.'
-    : 'Runtime ready in compatibility-input mode. Select the original Black Monday disc image.';
+    ? `Runtime ready with native analogue injection. Performance=${activePerformanceProfile}, GS=${activeGsScale}x.`
+    : `Runtime ready in compatibility-input mode. Performance=${activePerformanceProfile}, GS=${activeGsScale}x.`;
 }
 
 function beginStats() {
@@ -164,9 +195,9 @@ function beginStats() {
     const sample = performanceMonitor.sample(runtime.getFrames());
     const frameTime = sample.frameTimeMs == null ? '--' : sample.frameTimeMs.toFixed(1);
     const memory = sample.memory ? ` heap=${sample.memory.usedJSHeapMiB.toFixed(0)}MiB` : '';
-    hudStatus.textContent = `frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms${memory}`;
-    diagnostics.record('performance.sample', sample);
-    if ((++diagnosticSampleCounter % 5) === 0) diagnostics.persist({ extra: { phase: 'running', fps: sample.fps, frameTimeMs: sample.frameTimeMs } });
+    hudStatus.textContent = `frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${memory}`;
+    if ((++diagnosticSampleCounter % 5) === 0) diagnostics.record('performance.sample', sample);
+    if ((diagnosticSampleCounter % 30) === 0) diagnostics.persist({ extra: { phase: 'running', fps: sample.fps, frameTimeMs: sample.frameTimeMs, performanceProfile: activePerformanceProfile, gsScale: activeGsScale } });
   }, 1000);
 }
 
