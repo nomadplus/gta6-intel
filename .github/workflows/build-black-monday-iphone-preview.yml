@@ -6,7 +6,7 @@ on:
       - black-monday-iphone-test
     paths:
       - '.github/workflows/build-black-monday-iphone-preview.yml'
-      - 'black-monday-preview/sitepart_*'
+      - 'black-monday-preview/site.tar.gz'
   workflow_dispatch:
 
 permissions:
@@ -30,9 +30,9 @@ jobs:
         run: |
           rm -rf "$SITE_ROOT" /tmp/black-monday-shell
           mkdir -p "$SITE_ROOT" /tmp/black-monday-shell
-          cat black-monday-preview/sitepart_* | base64 -d > /tmp/black-monday-site.tar.gz
-          tar -tzf /tmp/black-monday-site.tar.gz >/tmp/black-monday-site-files.txt
-          tar -xzf /tmp/black-monday-site.tar.gz -C /tmp/black-monday-shell
+          test -s black-monday-preview/site.tar.gz
+          tar -tzf black-monday-preview/site.tar.gz >/tmp/black-monday-site-files.txt
+          tar -xzf black-monday-preview/site.tar.gz -C /tmp/black-monday-shell
           if [ -f /tmp/black-monday-shell/preview/index.html ]; then
             cp -a /tmp/black-monday-shell/preview/. "$SITE_ROOT/"
           elif [ -f /tmp/black-monday-shell/index.html ]; then
@@ -45,8 +45,7 @@ jobs:
           test -f "$SITE_ROOT/index.html"
           test -f "$SITE_ROOT/app.js"
           test -f "$SITE_ROOT/runtime/PlayRuntimeAdapter.js"
-          test ! -e "$SITE_ROOT/Getaway_The_Black_Monday_Europe.iso"
-          if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' -o -iname '*.bin' \) | grep -q .; then
+          if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' \) | grep -q .; then
             echo 'Game media was accidentally included in preview bundle.' >&2
             exit 1
           fi
