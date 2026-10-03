@@ -49,6 +49,7 @@ jobs:
             black-monday-preview-src/appchunk_08 \
             black-monday-perf/appchunk_09 \
             black-monday-perf/appchunk_10 \
+            black-monday-perf/appchunk_11 \
             > "$SITE_ROOT/app.bundle.js"
           test -s "$SITE_ROOT/index.html"
           test -s "$SITE_ROOT/app.bundle.js"
@@ -59,8 +60,9 @@ jobs:
           grep -q "archiveInput" "$SITE_ROOT/app.bundle.js"
           grep -q "extractor/worker.js" "$SITE_ROOT/app.bundle.js"
           grep -q "installBlackMondayDiscReadAhead" "$SITE_ROOT/app.bundle.js"
-          grep -q "bmcore-20261003-r33" "$SITE_ROOT/app.bundle.js"
+          grep -q "bmcore-20261003-r34" "$SITE_ROOT/app.bundle.js"
           grep -q "getWasmCodegenModuleCount" "$SITE_ROOT/app.bundle.js"
+          grep -q "pumpBlackMondayGs" "$SITE_ROOT/app.bundle.js"
           if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' \) | grep -q .; then
             echo 'Game media was accidentally included in preview bundle.' >&2
             exit 1
@@ -146,6 +148,7 @@ jobs:
           python3 /tmp/apply_savestate_patch.py /tmp/play
           python3 black-monday-perf/apply_runtime_stats_patch.py /tmp/play
           python3 black-monday-perf/apply_wasm_codegen_stats_patch.py /tmp/play
+          python3 black-monday-perf/apply_main_thread_gs_patch.py /tmp/play
           python3 black-monday-perf/apply_cpp_disc_cache_patch.py /tmp/play
           git -C /tmp/play diff --check
           grep -q 'setPadValue' /tmp/play/Source/ui_js/Main.cpp
@@ -155,6 +158,9 @@ jobs:
           grep -q 'pollLoadState' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'getEeUsagePercent' /tmp/play/Source/ui_js/Main.cpp
           grep -q 'getWasmCodegenModuleCount' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'pumpBlackMondayGs' /tmp/play/Source/ui_js/Main.cpp
+          grep -q 'ProcessPendingCalls' /tmp/play/Source/gs/GSHandler.cpp
+          grep -q 'CGSH_OpenGL(gsThreaded)' /tmp/play/Source/ui_js/GSH_OpenGLJs.cpp
           grep -q 'g_blackMondayWasmModuleMicros' /tmp/play/deps/CodeGen/src/MemoryFunction.cpp
           grep -q 'CACHE_BYTES' /tmp/play/Source/Js_DiscImageDeviceStream.h
 
