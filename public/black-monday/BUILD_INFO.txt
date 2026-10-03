@@ -1,11 +1,11 @@
 play_commit=83700b2c31e593bc94e845b4b31b797be84dda59
 emsdk_version=4.0.1
 sevenzip_wasm_commit=521d2cf93f5964f4e77b01049e19f1b29305c454
-preview_source_commit=f350d298ff5d165d8790125e6e85dd578d5498c1
-built_utc=2026-10-03T17:26:29Z
+preview_source_commit=648811108cf0bea81a802bffda24ead0227f99b6
+built_utc=2026-10-03T21:28:26Z
 play_js_bytes=213595
 play_wasm_bytes=2695401
-5080aff7aa71e8f6772074dd75e2cc805803b168a1bdfe35c6c35e0626ff0a7f  public/black-monday/app.bundle.js
+68fe744adacd6a38a77001bf63406b72e86746e118aac304d9beaa1ce18abe24  public/black-monday/app.bundle.js
 dacfbc4f6d59230ecaee93e10c8031234a9c2a9594154c20ade625cf25b8a5fb  public/black-monday/runtime/Play.js
 7eafbdfd6d0b0a1e4f864e94f1d951e7ee3bbba7393fa0dc84611114cdc02462  public/black-monday/runtime/Play.wasm
 0c5c5afaae71e0a270eea7c1a4928a55998ab47b80313c907bb357fe73a3ac3d  public/black-monday/extractor/worker.js

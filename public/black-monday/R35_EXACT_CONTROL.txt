@@ -1,3 +1,0 @@
-BLACK_MONDAY_WEB exact r35 binary control
-Base generated runtime commit: 159db6ab2edcf6bdaba306d853c8d8f05d4beeb1
-Purpose: verify the previously booting Play.js/Play.wasm pair on the same stable Safari origin without recompilation.
