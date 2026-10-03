@@ -1,0 +1,193 @@
+// BLACK_MONDAY_WEB iPhone preview bundle — generated from verified v0.3.2 modules.
+
+// ---- input/controlProfiles.js ----
+const PAD = Object.freeze({
+  ANALOG_LEFT_X: 0, ANALOG_LEFT_Y: 1, ANALOG_RIGHT_X: 2, ANALOG_RIGHT_Y: 3,
+  DPAD_UP: 4, DPAD_DOWN: 5, DPAD_LEFT: 6, DPAD_RIGHT: 7,
+  SELECT: 8, START: 9, SQUARE: 10, TRIANGLE: 11, CIRCLE: 12, CROSS: 13,
+  L1: 14, L2: 15, L3: 16, R1: 17, R2: 18, R3: 19,
+});
+
+const KEY = Object.freeze({
+  SQUARE: 'KeyA', CROSS: 'KeyZ', TRIANGLE: 'KeyS', CIRCLE: 'KeyX',
+  L1: 'Key1', L2: 'Key2', L3: 'Key3', R1: 'Key8', R2: 'Key9', R3: 'Key0',
+  START: 'Enter', SELECT: 'Backspace',
+  LEFT_LEFT: 'KeyF', LEFT_RIGHT: 'KeyH', LEFT_UP: 'KeyT', LEFT_DOWN: 'KeyG',
+  RIGHT_LEFT: 'KeyJ', RIGHT_RIGHT: 'KeyL', RIGHT_UP: 'KeyI', RIGHT_DOWN: 'KeyK',
+});
+
+const KEY_TO_PAD = Object.freeze({
+  [KEY.SQUARE]: PAD.SQUARE, [KEY.CROSS]: PAD.CROSS, [KEY.TRIANGLE]: PAD.TRIANGLE, [KEY.CIRCLE]: PAD.CIRCLE,
+  [KEY.L1]: PAD.L1, [KEY.L2]: PAD.L2, [KEY.L3]: PAD.L3, [KEY.R1]: PAD.R1, [KEY.R2]: PAD.R2, [KEY.R3]: PAD.R3,
+  [KEY.START]: PAD.START, [KEY.SELECT]: PAD.SELECT,
+});
+
+const CONTROL_PROFILES = Object.freeze({
+  onFootMitch: [
+    ['ATTACK/FIRE', KEY.SQUARE], ['ACTION', KEY.TRIANGLE], ['COVER/ROLL', KEY.CROSS], ['ARREST/DRAG', KEY.CIRCLE],
+    ['TARGET', KEY.R1], ['FREE AIM', KEY.R2], ['RELOAD', KEY.L2], ['WEAPON', KEY.R3],
+  ],
+  driving: [
+    ['ACCEL', KEY.CROSS], ['BRAKE', KEY.SQUARE], ['REVERSE', KEY.CIRCLE], ['EXIT', KEY.TRIANGLE],
+    ['HANDBRAKE', KEY.R1], ['SHOOT', KEY.L1], ['LOOK L', KEY.L2], ['LOOK R', KEY.R2],
+  ],
+});
+
+
+// ---- input/inputMath.js ----
+function clamp(v, min, max) { return Math.min(max, Math.max(min, v)); }
+
+function normalizeStick(dx, dy, radius) {
+  const length = Math.hypot(dx, dy);
+  if (!length || !radius) return { x: 0, y: 0, magnitude: 0 };
+  const scale = Math.min(1, radius / length);
+  return { x: (dx * scale) / radius, y: (dy * scale) / radius, magnitude: Math.min(1, length / radius) };
+}
+
+function vectorToDigitalKeys(x, y, keys, deadZone = 0.24) {
+  const active = new Set();
+  if (x < -deadZone) active.add(keys.left);
+  if (x > deadZone) active.add(keys.right);
+  if (y < -deadZone) active.add(keys.up);
+  if (y > deadZone) active.add(keys.down);
+  return active;
+}
+
+function axisToPs2Byte(v, deadZone = 0.08) {
+  if (Math.abs(v) < deadZone) return 0x7F;
+  return clamp(Math.round(0x7F + v * 0x80), 0, 0xFF);
+}
+
+
+// ---- input/GamepadController.js ----
+
+
+// W3C Standard Gamepad layout -> PS2 pad semantics used by Play!.
+const BUTTON_MAP = Object.freeze({
+  0: [PAD.CROSS, KEY.CROSS],
+  1: [PAD.CIRCLE, KEY.CIRCLE],
+  2: [PAD.SQUARE, KEY.SQUARE],
+  3: [PAD.TRIANGLE, KEY.TRIANGLE],
+  4: [PAD.L1, KEY.L1],
+  5: [PAD.R1, KEY.R1],
+  6: [PAD.L2, KEY.L2],
+  7: [PAD.R2, KEY.R2],
+  8: [PAD.SELECT, KEY.SELECT],
+  9: [PAD.START, KEY.START],
+  10: [PAD.L3, KEY.L3],
+  11: [PAD.R3, KEY.R3],
+});
+
+const DPAD_MAP = Object.freeze({
+  12: [PAD.DPAD_UP, 'ArrowUp'],
+  13: [PAD.DPAD_DOWN, 'ArrowDown'],
+  14: [PAD.DPAD_LEFT, 'ArrowLeft'],
+  15: [PAD.DPAD_RIGHT, 'ArrowRight'],
+});
+
+class GamepadController {
+  constructor({ canvas, emitKey, onActivity = () => {} } = {}) {
+    this.canvas = canvas;
+    this.emitKey = emitKey ?? ((code, down) => this.dispatchKey(code, down));
+    this.onActivity = onActivity;
+    this.nativePadSink = null;
+    this.running = false;
+    this.raf = 0;
+    this.heldKeys = new Set();
+    this.lastPadIndex = null;
+    this.axisDeadzone = 0.12;
+    this._loop = this._loop.bind(this);
+  }
+
+  start() {
+    if (this.running) return;
+    this.running = true;
+    this.raf = requestAnimationFrame(this._loop);
+  }
+
+  stop() {
+    this.running = false;
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    this.releaseAll();
+  }
+
+  attachNativePadSink({ setValue, clearValue, clearAll }) {
+    this.releaseAll();
+    this.nativePadSink = { setValue, clearValue, clearAll };
+    this.nativePadSink.clearAll?.();
+  }
+
+  detachNativePadSink() {
+    this.releaseAll();
+    this.nativePadSink = null;
+  }
+
+  _loop() {
+    if (!this.running) return;
+    const pads = navigator.getGamepads?.() ?? [];
+    const pad = [...pads].find(p => p && p.connected && (p.mapping === 'standard' || p.axes.length >= 4));
+    if (pad) this.updateFromGamepad(pad);
+    else if (this.lastPadIndex !== null) {
+      this.releaseAll();
+      this.lastPadIndex = null;
+    }
+    this.raf = requestAnimationFrame(this._loop);
+  }
+
+  updateFromGamepad(gamepad) {
+    this.lastPadIndex = gamepad.index;
+    const buttonStates = Object.fromEntries(
+      [...Object.keys(BUTTON_MAP), ...Object.keys(DPAD_MAP)].map(indexText => {
+        const index = Number(indexText);
+        const button = gamepad.buttons[index];
+        return [index, Boolean(button?.pressed || (button?.value ?? 0) > 0.5)];
+      }),
+    );
+    const axes = [0, 1, 2, 3].map(i => this.applyDeadzone(gamepad.axes[i] ?? 0));
+    const active = Object.values(buttonStates).some(Boolean) || axes.some(v => Math.abs(v) > 0);
+
+    // Claim ownership before emitting the first active frame so a newly used gamepad
+    // doesn't lose its first movement/button event to the input arbiter.
+    if (active) this.onActivity({ type: 'gamepad', index: gamepad.index, id: gamepad.id });
+
+    for (const [indexText, [padButton, fallbackKey]] of Object.entries(BUTTON_MAP)) {
+      this.emitButton(padButton, fallbackKey, buttonStates[Number(indexText)]);
+    }
+    for (const [indexText, [padButton, fallbackKey]] of Object.entries(DPAD_MAP)) {
+      this.emitButton(padButton, fallbackKey, buttonStates[Number(indexText)]);
+    }
+
+    if (this.nativePadSink) {
+      this.nativePadSink.setValue(PAD.ANALOG_LEFT_X, axisToPs2Byte(axes[0]));
+      this.nativePadSink.setValue(PAD.ANALOG_LEFT_Y, axisToPs2Byte(axes[1]));
+      this.nativePadSink.setValue(PAD.ANALOG_RIGHT_X, axisToPs2Byte(axes[2]));
+      this.nativePadSink.setValue(PAD.ANALOG_RIGHT_Y, axisToPs2Byte(axes[3]));
+    } else {
+      this.syncKeyGroup(
+        vectorToDigitalKeys(axes[0], axes[1], { left: KEY.LEFT_LEFT, right: KEY.LEFT_RIGHT, up: KEY.LEFT_UP, down: KEY.LEFT_DOWN }, 0.25),
+        [KEY.LEFT_LEFT, KEY.LEFT_RIGHT, KEY.LEFT_UP, KEY.LEFT_DOWN],
+      );
+      this.syncKeyGroup(
+        vectorToDigitalKeys(axes[2], axes[3], { left: KEY.RIGHT_LEFT, right: KEY.RIGHT_RIGHT, up: KEY.RIGHT_UP, down: KEY.RIGHT_DOWN }, 0.25),
+        [KEY.RIGHT_LEFT, KEY.RIGHT_RIGHT, KEY.RIGHT_UP, KEY.RIGHT_DOWN],
+      );
+    }
+  }
+
+  applyDeadzone(value) {
+    const v = Number.isFinite(value) ? Math.max(-1, Math.min(1, value)) : 0;
+    if (Math.abs(v) <= this.axisDeadzone) return 0;
+    const sign = Math.sign(v);
+    return sign * ((Math.abs(v) - this.axisDeadzone) / (1 - this.axisDeadzone));
+  }
+
+  emitButton(padButton, fallbackKey, down) {
+    if (this.nativePadSink) {
+      if (down) this.nativePadSink.setValue(padButton, 1);
+      else this.nativePadSink.clearValue(padButton);
+    } else this.setFallbackKey(fallbackKey, down);
+  }
+
+  syncKeyGroup(next, group) {
+    for (const code of 
