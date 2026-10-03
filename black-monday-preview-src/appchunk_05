@@ -1,0 +1,174 @@
+timeAdapter {
+  constructor({ runtimeUrl = './runtime/Play.js', canvasId = 'outputCanvas' } = {}) {
+    this.runtimeUrl = runtimeUrl;
+    this.canvasId = canvasId;
+    this.module = null;
+    this.booted = false;
+  }
+
+  async init() {
+    const runtimeHref = new URL(this.runtimeUrl, import.meta.url).href;
+    const imported = await import(runtimeHref);
+    const Play = imported.default;
+    if (typeof Play !== 'function') throw new Error('Play.js did not export the expected Emscripten module factory.');
+    const base = new URL('.', runtimeHref).href;
+    this.module = await Play({
+      locateFile: path => new URL(path, base).href,
+      mainScriptUrlOrBlob: runtimeHref,
+      print: text => console.log(`[Play] ${text}`),
+      printErr: text => console.error(`[Play] ${text}`),
+    });
+    try { this.module.FS.mkdir('/work'); } catch (e) { if (!String(e).includes('File exists')) throw e; }
+    await mountPersistentVfs(this.module);
+    this.module.discImageDevice = new DiscImageDevice(this.module);
+    this.module.ccall('initVm', '', [], []);
+    return this;
+  }
+
+  bootDisc(file) {
+    if (!this.module) throw new Error('Runtime not initialised.');
+    this.module.discImageDevice.setFile(file);
+    this.module.bootDiscImage(file.name);
+    this.booted = true;
+  }
+
+  bootElf(file) { throw new Error('ELF import is not wired in this first shell yet.'); }
+  getFrames() { return this.module?.getFrames?.() ?? 0; }
+  setPadValue(button, value, pad = 0) {
+    if (!this.module?.setPadValue) throw new Error('Play! core does not expose setPadValue; apply patch 0001 and rebuild.');
+    this.module.setPadValue(pad, button, value);
+  }
+  clearPadValue(button, pad = 0) { this.module?.clearPadValue?.(pad, button); }
+  clearPadValues() { this.module?.clearPadValues?.(); }
+  hasNativePadInjection() { return typeof this.module?.setPadValue === 'function' && typeof this.module?.clearPadValue === 'function'; }
+  clearStats() { this.module?.clearStats?.(); }
+  hasEeFrequencyScale() { return typeof this.module?.setEeFrequencyScale === 'function'; }
+  hasGsResolutionFactor() { return typeof this.module?.setGsResolutionFactor === 'function'; }
+  setGsResolutionFactor(factor = 1) {
+    if (!this.hasGsResolutionFactor()) throw new Error('Play! core does not expose setGsResolutionFactor; apply patch 0005 and rebuild.');
+    if (![1, 2, 4, 8].includes(factor)) throw new Error(`Unsupported GS resolution factor: ${factor}`);
+    this.module.setGsResolutionFactor(factor);
+    return factor;
+  }
+  setPerformanceProfile(id = 'compatibility') {
+    const profile = getPerformanceProfile(id);
+    if (!this.hasEeFrequencyScale()) {
+      if (id !== 'compatibility') throw new Error('Play! core does not expose setEeFrequencyScale; apply patch 0003 and rebuild.');
+      return profile;
+    }
+    this.module.setEeFrequencyScale(profile.eeNumerator, profile.eeDenominator);
+    return profile;
+  }
+  pause() {
+    if (!this.booted) return false;
+    if (typeof this.module?.pauseVm !== 'function') return false;
+    this.module.pauseVm();
+    return true;
+  }
+
+  resume() {
+    if (!this.booted) return false;
+    if (typeof this.module?.resumeVm !== 'function') return false;
+    this.module.resumeVm();
+    return true;
+  }
+
+  hasLifecycleControl() {
+    return typeof this.module?.pauseVm === 'function' && typeof this.module?.resumeVm === 'function';
+  }
+
+  hasSaveStates() {
+    return typeof this.module?.saveState === 'function'
+      && typeof this.module?.beginLoadState === 'function'
+      && typeof this.module?.pollLoadState === 'function';
+  }
+
+  async saveState(slot = 0) {
+    if (!this.module) throw new Error('Runtime not initialised.');
+    if (!this.hasSaveStates()) throw new Error('Play! core does not expose browser savestates; apply patch 0006 and rebuild.');
+    const safeSlot = Number(slot);
+    if (!Number.isInteger(safeSlot) || safeSlot < 0 || safeSlot > 99) throw new Error(`Invalid savestate slot: ${slot}`);
+    const saved = Boolean(this.module.saveState(safeSlot));
+    if (saved) await flushPersistentVfs(this.module);
+    return saved;
+  }
+
+  async loadState(slot = 0, { timeoutMs = 30000, pollMs = 25 } = {}) {
+    if (!this.module) throw new Error('Runtime not initialised.');
+    if (!this.hasSaveStates()) throw new Error('Play! core does not expose browser savestates; apply patch 0006 and rebuild.');
+    const safeSlot = Number(slot);
+    if (!Number.isInteger(safeSlot) || safeSlot < 0 || safeSlot > 99) throw new Error(`Invalid savestate slot: ${slot}`);
+    this.clearPadValues();
+    if (!this.module.beginLoadState(safeSlot)) throw new Error('Play! rejected savestate load request (another load may already be pending).');
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() <= deadline) {
+      const status = Number(this.module.pollLoadState());
+      if (status === 2) {
+        this.module.resumeVm?.();
+        return true;
+      }
+      if (status === -1) return false;
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+    throw new Error(`Savestate load timed out after ${timeoutMs} ms.`);
+  }
+
+  exportSaveBackup() {
+    if (!this.module) throw new Error('Runtime not initialised.');
+    return exportVfsBackup(this.module);
+  }
+
+  async importSaveBackup(backup) {
+    if (!this.module) throw new Error('Runtime not initialised.');
+    const result = importVfsBackup(this.module, backup);
+    await flushPersistentVfs(this.module);
+    return result;
+  }
+
+  async flushSaves() { await flushPersistentVfs(this.module); }
+}
+
+
+// ---- systemProbe.js ----
+const MIB = 1024 * 1024;
+const BLACK_MONDAY_ISO_BYTES = 4211343360;
+const DISC_INSTALL_HEADROOM_BYTES = 512 * MIB;
+
+function finiteNumber(value) {
+  return Number.isFinite(value) ? value : null;
+}
+
+function probeSharedWasmMemory() {
+  try {
+    if (typeof WebAssembly !== 'object' || typeof SharedArrayBuffer === 'undefined') return false;
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+    return memory.buffer instanceof SharedArrayBuffer;
+  } catch {
+    return false;
+  }
+}
+
+async function probeSystem() {
+  const nav = globalThis.navigator ?? {};
+  const doc = globalThis.document;
+  const canvas = doc?.createElement?.('canvas');
+  const gl2 = Boolean(canvas?.getContext?.('webgl2'));
+
+  let opfs = false;
+  try { opfs = Boolean(nav.storage?.getDirectory && await nav.storage.getDirectory()); } catch { opfs = false; }
+
+  let storage = null;
+  try { storage = await nav.storage?.estimate?.(); } catch { storage = null; }
+
+  let storagePersisted = null;
+  try {
+    if (typeof nav.storage?.persisted === 'function') storagePersisted = Boolean(await nav.storage.persisted());
+  } catch { storagePersisted = null; }
+
+  const quota = finiteNumber(storage?.quota);
+  const usage = finiteNumber(storage?.usage);
+  const available = quota == null ? null : Math.max(0, quota - (usage ?? 0));
+  const installBytesRequired = BLACK_MONDAY_ISO_BYTES + DISC_INSTALL_HEADROOM_BYTES;
+
+  const report = {
+    userAge
