@@ -7,6 +7,7 @@ on:
     paths:
       - '.github/workflows/build-black-monday-iphone-preview.yml'
       - 'black-monday-preview-src/**'
+      - 'black-monday-perf/**'
   workflow_dispatch:
 
 permissions:
@@ -46,6 +47,7 @@ jobs:
             black-monday-preview-src/appchunk_06 \
             black-monday-preview-src/appchunk_07 \
             black-monday-preview-src/appchunk_08 \
+            black-monday-perf/appchunk_09 \
             > "$SITE_ROOT/app.bundle.js"
           test -s "$SITE_ROOT/index.html"
           test -s "$SITE_ROOT/app.bundle.js"
@@ -55,6 +57,7 @@ jobs:
           grep -q "runtime/Play.js" "$SITE_ROOT/app.bundle.js"
           grep -q "archiveInput" "$SITE_ROOT/app.bundle.js"
           grep -q "extractor/worker.js" "$SITE_ROOT/app.bundle.js"
+          grep -q "installBlackMondayDiscReadAhead" "$SITE_ROOT/app.bundle.js"
           if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' \) | grep -q .; then
             echo 'Game media was accidentally included in preview bundle.' >&2
             exit 1
