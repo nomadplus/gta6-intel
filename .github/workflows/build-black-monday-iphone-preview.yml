@@ -6,7 +6,7 @@ on:
       - black-monday-iphone-test
     paths:
       - '.github/workflows/build-black-monday-iphone-preview.yml'
-      - 'black-monday-preview/iphonebundle_*'
+      - 'black-monday-preview-src/**'
   workflow_dispatch:
 
 permissions:
@@ -20,41 +20,39 @@ jobs:
       PLAY_COMMIT: 83700b2c31e593bc94e845b4b31b797be84dda59
       EMSDK_VERSION: 4.0.1
       SITE_ROOT: public/black-monday
-      SHELL_SHA256: 5d76cceb616fd91af71102e64f20946382910d2885bab295da5007c401587ddd
     steps:
       - name: Checkout isolated preview branch
         uses: actions/checkout@v4
         with:
           ref: black-monday-iphone-test
 
-      - name: Reconstruct and verify iPhone PWA shell
+      - name: Assemble and verify iPhone PWA shell
         run: |
-          rm -rf "$SITE_ROOT" /tmp/black-monday-shell /tmp/black-monday-site.tar.gz
-          mkdir -p "$SITE_ROOT" /tmp/black-monday-shell
-          count="$(find black-monday-preview -maxdepth 1 -type f -name 'iphonebundle_*' | wc -l)"
-          test "$count" -eq 7
-          cat black-monday-preview/iphonebundle_* | base64 -d > /tmp/black-monday-site.tar.gz
-          echo "$SHELL_SHA256  /tmp/black-monday-site.tar.gz" | sha256sum -c -
-          tar -tzf /tmp/black-monday-site.tar.gz >/tmp/black-monday-site-files.txt
-          tar -xzf /tmp/black-monday-site.tar.gz -C /tmp/black-monday-shell
-          if [ -f /tmp/black-monday-shell/preview/index.html ]; then
-            cp -a /tmp/black-monday-shell/preview/. "$SITE_ROOT/"
-          elif [ -f /tmp/black-monday-shell/index.html ]; then
-            cp -a /tmp/black-monday-shell/. "$SITE_ROOT/"
-          else
-            echo 'Preview bundle did not contain index.html.' >&2
-            cat /tmp/black-monday-site-files.txt >&2
-            exit 1
-          fi
-          test -f "$SITE_ROOT/index.html"
-          test -f "$SITE_ROOT/app.js"
-          test -f "$SITE_ROOT/runtime/PlayRuntimeAdapter.js"
+          rm -rf "$SITE_ROOT"
+          mkdir -p "$SITE_ROOT/runtime"
+          cp black-monday-preview-src/index.html "$SITE_ROOT/index.html"
+          cp black-monday-preview-src/styles.css "$SITE_ROOT/styles.css"
+          cp black-monday-preview-src/manifest.webmanifest "$SITE_ROOT/manifest.webmanifest"
+          cp black-monday-preview-src/sw.js "$SITE_ROOT/sw.js"
+          cat \
+            black-monday-preview-src/appchunk_00 \
+            black-monday-preview-src/appchunk_01 \
+            black-monday-preview-src/appchunk_02 \
+            black-monday-preview-src/appchunk_03 \
+            black-monday-preview-src/appchunk_04 \
+            black-monday-preview-src/appchunk_05 \
+            black-monday-preview-src/appchunk_06 \
+            black-monday-preview-src/appchunk_07 \
+            > "$SITE_ROOT/app.bundle.js"
+          test -s "$SITE_ROOT/index.html"
+          test -s "$SITE_ROOT/app.bundle.js"
+          node --check "$SITE_ROOT/app.bundle.js"
+          node --check "$SITE_ROOT/sw.js"
+          grep -q "runtime/Play.js" "$SITE_ROOT/app.bundle.js"
           if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' \) | grep -q .; then
             echo 'Game media was accidentally included in preview bundle.' >&2
             exit 1
           fi
-          node --check "$SITE_ROOT/app.js"
-          node --check "$SITE_ROOT/runtime/PlayRuntimeAdapter.js"
 
       - name: Setup Emscripten
         uses: emscripten-core/setup-emsdk@v16
@@ -115,7 +113,7 @@ jobs:
             echo "built_utc=$(date -u +%FT%TZ)"
             echo "play_js_bytes=$(stat -c %s "$SITE_ROOT/runtime/Play.js")"
             echo "play_wasm_bytes=$(stat -c %s "$SITE_ROOT/runtime/Play.wasm")"
-            sha256sum "$SITE_ROOT/runtime/Play.js" "$SITE_ROOT/runtime/Play.wasm"
+            sha256sum "$SITE_ROOT/app.bundle.js" "$SITE_ROOT/runtime/Play.js" "$SITE_ROOT/runtime/Play.wasm"
           } > "$SITE_ROOT/BUILD_INFO.txt"
           du -sh "$SITE_ROOT"
           find "$SITE_ROOT" -maxdepth 2 -type f | sort
