@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - black-monday-iphone-test
+      - black-monday-iphone-dev-auto
     paths:
       - '.github/workflows/build-black-monday-iphone-preview.yml'
       - 'black-monday-preview-src/**'
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: black-monday-iphone-preview
+  group: black-monday-iphone-preview-${{ github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -30,7 +31,7 @@ jobs:
       - name: Checkout isolated preview branch
         uses: actions/checkout@v4
         with:
-          ref: black-monday-iphone-test
+          ref: ${{ github.ref_name }}
 
       - name: Assemble and verify iPhone PWA shell
         run: |
@@ -54,6 +55,7 @@ jobs:
             black-monday-perf/appchunk_09 \
             black-monday-perf/appchunk_10 \
             black-monday-perf/appchunk_12 \
+            black-monday-perf/appchunk_15 \
             > "$SITE_ROOT/app.bundle.js"
           test -s "$SITE_ROOT/index.html"
           test -s "$SITE_ROOT/app.bundle.js"
@@ -63,6 +65,7 @@ jobs:
           grep -q "installBlackMondayDiscReadAhead" "$SITE_ROOT/app.bundle.js"
           grep -q "bmcore-20261003-r35" "$SITE_ROOT/app.bundle.js"
           grep -q "getBlackMondayEeHostMs" "$SITE_ROOT/app.bundle.js"
+          grep -q "__blackMondaySelfTest" "$SITE_ROOT/app.bundle.js"
           ! grep -q "blackMondayRuntimeInitR34MainThreadGs" "$SITE_ROOT/app.bundle.js"
           if find "$SITE_ROOT" -type f \( -iname '*.iso' -o -iname '*.7z' \) | grep -q .; then
             echo 'Game media was accidentally included in preview bundle.' >&2
@@ -145,6 +148,31 @@ jobs:
             sha256sum "$SITE_ROOT/app.bundle.js" "$SITE_ROOT/runtime/Play.js" "$SITE_ROOT/runtime/Play.wasm" "$SITE_ROOT/extractor/worker.js" "$SITE_ROOT/extractor/7zz.js" "$SITE_ROOT/extractor/7zz.wasm"
           } > "$SITE_ROOT/BUILD_INFO.txt"
 
+      - name: Install browser smoke-test engines
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install --no-save playwright@1.55.0
+          npx playwright install --with-deps chromium webkit
+
+      - name: Automated Play PS2 VM smoke test
+        run: |
+          node black-monday-perf/ci_serve.mjs public >/tmp/black-monday-ci-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID >/dev/null 2>&1 || true' EXIT
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4173/black-monday/ >/dev/null; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" != "1" ]; then
+            cat /tmp/black-monday-ci-server.log
+            exit 1
+          fi
+          node black-monday-perf/ci_vm_smoke.mjs
+
       - name: Commit generated preview runtime
         run: |
           git config user.name 'black-monday-web-bot'
@@ -155,4 +183,4 @@ jobs:
             exit 0
           fi
           git commit -m 'Build Black Monday iPhone preview runtime [skip preview-build]'
-          git push origin HEAD:black-monday-iphone-test
+          git push origin "HEAD:${GITHUB_REF_NAME}"
