@@ -1275,12 +1275,21 @@ function beginStats() {
 async function bootBlackMondayFile(file, { install = false } = {}) {
   // Keep these before any long async work: iOS Safari requires media/orientation requests
   // to originate from a user gesture. PWA manifest orientation remains the fallback.
-  const audioReport = await unlockAudio();
+  const audioReport = { supported: audioUnlockSupported(), unlocked: isAudioUnlocked(), state: isAudioUnlocked() ? 'running' : 'deferred' };
+  // Do not block Black Monday boot on iOS media activation. Safari can keep
+  // AudioContext.resume() pending indefinitely once the original user gesture
+  // has expired (for example after a multi-minute archive extraction). The
+  // document-level first-gesture handler will unlock audio on the next touch.
+  unlockAudio().then(report => {
+    if (report.supported && !report.unlocked) console.warn('Audio context is not yet unlocked', report.state);
+  }).catch(error => console.warn('Deferred audio unlock failed', error));
   if (!orientationAttempted) {
     orientationAttempted = true;
-    try { await globalThis.screen?.orientation?.lock?.('landscape'); } catch { /* iOS Safari may reject; standalone manifest handles it */ }
+    try {
+      const orientationLock = globalThis.screen?.orientation?.lock?.('landscape');
+      Promise.resolve(orientationLock).catch(() => {});
+    } catch { /* iOS Safari may reject; standalone manifest handles it */ }
   }
-  if (audioReport.supported && !audioReport.unlocked) console.warn('Audio context is not yet unlocked', audioReport.state);
   status.textContent = 'Checking original Black Monday disc…';
   const discReport = await assertBlackMondayDisc(file);
   let bootFile = file;
