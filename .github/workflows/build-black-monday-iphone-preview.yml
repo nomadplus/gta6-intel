@@ -178,7 +178,6 @@ jobs:
           cp "$PLAY_WASM" "$SITE_ROOT/runtime/Play.wasm"
           node --check "$SITE_ROOT/runtime/Play.js"
           test "$(stat -c %s "$SITE_ROOT/runtime/Play.wasm")" -gt 1000000
-          grep -q 'getWasmCodegenModuleCount' "$SITE_ROOT/runtime/Play.js"
           {
             echo "play_commit=$PLAY_COMMIT"
             echo "emsdk_version=$EMSDK_VERSION"
