@@ -1,0 +1,166 @@
+
+
+// ---- iPhone performance diagnostics / disc read-ahead ----
+// Play!'s upstream browser path proxies every optical-media read to the browser
+// main thread and resolves it through File.slice(...).arrayBuffer(). On iOS this
+// is expensive for games that stream lots of small DVD reads. Keep a small LRU
+// of larger read-ahead windows so repeated/sequential sector reads stay in RAM.
+function installBlackMondayDiscReadAhead(device, {
+  windowBytes = 4 * 1024 * 1024,
+  maxWindows = 4,
+} = {}) {
+  if (!device || device.__blackMondayReadAheadInstalled) return device;
+
+  const windows = new Map();
+  const stats = {
+    reads: 0,
+    hits: 0,
+    misses: 0,
+    requestedBytes: 0,
+    fetchedBytes: 0,
+    fetchMs: 0,
+    maxFetchMs: 0,
+    errors: 0,
+  };
+
+  const remember = (start, bytes) => {
+    if (windows.has(start)) windows.delete(start);
+    windows.set(start, { start, end: start + bytes.byteLength, bytes });
+    while (windows.size > maxWindows) windows.delete(windows.keys().next().value);
+  };
+
+  const findWindow = (offset, end) => {
+    for (const [key, entry] of windows) {
+      if (offset >= entry.start && end <= entry.end) {
+        windows.delete(key);
+        windows.set(key, entry);
+        return entry;
+      }
+    }
+    return null;
+  };
+
+  device.read = function blackMondayRead(dstPtr, offset, size) {
+    this.doneFlag = false;
+    this.lastError = null;
+    stats.reads += 1;
+    stats.requestedBytes += size;
+
+    if (!this.file) {
+      this.lastError = new Error('No disc image selected.');
+      stats.errors += 1;
+      this.doneFlag = true;
+      return;
+    }
+
+    const requestEnd = offset + size;
+    const hit = findWindow(offset, requestEnd);
+    if (hit) {
+      const startInWindow = offset - hit.start;
+      this.module.HEAPU8.set(hit.bytes.subarray(startInWindow, startInWindow + size), dstPtr);
+      stats.hits += 1;
+      this.doneFlag = true;
+      return;
+    }
+
+    stats.misses += 1;
+    const largeRead = size >= windowBytes;
+    const fetchStart = largeRead ? offset : Math.floor(offset / windowBytes) * windowBytes;
+    const fetchEnd = largeRead
+      ? Math.min(this.file.size, requestEnd)
+      : Math.min(this.file.size, Math.max(requestEnd, fetchStart + windowBytes));
+    const started = performance.now();
+
+    this.file.slice(fetchStart, fetchEnd).arrayBuffer()
+      .then(buffer => {
+        const elapsed = performance.now() - started;
+        const bytes = new Uint8Array(buffer);
+        stats.fetchedBytes += bytes.byteLength;
+        stats.fetchMs += elapsed;
+        stats.maxFetchMs = Math.max(stats.maxFetchMs, elapsed);
+        if (!largeRead) remember(fetchStart, bytes);
+        const startInFetch = offset - fetchStart;
+        this.module.HEAPU8.set(bytes.subarray(startInFetch, startInFetch + size), dstPtr);
+        this.doneFlag = true;
+      })
+      .catch(error => {
+        stats.errors += 1;
+        this.lastError = error;
+        this.doneFlag = true;
+      });
+  };
+
+  device.getBlackMondayIoStats = () => {
+    const avgFetchMs = stats.misses ? stats.fetchMs / stats.misses : 0;
+    return {
+      ...stats,
+      avgFetchMs,
+      hitRate: stats.reads ? stats.hits / stats.reads : 0,
+      windows: windows.size,
+      windowBytes,
+    };
+  };
+  device.clearBlackMondayReadAhead = () => windows.clear();
+  device.__blackMondayReadAheadInstalled = true;
+  return device;
+}
+
+// Add diagnostic EE profiles without changing the compatibility profiles used
+// elsewhere in the shell. These are measurement modes only; correctness still
+// has to be checked before any underclock becomes a shipping default.
+const __blackMondayBaseSetPerformanceProfile = runtime.setPerformanceProfile.bind(runtime);
+runtime.setPerformanceProfile = function blackMondaySetPerformanceProfile(id = 'compatibility') {
+  if (id === 'quarter') {
+    if (!this.module?.setEeFrequencyScale) throw new Error('EE frequency hook unavailable.');
+    this.module.setEeFrequencyScale(1, 4);
+    return { label: 'Quarter EE (diagnostic)', eeNumerator: 1, eeDenominator: 4, experimental: true };
+  }
+  if (id === 'eighth') {
+    if (!this.module?.setEeFrequencyScale) throw new Error('EE frequency hook unavailable.');
+    this.module.setEeFrequencyScale(1, 8);
+    return { label: 'Eighth EE (diagnostic)', eeNumerator: 1, eeDenominator: 8, experimental: true };
+  }
+  return __blackMondayBaseSetPerformanceProfile(id);
+};
+
+const __blackMondayBaseRuntimeInit = runtime.init.bind(runtime);
+runtime.init = async function blackMondayRuntimeInitWithReadAhead() {
+  const result = await __blackMondayBaseRuntimeInit();
+  installBlackMondayDiscReadAhead(this.module?.discImageDevice);
+  return result;
+};
+
+// Replace the lightweight HUD sampler with one that also exposes optical-media
+// behaviour. This lets the physical iPhone tell us whether the 3fps crawl is
+// dominated by Safari file I/O or by the emulator core itself.
+beginStats = function blackMondayBeginStatsWithIo() {
+  clearInterval(statsTimer);
+  runtime.clearStats();
+  performanceMonitor.reset(runtime.getFrames());
+  let diagnosticSampleCounter = 0;
+  statsTimer = window.setInterval(() => {
+    const sample = performanceMonitor.sample(runtime.getFrames());
+    const frameTime = sample.frameTimeMs == null ? '--' : sample.frameTimeMs.toFixed(1);
+    const io = runtime.module?.discImageDevice?.getBlackMondayIoStats?.() ?? null;
+    const ioText = io
+      ? ` io=${(io.hitRate * 100).toFixed(0)}% miss=${io.misses} read=${io.avgFetchMs.toFixed(1)}ms`
+      : '';
+    const memory = sample.memory ? ` heap=${sample.memory.usedJSHeapMiB.toFixed(0)}MiB` : '';
+    hudStatus.textContent = `frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${memory}`;
+    if ((++diagnosticSampleCounter % 5) === 0) {
+      diagnostics.record('performance.sample', { ...sample, discIo: io });
+    }
+    if ((diagnosticSampleCounter % 30) === 0) {
+      diagnostics.persist({
+        extra: {
+          phase: 'running',
+          fps: sample.fps,
+          frameTimeMs: sample.frameTimeMs,
+          performanceProfile: activePerformanceProfile,
+          gsScale: activeGsScale,
+          discIo: io,
+        },
+      });
+    }
+  }, 1000);
+};
