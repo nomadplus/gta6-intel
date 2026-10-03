@@ -123,47 +123,86 @@ runtime.setPerformanceProfile = function blackMondaySetPerformanceProfile(id = '
   return __blackMondayBaseSetPerformanceProfile(id);
 };
 
-// Safari can retain a previously fetched ES module and/or WASM response across
-// preview updates. Version both sides of the Play! runtime as a pair so a new
-// launcher can never initialise against a stale Play.js or Play.wasm.
-const BLACK_MONDAY_RUNTIME_BUILD = 'bmcore-20261003-r28';
-function blackMondayVersionRuntimeUrl(input) {
-  const url = new URL(input, globalThis.location?.href ?? import.meta.url);
+// Safari's protected-preview network module loader can reject Play.js even when
+// a normal authenticated request for the same URL succeeds. Avoid that network
+// module-import path completely: fetch the exact JS/WASM pair as ordinary bytes,
+// import Play.js from a same-origin Blob module, and hand the matching WASM bytes
+// directly to Emscripten. Pthread workers then load the same Blob module, so the
+// JS and WASM pair cannot be mixed across deployments or HTTP caches.
+const BLACK_MONDAY_RUNTIME_BUILD = 'bmcore-20261003-r31';
+function blackMondayRuntimeAssetUrl(name) {
+  const url = new URL(`./runtime/${name}`, globalThis.location?.href ?? import.meta.url);
   url.searchParams.set('bmcore', BLACK_MONDAY_RUNTIME_BUILD);
   return url.href;
 }
-runtime.runtimeUrl = blackMondayVersionRuntimeUrl(runtime.runtimeUrl);
 
-const __blackMondayBaseRuntimeInit = runtime.init.bind(runtime);
-runtime.init = async function blackMondayRuntimeInitWithReadAhead() {
-  const originalFetch = globalThis.fetch.bind(globalThis);
-  globalThis.fetch = (input, init = {}) => {
-    try {
-      const raw = typeof input === 'string' || input instanceof URL ? String(input) : input?.url;
-      const url = new URL(raw, globalThis.location?.href ?? import.meta.url);
-      const isPlayRuntime = url.origin === globalThis.location?.origin
-        && (url.pathname.endsWith('/runtime/Play.js') || url.pathname.endsWith('/runtime/Play.wasm'));
-      if (isPlayRuntime) {
-        url.searchParams.set('bmcore', BLACK_MONDAY_RUNTIME_BUILD);
-        const reloadInit = { ...init, cache: 'reload' };
-        if (typeof Request !== 'undefined' && input instanceof Request) {
-          return originalFetch(new Request(url.href, input), reloadInit);
-        }
-        return originalFetch(url.href, reloadInit);
-      }
-    } catch {
-      // Fall through to the browser's normal fetch path.
-    }
-    return originalFetch(input, init);
-  };
-
-  try {
-    const result = await __blackMondayBaseRuntimeInit();
-    installBlackMondayDiscReadAhead(this.module?.discImageDevice);
-    return result;
-  } finally {
-    globalThis.fetch = originalFetch;
+async function blackMondayFetchRuntimeAsset(url, expectedType) {
+  const response = await fetch(url, {
+    cache: 'reload',
+    credentials: 'include',
+    redirect: 'follow',
+  });
+  if (!response.ok) throw new Error(`Runtime asset ${new URL(url).pathname} returned HTTP ${response.status}.`);
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  if (expectedType === 'js' && !contentType.includes('javascript')) {
+    throw new Error(`Play.js returned unexpected content type: ${contentType || 'unknown'}.`);
   }
+  if (expectedType === 'wasm' && !(contentType.includes('wasm') || contentType.includes('octet-stream'))) {
+    throw new Error(`Play.wasm returned unexpected content type: ${contentType || 'unknown'}.`);
+  }
+  return response;
+}
+
+runtime.init = async function blackMondayRuntimeInitAuthenticatedBlob() {
+  if (this.module) return this;
+  const playJsUrl = blackMondayRuntimeAssetUrl('Play.js');
+  const playWasmUrl = blackMondayRuntimeAssetUrl('Play.wasm');
+
+  status.textContent = 'Runtime 1/5: fetching Play.js…';
+  diagnostics.record('runtime.stage', { stage: 'fetch-play-js', build: BLACK_MONDAY_RUNTIME_BUILD });
+  const jsResponse = await blackMondayFetchRuntimeAsset(playJsUrl, 'js');
+  const jsSource = await jsResponse.text();
+  if (!jsSource.includes('export default Play')) throw new Error('Fetched Play.js did not contain the expected ES-module export.');
+
+  status.textContent = 'Runtime 2/5: loading Play module…';
+  diagnostics.record('runtime.stage', { stage: 'import-play-blob', jsBytes: jsSource.length });
+  const blobUrl = URL.createObjectURL(new Blob([jsSource], { type: 'text/javascript' }));
+  this.runtimeBlobUrl = blobUrl;
+  let imported;
+  try {
+    imported = await import(blobUrl);
+  } catch (error) {
+    throw new Error(`Local Play module import failed: ${error?.message || error}`);
+  }
+  const Play = imported?.default;
+  if (typeof Play !== 'function') throw new Error('Local Play module did not export the expected Emscripten factory.');
+
+  status.textContent = 'Runtime 3/5: fetching matching Play.wasm…';
+  diagnostics.record('runtime.stage', { stage: 'fetch-play-wasm' });
+  const wasmResponse = await blackMondayFetchRuntimeAsset(playWasmUrl, 'wasm');
+  const wasmBytes = new Uint8Array(await wasmResponse.arrayBuffer());
+  if (wasmBytes.byteLength < 1000000) throw new Error(`Play.wasm is unexpectedly small (${wasmBytes.byteLength} bytes).`);
+
+  status.textContent = 'Runtime 4/5: instantiating Play! WebAssembly…';
+  diagnostics.record('runtime.stage', { stage: 'instantiate-play', wasmBytes: wasmBytes.byteLength });
+  const runtimeBase = new URL('./runtime/', globalThis.location?.href ?? import.meta.url).href;
+  this.module = await Play({
+    wasmBinary: wasmBytes,
+    locateFile: path => path === 'Play.wasm' ? playWasmUrl : new URL(path, runtimeBase).href,
+    mainScriptUrlOrBlob: blobUrl,
+    print: text => console.log(`[Play] ${text}`),
+    printErr: text => console.error(`[Play] ${text}`),
+  });
+
+  status.textContent = 'Runtime 5/5: mounting saves and creating PS2 VM…';
+  diagnostics.record('runtime.stage', { stage: 'mount-and-init-vm' });
+  try { this.module.FS.mkdir('/work'); } catch (e) { if (!String(e).includes('File exists')) throw e; }
+  await mountPersistentVfs(this.module);
+  this.module.discImageDevice = new DiscImageDevice(this.module);
+  installBlackMondayDiscReadAhead(this.module.discImageDevice);
+  this.module.ccall('initVm', '', [], []);
+  diagnostics.record('runtime.stage', { stage: 'ready', build: BLACK_MONDAY_RUNTIME_BUILD });
+  return this;
 };
 
 function blackMondayCoreStats(sample) {
