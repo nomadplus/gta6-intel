@@ -1908,3 +1908,91 @@ beginStats = function blackMondayBeginStatsWithCoreDiagnostics() {
     }
   }, 1000);
 };
+
+
+// ---- Black Monday r33: WASM dynarec wall-clock profiler ----
+// The installed disc stays on the same origin. Only the Play! runtime pair is
+// cache-busted so this instrumented core cannot be mixed with the previous build.
+blackMondayRuntimeAssetUrl = function blackMondayRuntimeAssetUrlR33(name) {
+  const url = new URL(`./runtime/${name}`, import.meta.url);
+  url.searchParams.set('bmcore', 'bmcore-20261003-r33');
+  return url.href;
+};
+
+function blackMondayWasmCodegenTotals() {
+  const module = runtime.module;
+  const value = name => {
+    const result = Number(module?.[name]?.());
+    return Number.isFinite(result) && result >= 0 ? result : 0;
+  };
+  return {
+    modules: value('getWasmCodegenModuleCount'),
+    bytes: value('getWasmCodegenModuleBytes'),
+    moduleMs: value('getWasmCodegenModuleMs'),
+    instances: value('getWasmCodegenInstanceCount'),
+    instanceMs: value('getWasmCodegenInstanceMs'),
+  };
+}
+
+function blackMondayDeltaCodegen(current, previous, elapsedSeconds) {
+  const seconds = Math.max(0.001, elapsedSeconds);
+  return {
+    modulesPerSecond: Math.max(0, current.modules - previous.modules) / seconds,
+    kibPerSecond: Math.max(0, current.bytes - previous.bytes) / 1024 / seconds,
+    moduleMsPerSecond: Math.max(0, current.moduleMs - previous.moduleMs) / seconds,
+    instancesPerSecond: Math.max(0, current.instances - previous.instances) / seconds,
+    instanceMsPerSecond: Math.max(0, current.instanceMs - previous.instanceMs) / seconds,
+  };
+}
+
+// Replace the r32 sampler with a profiler that separates guest utilisation from
+// real Safari wall time spent compiling/instantiating dynamically generated WASM.
+beginStats = function blackMondayBeginStatsWithDynarecProfiler() {
+  clearInterval(statsTimer);
+  runtime.clearStats();
+  performanceMonitor.reset(runtime.getFrames());
+  let diagnosticSampleCounter = 0;
+  let previousCodegen = blackMondayWasmCodegenTotals();
+
+  statsTimer = window.setInterval(() => {
+    const sample = performanceMonitor.sample(runtime.getFrames());
+    const frameTime = sample.frameTimeMs == null ? '--' : sample.frameTimeMs.toFixed(1);
+    const io = runtime.module?.discImageDevice?.getBlackMondayIoStats?.() ?? null;
+    const core = blackMondayCoreStats(sample);
+    const codegen = blackMondayWasmCodegenTotals();
+    const cg = blackMondayDeltaCodegen(codegen, previousCodegen, sample.deltaMs / 1000);
+    previousCodegen = codegen;
+
+    const ioText = io
+      ? ` jsio=${io.reads} hit=${(io.hitRate * 100).toFixed(0)}% fetch=${io.avgFetchMs.toFixed(1)}ms`
+      : '';
+    const coreText = [
+      core.eeUsage == null ? null : `ee=${core.eeUsage.toFixed(0)}%`,
+      core.iopUsage == null ? null : `iop=${core.iopUsage.toFixed(0)}%`,
+      core.drawCallsPerFrame == null ? null : `dc=${core.drawCallsPerFrame.toFixed(0)}`,
+    ].filter(Boolean).join(' ');
+    const jitText = ` jit=${cg.modulesPerSecond.toFixed(0)}/s/${cg.moduleMsPerSecond.toFixed(0)}ms inst=${cg.instancesPerSecond.toFixed(0)}/s/${cg.instanceMsPerSecond.toFixed(0)}ms code=${cg.kibPerSecond.toFixed(0)}KiB/s`;
+    const memory = sample.memory ? ` heap=${sample.memory.usedJSHeapMiB.toFixed(0)}MiB` : '';
+
+    hudStatus.textContent = `frames=${sample.frames} ${sample.fps.toFixed(1)}fps ${frameTime}ms perf=${activePerformanceProfile} gs=${activeGsScale}x${ioText}${coreText ? ` ${coreText}` : ''}${jitText}${memory}`;
+
+    if ((++diagnosticSampleCounter % 5) === 0) {
+      diagnostics.record('performance.sample', { ...sample, discIo: io, core, codegen, codegenRate: cg });
+    }
+    if ((diagnosticSampleCounter % 30) === 0) {
+      diagnostics.persist({
+        extra: {
+          phase: 'running',
+          fps: sample.fps,
+          frameTimeMs: sample.frameTimeMs,
+          performanceProfile: activePerformanceProfile,
+          gsScale: activeGsScale,
+          discIo: io,
+          core,
+          codegen,
+          codegenRate: cg,
+        },
+      });
+    }
+  }, 1000);
+};
