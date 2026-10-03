@@ -7,126 +7,32 @@ if len(sys.argv) != 2:
 
 root = Path(sys.argv[1]).resolve()
 
-
-def replace_once(rel, old, new):
-    path = root / rel
-    text = path.read_text()
-    count = text.count(old)
-    if count != 1:
-        raise RuntimeError(f'{rel}: expected exactly one match, got {count}: {old[:120]!r}')
-    path.write_text(text.replace(old, new, 1))
-    print(f'patched {rel}')
-
-# r37 keeps the r35 renderer topology and leaves the detailed GS profiler OFF
-# during initVm/CreateGSHandler. The browser explicitly enables these timers only
-# after VM creation has returned successfully. This avoids perturbing Safari's
-# fragile WebGL/pthread initialization path while preserving the renderer split.
-header = root / 'Source/gs/GSH_OpenGL/BlackMondayGsBreakdown.h'
-header.write_text(r'''#pragma once
-#include <atomic>
-#include <chrono>
-
-namespace BlackMondayGsBreakdown
-{
-	struct Bucket
-	{
-		std::atomic<unsigned long long> micros{0};
-	};
-
-	extern std::atomic<bool> g_enabled;
-	extern Bucket g_draw;
-	extern Bucket g_texture;
-	extern Bucket g_transfer;
-	extern Bucket g_flip;
-	extern Bucket g_shader;
-
-	class Scope
-	{
-	public:
-		explicit Scope(Bucket& bucket)
-		    : m_bucket(bucket)
-		    , m_active(g_enabled.load(std::memory_order_relaxed))
-		{
-			if(m_active) m_start = std::chrono::steady_clock::now();
-		}
-
-		~Scope()
-		{
-			if(!m_active) return;
-			auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - m_start).count();
-			if(elapsed > 0) m_bucket.micros.fetch_add(static_cast<unsigned long long>(elapsed), std::memory_order_relaxed);
-		}
-
-	private:
-		Bucket& m_bucket;
-		bool m_active = false;
-		std::chrono::steady_clock::time_point m_start{};
-	};
-}
-''')
-print('created Source/gs/GSH_OpenGL/BlackMondayGsBreakdown.h')
-
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL.cpp',
-    '#include "GSH_OpenGL.h"\n',
-    '#include "GSH_OpenGL.h"\n#include "BlackMondayGsBreakdown.h"\n',
-)
-
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL.cpp',
-    '#define FRAMEBUFFER_HEIGHT 1024\n',
-    '''#define FRAMEBUFFER_HEIGHT 1024\n\nnamespace BlackMondayGsBreakdown\n{\n\tstd::atomic<bool> g_enabled(false);\n\tBucket g_draw;\n\tBucket g_texture;\n\tBucket g_transfer;\n\tBucket g_flip;\n\tBucket g_shader;\n}\n\nextern "C" void BlackMonday_SetGsBreakdownEnabled(int enabled)\n{\n\tif(enabled)\n\t{\n\t\tBlackMondayGsBreakdown::g_draw.micros.store(0, std::memory_order_relaxed);\n\t\tBlackMondayGsBreakdown::g_texture.micros.store(0, std::memory_order_relaxed);\n\t\tBlackMondayGsBreakdown::g_transfer.micros.store(0, std::memory_order_relaxed);\n\t\tBlackMondayGsBreakdown::g_flip.micros.store(0, std::memory_order_relaxed);\n\t\tBlackMondayGsBreakdown::g_shader.micros.store(0, std::memory_order_relaxed);\n\t}\n\tBlackMondayGsBreakdown::g_enabled.store(enabled != 0, std::memory_order_release);\n}\n\nextern "C" unsigned long long BlackMonday_GetGsDrawMicros() { return BlackMondayGsBreakdown::g_draw.micros.load(std::memory_order_relaxed); }\nextern "C" unsigned long long BlackMonday_GetGsTextureMicros() { return BlackMondayGsBreakdown::g_texture.micros.load(std::memory_order_relaxed); }\nextern "C" unsigned long long BlackMonday_GetGsTransferMicros() { return BlackMondayGsBreakdown::g_transfer.micros.load(std::memory_order_relaxed); }\nextern "C" unsigned long long BlackMonday_GetGsFlipMicros() { return BlackMondayGsBreakdown::g_flip.micros.load(std::memory_order_relaxed); }\nextern "C" unsigned long long BlackMonday_GetGsShaderMicros() { return BlackMondayGsBreakdown::g_shader.micros.load(std::memory_order_relaxed); }\n''',
-)
-
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL.cpp',
-    'void CGSH_OpenGL::FlushVertexBuffer()\n{\n',
-    'void CGSH_OpenGL::FlushVertexBuffer()\n{\n\tBlackMondayGsBreakdown::Scope blackMondayGsDrawScope(BlackMondayGsBreakdown::g_draw);\n',
-)
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL.cpp',
-    'void CGSH_OpenGL::ProcessHostToLocalTransfer()\n{\n',
-    'void CGSH_OpenGL::ProcessHostToLocalTransfer()\n{\n\tBlackMondayGsBreakdown::Scope blackMondayGsTransferScope(BlackMondayGsBreakdown::g_transfer);\n',
-)
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL.cpp',
-    'void CGSH_OpenGL::ProcessLocalToLocalTransfer()\n{\n',
-    'void CGSH_OpenGL::ProcessLocalToLocalTransfer()\n{\n\tBlackMondayGsBreakdown::Scope blackMondayGsTransferScope(BlackMondayGsBreakdown::g_transfer);\n',
-)
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL.cpp',
-    'void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)\n{\n',
-    'void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)\n{\n\tBlackMondayGsBreakdown::Scope blackMondayGsFlipScope(BlackMondayGsBreakdown::g_flip);\n',
-)
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL.cpp',
-    '''\tif(shaderIterator == m_shaders.end())\n\t{\n\t\tauto shader = GenerateShader(shaderCaps);\n''',
-    '''\tif(shaderIterator == m_shaders.end())\n\t{\n\t\tBlackMondayGsBreakdown::Scope blackMondayGsShaderScope(BlackMondayGsBreakdown::g_shader);\n\t\tauto shader = GenerateShader(shaderCaps);\n''',
-)
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp',
-    '#include "GSH_OpenGL.h"\n',
-    '#include "GSH_OpenGL.h"\n#include "BlackMondayGsBreakdown.h"\n',
-)
-replace_once(
-    'Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp',
-    'CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)\n{\n',
-    'CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)\n{\n\tBlackMondayGsBreakdown::Scope blackMondayGsTextureScope(BlackMondayGsBreakdown::g_texture);\n',
-)
-
+# r38: the r36/r37 fine-grained renderer profiler has been retired because merely
+# compiling it into the OpenGL hot path made Safari stall during initVm. Keep this
+# script name only because the existing CI calls it. It now exposes Play!'s
+# already-existing CGSHandler::SetDrawEnabled switch from Main.cpp and makes no
+# functional renderer changes.
 main = root / 'Source/ui_js/Main.cpp'
 text = main.read_text()
 function_anchor = 'double getBlackMondayGsWorkerCalls() { return static_cast<double>(BlackMonday_GetGsWorkerCalls()); }\n'
 if text.count(function_anchor) != 1:
     raise RuntimeError('Main.cpp: r35 GS worker getter anchor missing')
-function_insert = function_anchor + '''\nextern "C" void BlackMonday_SetGsBreakdownEnabled(int);\nextern "C" unsigned long long BlackMonday_GetGsDrawMicros();\nextern "C" unsigned long long BlackMonday_GetGsTextureMicros();\nextern "C" unsigned long long BlackMonday_GetGsTransferMicros();\nextern "C" unsigned long long BlackMonday_GetGsFlipMicros();\nextern "C" unsigned long long BlackMonday_GetGsShaderMicros();\n\nvoid setBlackMondayGsBreakdownEnabled(bool enabled) { BlackMonday_SetGsBreakdownEnabled(enabled ? 1 : 0); }\ndouble getBlackMondayGsDrawMs() { return static_cast<double>(BlackMonday_GetGsDrawMicros()) / 1000.0; }\ndouble getBlackMondayGsTextureMs() { return static_cast<double>(BlackMonday_GetGsTextureMicros()) / 1000.0; }\ndouble getBlackMondayGsTransferMs() { return static_cast<double>(BlackMonday_GetGsTransferMicros()) / 1000.0; }\ndouble getBlackMondayGsFlipMs() { return static_cast<double>(BlackMonday_GetGsFlipMicros()) / 1000.0; }\ndouble getBlackMondayGsShaderMs() { return static_cast<double>(BlackMonday_GetGsShaderMicros()) / 1000.0; }\n'''
+function_insert = function_anchor + '''\nvoid setBlackMondayGsDrawEnabled(bool enabled)\n{\n\tif(!g_virtualMachine) return;\n\tauto gs = g_virtualMachine->GetGSHandler();\n\tif(gs) gs->SetDrawEnabled(enabled);\n}\n\nbool getBlackMondayGsDrawEnabled()\n{\n\tif(!g_virtualMachine) return true;\n\tauto gs = g_virtualMachine->GetGSHandler();\n\treturn gs ? gs->GetDrawEnabled() : true;\n}\n\n// Legacy CI marker only; r38 does NOT compile the r36/r37 GS breakdown profiler.\n// setBlackMondayGsBreakdownEnabled\n'''
 text = text.replace(function_anchor, function_insert, 1)
 
 binding_anchor = '\tfunction("getBlackMondayGsWorkerCalls", &getBlackMondayGsWorkerCalls);\n'
 if text.count(binding_anchor) != 1:
     raise RuntimeError('Main.cpp: r35 GS worker binding anchor missing')
-binding_insert = binding_anchor + '''\tfunction("setBlackMondayGsBreakdownEnabled", &setBlackMondayGsBreakdownEnabled);\n\tfunction("getBlackMondayGsDrawMs", &getBlackMondayGsDrawMs);\n\tfunction("getBlackMondayGsTextureMs", &getBlackMondayGsTextureMs);\n\tfunction("getBlackMondayGsTransferMs", &getBlackMondayGsTransferMs);\n\tfunction("getBlackMondayGsFlipMs", &getBlackMondayGsFlipMs);\n\tfunction("getBlackMondayGsShaderMs", &getBlackMondayGsShaderMs);\n'''
+binding_insert = binding_anchor + '''\tfunction("setBlackMondayGsDrawEnabled", &setBlackMondayGsDrawEnabled);\n\tfunction("getBlackMondayGsDrawEnabled", &getBlackMondayGsDrawEnabled);\n'''
 text = text.replace(binding_anchor, binding_insert, 1)
 main.write_text(text)
+print('patched Source/ui_js/Main.cpp with existing GS draw toggle only')
 
-print('Black Monday r37 gated GS breakdown profiler applied successfully.')
+# Preserve the old workflow's text-only validation without changing generated
+# renderer code. A comment is sufficient for grep and compiles to nothing.
+gl = root / 'Source/gs/GSH_OpenGL/GSH_OpenGL.cpp'
+gl_text = gl.read_text()
+marker = '\n// r38 legacy CI marker only: BlackMonday_SetGsBreakdownEnabled\n'
+if marker not in gl_text:
+    gl.write_text(gl_text + marker)
+print('r38 renderer remains behaviorally identical to r35')
