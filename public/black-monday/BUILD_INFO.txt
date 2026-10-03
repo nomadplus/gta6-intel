@@ -1,8 +1,8 @@
 play_commit=83700b2c31e593bc94e845b4b31b797be84dda59
 emsdk_version=4.0.1
 sevenzip_wasm_commit=521d2cf93f5964f4e77b01049e19f1b29305c454
-preview_source_commit=f8a71c13d4ff9703f837d4ebf931a6789e0dd22e
-built_utc=2026-10-03T10:09:06Z
+preview_source_commit=04d50dfbc0ef3da525ece3e2ede3773be5ae5d47
+built_utc=2026-10-03T10:16:22Z
 play_js_bytes=213440
 play_wasm_bytes=2693084
 sevenzip_js_bytes=82904
